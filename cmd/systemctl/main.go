@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 	"initd/internal/ipc"
+	"initd/internal/userpaths"
 
 	"golang.org/x/sys/unix"
 )
@@ -27,10 +28,27 @@ func main() {
 
 	flags := flag.NewFlagSet("systemctl", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	socketPath := flags.String("socket", "/run/initd.sock", "path to initd unix socket")
+	socketPath := flags.String("socket", "", "path to initd unix socket")
+	var userFlag, systemFlag bool
+	flags.BoolVar(&userFlag, "user", false, "talk to user manager")
+	flags.BoolVar(&systemFlag, "system", false, "talk to system manager")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		usage()
 		os.Exit(1)
+	}
+
+	if userFlag && systemFlag {
+		fmt.Fprintln(os.Stderr, "Cannot combine --user and --system")
+		os.Exit(1)
+	}
+
+	resolvedSocket := *socketPath
+	if resolvedSocket == "" {
+		if userFlag {
+			resolvedSocket = userpaths.UserSocketPath()
+		} else {
+			resolvedSocket = userpaths.SystemSocketPath()
+		}
 	}
 
 	if flags.NArg() < 1 {
@@ -41,7 +59,7 @@ func main() {
 	cmd := flags.Arg(0)
 	args := flags.Args()[1:]
 
-	client := &ipc.Client{SocketPath: *socketPath}
+	client := &ipc.Client{SocketPath: resolvedSocket}
 
 	switch cmd {
 	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "enable", "disable":
@@ -359,6 +377,8 @@ func printHelp() {
 	fmt.Println("Query or send control commands to the initd system manager.")
 	fmt.Println()
 	fmt.Println("Options:")
+	fmt.Println("  --user               Talk to user manager")
+	fmt.Println("  --system             Talk to system manager (default)")
 	fmt.Println("  --socket=PATH        Path to initd control socket")
 	fmt.Println("  -h, --help           Show this help")
 	fmt.Println("  -V, --version        Show version")
