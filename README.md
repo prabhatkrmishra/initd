@@ -233,6 +233,8 @@ systemctl [OPTIONS...] COMMAND [UNIT...]
 Query or send control commands to the initd system manager.
 
 Options:
+  --user               Talk to user manager
+  --system             Talk to system manager (default)
   --socket=PATH        Path to initd control socket
   -h, --help           Show this help
   -V, --version        Show version
@@ -438,6 +440,29 @@ In this mode:
 - All enabled systemd-style services are started
 - Signal handling and service supervision still work
 - Suitable for Docker, chroot, Android, WSL, and embedded environments
+
+#### User services in chroot / proot (no root)
+
+`initd` runs a single daemon that serves both system and user units:
+
+- System units: `/etc/systemd/system`, `/lib/systemd/system` via `/run/initd.sock` (or `$XDG_RUNTIME_DIR/initd-system.sock` when not root)
+- User units: `~/.config/systemd/user`, `/etc/systemd/user` via `$XDG_RUNTIME_DIR/initd.sock` (or `/tmp/initd-<uid>.sock`)
+
+```
+# Start initd once (handles both)
+initd
+
+# System services (default)
+systemctl start nginx
+systemctl --system status nginx
+
+# User services (no root needed)
+systemctl --user start myapp
+systemctl --user enable myapp
+systemctl --user status myapp
+```
+
+`--socket` overrides both `--user` and `--system` for custom paths.
 
 ------
 

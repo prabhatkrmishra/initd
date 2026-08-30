@@ -48,6 +48,24 @@ func main() {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "failed to load user units: %v", err)
 	}
 
+	// Fallback for non-root: /run/initd.sock not writable
+	if socketPath == "/run/initd.sock" && os.Getuid() != 0 {
+		if _, err := os.Stat("/run"); err == nil {
+			if f, err := os.OpenFile("/run/initd.sock.test", os.O_CREATE|os.O_WRONLY, 0600); err != nil {
+				fallback := userpaths.SystemSocketPath()
+				if fallback == "/run/initd.sock" {
+					fallback = "/tmp/initd.sock"
+				}
+				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+					"no permission for %s, falling back to %s", socketPath, fallback)
+				socketPath = fallback
+			} else {
+				_ = f.Close()
+				_ = os.Remove("/run/initd.sock.test")
+			}
+		}
+	}
+
 	serveManager := func(path string, mgr *supervisor.Manager) {
 		for {
 			if err := ipc.Serve(path, mgr); err != nil {
@@ -60,11 +78,9 @@ func main() {
 	}
 
 	go serveManager(socketPath, systemManager)
-	if initMode {
-		userSocket := userpaths.UserSocketPath()
-		if userSocket != socketPath {
-			go serveManager(userSocket, userManager)
-		}
+	userSocket := userpaths.UserSocketPath()
+	if userSocket != socketPath {
+		go serveManager(userSocket, userManager)
 	}
 
 if initMode {
