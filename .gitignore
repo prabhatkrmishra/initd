@@ -32,5 +32,5 @@ go.work.sum
 # .vscode/
 releases/
 build/
-systemctl
-initd
+/systemctl
+/initd

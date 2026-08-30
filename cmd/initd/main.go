@@ -11,6 +11,7 @@ import (
 	"initd/internal/ipc"
 	"initd/internal/logging"
 	"initd/internal/supervisor"
+	"initd/internal/userpaths"
 )
 
 const initdVersion = "0.0.2"
@@ -30,28 +31,41 @@ func main() {
 		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	}
 
-	manager := supervisor.NewManager()
+	systemManager := supervisor.NewSystemManager()
+	userManager := supervisor.NewUserManager()
 
 	if os.Getpid() == 1 {
 		reaper := supervisor.NewProcessReaper()
 		reaper.Start()
-		manager.SetReaper(reaper)
+		systemManager.SetReaper(reaper)
+		userManager.SetReaper(reaper)
 	}
 
-	if err := manager.LoadUnits(); err != nil {
-		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "failed to load units: %v", err)
+	if err := systemManager.LoadUnits(); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "failed to load system units: %v", err)
+	}
+	if err := userManager.LoadUnits(); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "failed to load user units: %v", err)
 	}
 
-	go func() {
+	serveManager := func(path string, mgr *supervisor.Manager) {
 		for {
-			if err := ipc.Serve(socketPath, manager); err != nil {
+			if err := ipc.Serve(path, mgr); err != nil {
 				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-					"ipc server error: %v (retrying)", err)
+					"ipc server error on %s: %v (retrying)", path, err)
 				time.Sleep(time.Second)
 				continue
 			}
 		}
-	}()
+	}
+
+	go serveManager(socketPath, systemManager)
+	if initMode {
+		userSocket := userpaths.UserSocketPath()
+		if userSocket != socketPath {
+			go serveManager(userSocket, userManager)
+		}
+	}
 
 if initMode {
     if os.Getpid() == 1 {
@@ -60,9 +74,13 @@ if initMode {
         boot.RemountRootRW()
         boot.ApplyHostname()
 
-        if err := manager.StartEnabledUnits(); err != nil {
+        if err := systemManager.StartEnabledUnits(); err != nil {
             logging.KernelPrintf(os.Stderr, "initd", 1,
-                "failed to start enabled units: %v", err)
+                "failed to start enabled system units: %v", err)
+        }
+        if err := userManager.StartEnabledUnits(); err != nil {
+            logging.KernelPrintf(os.Stderr, "initd", 1,
+                "failed to start enabled user units: %v", err)
         }
 
         boot.SpawnVirtualTerminals()
@@ -79,23 +97,24 @@ if initMode {
                 }
             }
         }
-    }
-
-    // init-lite
-    logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-        "WARNING: --init requested but PID != 1, running init-lite mode")
-
-    if err := manager.StartEnabledUnits(); err != nil {
+    } else {
+        // init-lite
         logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-            "failed to start enabled units: %v", err)
+            "WARNING: --init requested but PID != 1, running init-lite mode")
+
+        if err := systemManager.StartEnabledUnits(); err != nil {
+            logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+                "failed to start enabled system units: %v", err)
+        }
+        if err := userManager.StartEnabledUnits(); err != nil {
+            logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+                "failed to start enabled user units: %v", err)
+        }
+
+        for {
+            <-signals
+        }
     }
-
-	for {
-		<-signals
-	}
-
-
-    return
 }
 // socket-only mode
 <-signals
