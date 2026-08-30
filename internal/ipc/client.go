@@ -3,6 +3,7 @@ package ipc
 import (
 	"encoding/json"
 	"net"
+	"strings"
 )
 
 type Client struct {
@@ -10,7 +11,11 @@ type Client struct {
 }
 
 func (c *Client) Do(req Request) (Response, error) {
-	conn, err := net.Dial("unix", c.SocketPath)
+	socketPath := c.SocketPath
+	if strings.HasPrefix(socketPath, "@") {
+		socketPath = "\x00" + strings.TrimPrefix(socketPath, "@")
+	}
+	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
 		return Response{}, err
 	}

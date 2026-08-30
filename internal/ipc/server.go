@@ -81,6 +81,21 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
+		if len(socketPath) > 90 && !strings.HasPrefix(socketPath, "@") {
+			abstract := abstractFallback(manager)
+			addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(abstract, "@"), Net: "unix"}
+			abstractListener, aerr := net.ListenUnix("unix", addr)
+			if aerr == nil {
+				defer abstractListener.Close()
+				for {
+					conn, err := abstractListener.Accept()
+					if err != nil {
+						continue
+					}
+					go handleConn(conn, manager)
+				}
+			}
+		}
 		return err
 	}
 	defer listener.Close()
@@ -95,6 +110,13 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 		}
 		go handleConn(conn, manager)
 	}
+}
+
+func abstractFallback(manager *supervisor.Manager) string {
+	if manager != nil && manager.UserMode {
+		return "@initd-user"
+	}
+	return "@initd-system"
 }
 
 func handleConn(conn net.Conn, manager *supervisor.Manager) {
