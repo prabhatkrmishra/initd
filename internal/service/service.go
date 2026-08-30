@@ -87,6 +87,12 @@ func (u *Unit) SetReaper(reaper ExitReaper) {
 	u.mu.Unlock()
 }
 
+func (u *Unit) Reaper() ExitReaper {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.reaper
+}
+
 func (u *Unit) Description() string {
 	if u.Config.Description != "" {
 		return u.Config.Description
@@ -767,6 +773,19 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 	// Respect RestartPreventExitStatus
 	if prevent := u.RestartPreventExitStatus(); prevent != nil {
 		if _, blocked := prevent[exitCode]; blocked {
+			if u.notifyServer != nil {
+				u.notifyServer.Stop()
+				u.notifyServer = nil
+			}
+			u.Runtime.State = StateFailed
+			if err != nil {
+				u.Runtime.LastError = err.Error()
+			} else {
+				u.Runtime.LastError = fmt.Sprintf("exit status %d", exitCode)
+			}
+			u.Runtime.ExitCode = exitCode
+			u.Runtime.FinishedAt = time.Now()
+			u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 			return
 		}
 	}
@@ -874,7 +893,10 @@ func processAlive(pid int) bool {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
-	return err == nil
+	if err == nil {
+		return true
+	}
+	return err == syscall.EPERM
 }
 
 func (u *Unit) canonicalServiceType() string {
@@ -969,7 +991,25 @@ func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr strin
 		if name == "" {
 			continue
 		}
-		path := filepath.Join(base, name)
+		if strings.Contains(name, "\\") {
+			return fmt.Errorf("invalid directory name %q", name)
+		}
+		clean := filepath.Clean(name)
+		if filepath.IsAbs(clean) || clean == "." {
+			return fmt.Errorf("invalid directory name %q", name)
+		}
+		if strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") || strings.HasSuffix(clean, "/..") || clean == ".." {
+			return fmt.Errorf("invalid directory name %q", name)
+		}
+		for _, part := range strings.Split(clean, "/") {
+			if part == "." || part == ".." || part == "" {
+				return fmt.Errorf("invalid directory name %q", name)
+			}
+		}
+		if clean != name {
+			return fmt.Errorf("invalid directory name %q", name)
+		}
+		path := filepath.Join(base, clean)
 		if err := os.MkdirAll(path, mode); err != nil {
 			return fmt.Errorf("create directory %s: %w", path, err)
 		}

@@ -82,6 +82,7 @@ func (m *Manager) LoadUnits() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	oldUnits := m.Units
 	units := map[string]*service.Unit{}
 	order := []string{}
 
@@ -103,11 +104,20 @@ func (m *Manager) LoadUnits() error {
 				continue
 			}
 			unitConfig.Name = entry.Name()
-			unit := service.NewUnit(unitConfig, path)
-			if m.reaper != nil {
-				unit.SetReaper(m.reaper)
+			if old, ok := oldUnits[entry.Name()]; ok {
+				old.Config = unitConfig
+				old.Path = path
+				if old.Reaper() == nil && m.reaper != nil {
+					old.SetReaper(m.reaper)
+				}
+				units[entry.Name()] = old
+			} else {
+				unit := service.NewUnit(unitConfig, path)
+				if m.reaper != nil {
+					unit.SetReaper(m.reaper)
+				}
+				units[entry.Name()] = unit
 			}
-			units[entry.Name()] = unit
 			order = append(order, entry.Name())
 		}
 	}

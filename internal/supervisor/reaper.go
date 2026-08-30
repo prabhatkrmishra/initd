@@ -10,11 +10,13 @@ import (
 type ProcessReaper struct {
 	mu       sync.Mutex
 	handlers map[int]func(syscall.WaitStatus)
+	pending  map[int]syscall.WaitStatus
 }
 
 func NewProcessReaper() *ProcessReaper {
 	return &ProcessReaper{
 		handlers: make(map[int]func(syscall.WaitStatus)),
+		pending:  make(map[int]syscall.WaitStatus),
 	}
 }
 
@@ -23,6 +25,12 @@ func (r *ProcessReaper) Register(pid int, handler func(syscall.WaitStatus)) {
 		return
 	}
 	r.mu.Lock()
+	if status, ok := r.pending[pid]; ok {
+		delete(r.pending, pid)
+		r.mu.Unlock()
+		go handler(status)
+		return
+	}
 	r.handlers[pid] = handler
 	r.mu.Unlock()
 
@@ -55,7 +63,11 @@ func (r *ProcessReaper) Start() {
 func (r *ProcessReaper) handleExit(pid int, status syscall.WaitStatus) {
 	r.mu.Lock()
 	handler := r.handlers[pid]
-	delete(r.handlers, pid)
+	if handler != nil {
+		delete(r.handlers, pid)
+	} else {
+		r.pending[pid] = status
+	}
 	r.mu.Unlock()
 	if handler != nil {
 		go handler(status)
