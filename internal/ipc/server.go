@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"initd/internal/boot"
@@ -49,12 +51,42 @@ type UnitFileData struct {
 }
 
 func Serve(socketPath string, manager *supervisor.Manager) error {
+	if strings.HasPrefix(socketPath, "@") {
+		addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(socketPath, "@"), Net: "unix"}
+		listener, err := net.ListenUnix("unix", addr)
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				continue
+			}
+			go handleConn(conn, manager)
+		}
+	}
+
+	dir := filepath.Dir(socketPath)
+	if dir != "" && dir != "." {
+		perm := os.FileMode(0755)
+		if manager != nil && manager.UserMode {
+			perm = 0700
+		}
+		_ = os.MkdirAll(dir, perm)
+		if manager != nil && manager.UserMode {
+			_ = os.Chmod(dir, 0700)
+		}
+	}
 	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	if manager != nil && manager.UserMode {
+		_ = os.Chmod(socketPath, 0700)
+	}
 
 	for {
 		conn, err := listener.Accept()
