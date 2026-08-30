@@ -26,19 +26,31 @@ func main() {
 		return
 	}
 
-	flags := flag.NewFlagSet("systemctl", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	socketPath := flags.String("socket", "", "path to initd unix socket")
+	// Extract --user/--system before flag parsing so they work
+	// regardless of position (systemd allows them before command).
+	rawArgs := os.Args[1:]
 	var userFlag, systemFlag bool
-	flags.BoolVar(&userFlag, "user", false, "talk to user manager")
-	flags.BoolVar(&systemFlag, "system", false, "talk to system manager")
-	if err := flags.Parse(os.Args[1:]); err != nil {
-		usage()
+	filtered := make([]string, 0, len(rawArgs))
+	for _, a := range rawArgs {
+		switch a {
+		case "--user":
+			userFlag = true
+		case "--system":
+			systemFlag = true
+		default:
+			filtered = append(filtered, a)
+		}
+	}
+	if userFlag && systemFlag {
+		fmt.Fprintln(os.Stderr, "Cannot combine --user and --system")
 		os.Exit(1)
 	}
 
-	if userFlag && systemFlag {
-		fmt.Fprintln(os.Stderr, "Cannot combine --user and --system")
+	flags := flag.NewFlagSet("systemctl", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	socketPath := flags.String("socket", "", "path to initd unix socket")
+	if err := flags.Parse(filtered); err != nil {
+		usage()
 		os.Exit(1)
 	}
 
@@ -57,17 +69,17 @@ func main() {
 	}
 
 	cmd := flags.Arg(0)
-	args := flags.Args()[1:]
+	cmdArgs := flags.Args()[1:]
 
 	client := &ipc.Client{SocketPath: resolvedSocket}
 
 	switch cmd {
 	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "enable", "disable":
-		if len(args) < 1 {
+		if len(cmdArgs) < 1 {
 			fmt.Fprintf(os.Stderr, "%s requires a unit name\n", cmd)
 			os.Exit(1)
 		}
-		handleUnitCommand(client, cmd, args[0])
+		handleUnitCommand(client, cmd, cmdArgs[0])
 
 	case "list-units":
 		handleListUnits(client)
