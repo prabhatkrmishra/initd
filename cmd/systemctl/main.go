@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 	"initd/internal/ipc"
@@ -211,11 +212,57 @@ func handleListUnits(client *ipc.Client) {
 	data, _ := json.Marshal(resp.Data)
 	_ = json.Unmarshal(data, &units)
 
-	fmt.Printf("UNIT\tLOAD\tACTIVE\tDESCRIPTION\n")
+	if len(units) == 0 {
+		fmt.Println("No units loaded.")
+		return
+	}
+
+	sort.Slice(units, func(i, j int) bool {
+		return units[i].Name < units[j].Name
+	})
+
+	unitW := len("UNIT")
+	loadW := len("loaded")
+	activeW := len("ACTIVE")
+	for _, u := range units {
+		if len(u.Name) > unitW {
+			unitW = len(u.Name)
+		}
+		if len(string(u.State)) > activeW {
+			activeW = len(string(u.State))
+		}
+	}
+	if unitW < 20 {
+		unitW = 20
+	}
+	if unitW > 50 {
+		unitW = 50
+	}
+	if loadW < len("LOAD") {
+		loadW = len("LOAD")
+	}
+
+	headerFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%s\n", unitW, loadW, activeW)
+	rowFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%s\n", unitW, loadW, activeW)
+
+	fmt.Printf(headerFmt, "UNIT", "LOAD", "ACTIVE", "DESCRIPTION")
+	fmt.Printf(headerFmt, strings.Repeat("-", unitW), strings.Repeat("-", loadW), strings.Repeat("-", activeW), strings.Repeat("-", 11))
 	for _, unit := range units {
 		active := string(unit.State)
-		fmt.Printf("%s\tloaded\t%s\t%s\n", unit.Name, active, unit.Description)
+		desc := unit.Description
+		if desc == "" {
+			desc = "-"
+		}
+		name := unit.Name
+		if len(name) > unitW {
+			name = name[:unitW-3] + "..."
+		}
+		if len(desc) > 60 {
+			desc = desc[:57] + "..."
+		}
+		fmt.Printf(rowFmt, name, "loaded", active, desc)
 	}
+	fmt.Printf("\n%d units listed.\n", len(units))
 }
 
 func handleListUnitFiles(client *ipc.Client) {
@@ -233,10 +280,43 @@ func handleListUnitFiles(client *ipc.Client) {
 	data, _ := json.Marshal(resp.Data)
 	_ = json.Unmarshal(data, &units)
 
-	fmt.Printf("UNIT FILE\tSTATE\n")
-	for _, unit := range units {
-		fmt.Printf("%s\t%s\n", unit.Name, unit.State)
+	if len(units) == 0 {
+		fmt.Println("No unit files found.")
+		return
 	}
+
+	sort.Slice(units, func(i, j int) bool {
+		return units[i].Name < units[j].Name
+	})
+
+	fileW := len("UNIT FILE")
+	stateW := len("STATE")
+	for _, u := range units {
+		if len(u.Name) > fileW {
+			fileW = len(u.Name)
+		}
+		if len(u.State) > stateW {
+			stateW = len(u.State)
+		}
+	}
+	if fileW < 20 {
+		fileW = 20
+	}
+	if fileW > 50 {
+		fileW = 50
+	}
+
+	headerFmt := fmt.Sprintf("%%-%ds  %%-%ds\n", fileW, stateW)
+	fmt.Printf(headerFmt, "UNIT FILE", "STATE")
+	fmt.Printf(headerFmt, strings.Repeat("-", fileW), strings.Repeat("-", stateW))
+	for _, unit := range units {
+		name := unit.Name
+		if len(name) > fileW {
+			name = name[:fileW-3] + "..."
+		}
+		fmt.Printf(headerFmt, name, unit.State)
+	}
+	fmt.Printf("\n%d unit files listed.\n", len(units))
 }
 
 func decodeStatus(resp ipc.Response) ipc.StatusData {
