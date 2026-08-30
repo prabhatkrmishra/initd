@@ -14,6 +14,7 @@ import (
 	"initd/internal/parser"
 	"initd/internal/service"
 	"initd/internal/tmpfiles"
+	"initd/internal/userpaths"
 )
 
 type Manager struct {
@@ -25,9 +26,15 @@ type Manager struct {
 	reaper      service.ExitReaper
 	bootStarted bool
 	bootDone    bool
+	UserMode    bool
+	EnabledRoot string
 }
 
 func NewManager() *Manager {
+	return NewSystemManager()
+}
+
+func NewSystemManager() *Manager {
 	return &Manager{
 		Units: map[string]*service.Unit{},
 		SearchPaths: []string{
@@ -35,7 +42,25 @@ func NewManager() *Manager {
 			"/lib/systemd/system",
 			"/usr/lib/systemd/system",
 		},
+		EnabledRoot: "/etc/systemd/system",
+		UserMode:    false,
 	}
+}
+
+func NewUserManager() *Manager {
+	return &Manager{
+		Units:       map[string]*service.Unit{},
+		SearchPaths: userpaths.UserUnitsPaths(),
+		EnabledRoot: userpaths.UserEnabledRoot(),
+		UserMode:    true,
+	}
+}
+
+func NewManagerWithMode(userMode bool) *Manager {
+	if userMode {
+		return NewUserManager()
+	}
+	return NewSystemManager()
 }
 
 func (m *Manager) SetReaper(reaper service.ExitReaper) {
@@ -411,8 +436,12 @@ func (m *Manager) EnableUnit(name string) error {
 	if len(unit.Config.Install.WantedBy) == 0 {
 		return errors.New("WantedBy not set")
 	}
+	root := m.EnabledRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
 	for _, target := range unit.Config.Install.WantedBy {
-		wantsDir := filepath.Join("/etc/systemd/system", fmt.Sprintf("%s.wants", target))
+		wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
 		if err := os.MkdirAll(wantsDir, 0o755); err != nil {
 			return err
 		}
@@ -430,8 +459,12 @@ func (m *Manager) DisableUnit(name string) error {
 	if err != nil {
 		return err
 	}
+	root := m.EnabledRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
 	for _, target := range unit.Config.Install.WantedBy {
-		wantsDir := filepath.Join("/etc/systemd/system", fmt.Sprintf("%s.wants", target))
+		wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
 		linkPath := filepath.Join(wantsDir, name)
 		_ = os.Remove(linkPath)
 	}
@@ -485,7 +518,10 @@ func (m *Manager) EnabledUnits() ([]*service.Unit, error) {
 }
 
 func (m *Manager) enabledUnitNames() (map[string]struct{}, error) {
-	root := "/etc/systemd/system"
+	root := m.EnabledRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
 	dirs, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
