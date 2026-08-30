@@ -2,16 +2,16 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
-	"time"
 	"initd/internal/boot"
 	"initd/internal/ipc"
 	"initd/internal/logging"
 	"initd/internal/supervisor"
 	"initd/internal/userpaths"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 )
 
 const initdVersion = "0.0.2"
@@ -83,57 +83,57 @@ func main() {
 		go serveManager(userSocket, userManager)
 	}
 
-if initMode {
-    if os.Getpid() == 1 {
-        // full init
-        boot.SetupConsole()
-        boot.RemountRootRW()
-        boot.ApplyHostname()
+	if initMode {
+		if os.Getpid() == 1 {
+			// full init
+			boot.SetupConsole()
+			boot.RemountRootRW()
+			boot.ApplyHostname()
 
-        if err := systemManager.StartEnabledUnits(); err != nil {
-            logging.KernelPrintf(os.Stderr, "initd", 1,
-                "failed to start enabled system units: %v", err)
-        }
-        if err := userManager.StartEnabledUnits(); err != nil {
-            logging.KernelPrintf(os.Stderr, "initd", 1,
-                "failed to start enabled user units: %v", err)
-        }
+			if err := systemManager.StartEnabledUnits(); err != nil {
+				logging.KernelPrintf(os.Stderr, "initd", 1,
+					"failed to start enabled system units: %v", err)
+			}
+			if err := userManager.StartEnabledUnits(); err != nil {
+				logging.KernelPrintf(os.Stderr, "initd", 1,
+					"failed to start enabled user units: %v", err)
+			}
 
-        boot.SpawnVirtualTerminals()
+			boot.SpawnVirtualTerminals()
 
-        for {
-            select {
-            case sig := <-signals:
-                switch sig {
-                case syscall.SIGTERM:
-                    logging.KernelPrintf(os.Stderr, "initd", 1,
-                        "SIGTERM ignored by init")
-                case syscall.SIGCHLD:
-                    // reaper handles
-                }
-            }
-        }
-    } else {
-        // init-lite
-        logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-            "WARNING: --init requested but PID != 1, running init-lite mode")
+			for {
+				select {
+				case sig := <-signals:
+					switch sig {
+					case syscall.SIGTERM:
+						logging.KernelPrintf(os.Stderr, "initd", 1,
+							"SIGTERM ignored by init")
+					case syscall.SIGCHLD:
+						// reaper handles
+					}
+				}
+			}
+		} else {
+			// init-lite
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"WARNING: --init requested but PID != 1, running init-lite mode")
 
-        if err := systemManager.StartEnabledUnits(); err != nil {
-            logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-                "failed to start enabled system units: %v", err)
-        }
-        if err := userManager.StartEnabledUnits(); err != nil {
-            logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-                "failed to start enabled user units: %v", err)
-        }
+			if err := systemManager.StartEnabledUnits(); err != nil {
+				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+					"failed to start enabled system units: %v", err)
+			}
+			if err := userManager.StartEnabledUnits(); err != nil {
+				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+					"failed to start enabled user units: %v", err)
+			}
 
-        for {
-            <-signals
-        }
-    }
-}
-// socket-only mode
-<-signals
+			for {
+				<-signals
+			}
+		}
+	}
+	// socket-only mode
+	<-signals
 
 }
 

@@ -13,12 +13,12 @@ import (
 )
 
 type Runtime struct {
-	mu        sync.Mutex
-	Path      string
-	Network   string
-	Listener  net.Listener
-	Packet    net.PacketConn
-	Active    bool
+	mu       sync.Mutex
+	Path     string
+	Network  string
+	Listener net.Listener
+	Packet   net.PacketConn
+	Active   bool
 }
 
 func Start(unit *parser.Unit) (*Runtime, error) {

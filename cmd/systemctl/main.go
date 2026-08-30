@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"initd/internal/ipc"
+	"initd/internal/userpaths"
 	"io"
 	"os"
 	"sort"
 	"strings"
 	"time"
-	"initd/internal/ipc"
-	"initd/internal/userpaths"
 
 	"golang.org/x/sys/unix"
 )
@@ -382,7 +382,6 @@ func printStatus(status ipc.StatusData, enabled string) {
 		}
 	}
 }
-
 
 func monotonicNow() time.Duration {
 	var ts unix.Timespec

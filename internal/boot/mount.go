@@ -1,9 +1,9 @@
 package boot
 
 import (
+	"initd/internal/logging"
 	"os"
 	"syscall"
-	"initd/internal/logging"
 )
 
 func RemountRootRW() {
@@ -12,9 +12,9 @@ func RemountRootRW() {
 	}
 
 	err := syscall.Mount(
-		"",   // source ignored for remount
-		"/",  // target
-		"",   // fs type ignored
+		"",  // source ignored for remount
+		"/", // target
+		"",  // fs type ignored
 		syscall.MS_REMOUNT,
 		"",
 	)

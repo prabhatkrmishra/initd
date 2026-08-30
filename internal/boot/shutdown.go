@@ -2,8 +2,8 @@ package boot
 
 import (
 	"os"
-	"time"
 	"syscall"
+	"time"
 
 	"initd/internal/logging"
 	"initd/internal/supervisor"

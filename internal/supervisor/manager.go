@@ -305,7 +305,6 @@ func (m *Manager) StopAllUnits() {
 	}
 }
 
-
 func (m *Manager) StopUnit(name string) error {
 	unit, err := m.FindUnit(name)
 	if err != nil {

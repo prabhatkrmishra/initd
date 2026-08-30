@@ -1,11 +1,12 @@
 package boot
+
 import (
 	"fmt"
+	"golang.org/x/sys/unix"
+	"initd/internal/logging"
 	"os"
 	"strings"
-	"golang.org/x/sys/unix"
 	"syscall"
-	"initd/internal/logging"
 )
 
 func SetupConsole() {
@@ -130,7 +131,6 @@ func spawnGetty() error {
 	return nil
 }
 
-
 func spawnFallbackShell() {
 	cmd := []string{"/bin/sh"}
 
@@ -160,62 +160,60 @@ func spawnLoginFrontend() {
 }
 
 func SpawnVirtualTerminals() {
-    for i := 1; i <= 6; i++ {
-        go spawnGettyOnTTY(fmt.Sprintf("tty%d", i))
-    }
-    activateVT(1)
+	for i := 1; i <= 6; i++ {
+		go spawnGettyOnTTY(fmt.Sprintf("tty%d", i))
+	}
+	activateVT(1)
 }
-
 
 func spawnGettyOnTTY(name string) {
-    dev := "/dev/" + name
+	dev := "/dev/" + name
 
-    tty, err := os.OpenFile(dev, os.O_RDWR, 0)
-    if err != nil {
-        return
-    }
+	tty, err := os.OpenFile(dev, os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
 
-    attr := &syscall.ProcAttr{
-        Dir: "/",
-        Env: os.Environ(),
-        Files: []uintptr{
-            tty.Fd(), tty.Fd(), tty.Fd(),
-        },
-        Sys: &syscall.SysProcAttr{
-            Setsid:  true,
-            Setctty: true,
-            Ctty:    0,
-        },
-    }
+	attr := &syscall.ProcAttr{
+		Dir: "/",
+		Env: os.Environ(),
+		Files: []uintptr{
+			tty.Fd(), tty.Fd(), tty.Fd(),
+		},
+		Sys: &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    0,
+		},
+	}
 
-    _, err = syscall.ForkExec(
-        "/sbin/agetty",
-        []string{"agetty", "--noclear", name, "linux"},
-        attr,
-    )
+	_, err = syscall.ForkExec(
+		"/sbin/agetty",
+		[]string{"agetty", "--noclear", name, "linux"},
+		attr,
+	)
 
-    tty.Close()
+	tty.Close()
 }
 
-
 func activateVT(n int) {
-    f, err := os.OpenFile("/dev/tty0", os.O_RDWR, 0)
-    if err != nil {
-        return
-    }
-    defer f.Close()
+	f, err := os.OpenFile("/dev/tty0", os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
 
-    _, _, _ = syscall.Syscall(
-        syscall.SYS_IOCTL,
-        f.Fd(),
-        uintptr(0x5606), // VT_ACTIVATE
-        uintptr(n),
-    )
+	_, _, _ = syscall.Syscall(
+		syscall.SYS_IOCTL,
+		f.Fd(),
+		uintptr(0x5606), // VT_ACTIVATE
+		uintptr(n),
+	)
 
-    _, _, _ = syscall.Syscall(
-        syscall.SYS_IOCTL,
-        f.Fd(),
-        uintptr(0x5607), // VT_WAITACTIVE
-        uintptr(n),
-    )
+	_, _, _ = syscall.Syscall(
+		syscall.SYS_IOCTL,
+		f.Fd(),
+		uintptr(0x5607), // VT_WAITACTIVE
+		uintptr(n),
+	)
 }

@@ -10,7 +10,7 @@ import (
 
 type Unit struct {
 	Name                string
-	Type                string 
+	Type                string
 	Description         string
 	After               []string
 	Requires            []string
@@ -21,7 +21,6 @@ type Unit struct {
 	Install             InstallSection
 	Ignored             map[string]string
 }
-
 
 type ServiceSection struct {
 	Type                     string
@@ -70,68 +69,68 @@ type InstallSection struct {
 }
 
 var ignoredKeys = map[string]struct{}{
-	"MemoryMax":                {},
-	"CPUQuota":                 {},
-	"TasksMax":                 {},
-	"IOWeight":                 {},
-	"DeviceAllow":              {},
-	"DeviceDeny":               {},
-	"PrivateTmp":               {},
-	"ProtectSystem":            {},
-	"RestrictNamespaces":       {},
-	"CapabilityBoundingSet":    {},
-	"AmbientCapabilities":      {},
-	"SystemCallFilter":         {},
-	"SystemCallArchitectures":  {},
-	"ProtectProc":              {},
-	"ProcSubset":               {},
-	"NoExecPaths":              {},
-	"ExecPaths":                {},
-	"PrivateDevices":           {},
-	"ProtectHome":              {},
-	"ReadWritePaths":           {},
-	"ReadOnlyPaths":            {},
-	"InaccessiblePaths":        {},
-	"ReadWriteDirectories":     {},
-	"ReadOnlyDirectories":      {},
-	"InaccessibleDirectories":  {},
-	"NoNewPrivileges":          {},
-	"LockPersonality":          {},
-	"MemoryDenyWriteExecute":   {},
-	"PrivateUsers":             {},
-	"ProtectClock":             {},
-	"ProtectControlGroups":     {},
-	"ProtectHostname":          {},
-	"ProtectKernelLogs":        {},
-	"ProtectKernelModules":     {},
-	"ProtectKernelTunables":    {},
-	"RemoveIPC":                {},
-	"RestrictAddressFamilies":  {},
-	"RestrictRealtime":         {},
-	"RestrictSUIDSGID":         {},
-	"OOMScoreAdjust":           {},
-	"Nice":                     {},
-	"IOSchedulingClass":        {},
-	"IOSchedulingPriority":     {},
-	"CPUSchedulingPolicy":      {},
-	"CPUSchedulingPriority":    {},
-	"CPUAffinity":              {},
-	"LimitNPROC":               {},
-	"LimitCORE":                {},
-	"LimitMEMLOCK":             {},
-	"LimitAS":                  {},
-	"LimitRSS":                 {},
-	"LimitDATA":                {},
-	"LimitSTACK":               {},
-	"LimitCPU":                 {},
-	"Slice":                    {},
-	"Delegate":                 {},
-	"TasksAccounting":          {},
-	"MemoryAccounting":         {},
-	"CPUAccounting":            {},
-	"IOAccounting":             {},
-	"BlockIOAccounting":        {},
-	"DefaultDependencies":      {},
+	"MemoryMax":               {},
+	"CPUQuota":                {},
+	"TasksMax":                {},
+	"IOWeight":                {},
+	"DeviceAllow":             {},
+	"DeviceDeny":              {},
+	"PrivateTmp":              {},
+	"ProtectSystem":           {},
+	"RestrictNamespaces":      {},
+	"CapabilityBoundingSet":   {},
+	"AmbientCapabilities":     {},
+	"SystemCallFilter":        {},
+	"SystemCallArchitectures": {},
+	"ProtectProc":             {},
+	"ProcSubset":              {},
+	"NoExecPaths":             {},
+	"ExecPaths":               {},
+	"PrivateDevices":          {},
+	"ProtectHome":             {},
+	"ReadWritePaths":          {},
+	"ReadOnlyPaths":           {},
+	"InaccessiblePaths":       {},
+	"ReadWriteDirectories":    {},
+	"ReadOnlyDirectories":     {},
+	"InaccessibleDirectories": {},
+	"NoNewPrivileges":         {},
+	"LockPersonality":         {},
+	"MemoryDenyWriteExecute":  {},
+	"PrivateUsers":            {},
+	"ProtectClock":            {},
+	"ProtectControlGroups":    {},
+	"ProtectHostname":         {},
+	"ProtectKernelLogs":       {},
+	"ProtectKernelModules":    {},
+	"ProtectKernelTunables":   {},
+	"RemoveIPC":               {},
+	"RestrictAddressFamilies": {},
+	"RestrictRealtime":        {},
+	"RestrictSUIDSGID":        {},
+	"OOMScoreAdjust":          {},
+	"Nice":                    {},
+	"IOSchedulingClass":       {},
+	"IOSchedulingPriority":    {},
+	"CPUSchedulingPolicy":     {},
+	"CPUSchedulingPriority":   {},
+	"CPUAffinity":             {},
+	"LimitNPROC":              {},
+	"LimitCORE":               {},
+	"LimitMEMLOCK":            {},
+	"LimitAS":                 {},
+	"LimitRSS":                {},
+	"LimitDATA":               {},
+	"LimitSTACK":              {},
+	"LimitCPU":                {},
+	"Slice":                   {},
+	"Delegate":                {},
+	"TasksAccounting":         {},
+	"MemoryAccounting":        {},
+	"CPUAccounting":           {},
+	"IOAccounting":            {},
+	"BlockIOAccounting":       {},
+	"DefaultDependencies":     {},
 }
 
 func ParseUnit(path string) (*Unit, error) {
@@ -154,7 +153,6 @@ func ParseUnit(path string) (*Unit, error) {
 	default:
 		unit.Type = "unknown"
 	}
-
 
 	scanner := bufio.NewScanner(file)
 	section := ""
@@ -260,12 +258,12 @@ func ParseUnit(path string) (*Unit, error) {
 				unit.Service.UMask = value
 			case "LimitNOFILE":
 				unit.Service.LimitNOFILE = value
-			default:
-				unit.Ignored["Service."+key] = value
 			case "Environment":
 				unit.Service.Environment = append(unit.Service.Environment, value)
 			case "EnvironmentFile":
 				unit.Service.EnvironmentFile = append(unit.Service.EnvironmentFile, value)
+			default:
+				unit.Ignored["Service."+key] = value
 			}
 		case "Socket":
 			switch key {
@@ -294,13 +292,12 @@ func ParseUnit(path string) (*Unit, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	
+
 	if unit.Type == "socket" {
 		if len(unit.Socket.ListenStream) == 0 && len(unit.Socket.ListenDatagram) == 0 {
 			return nil, fmt.Errorf("socket unit missing ListenStream/ListenDatagram")
 		}
 	}
-
 
 	return unit, nil
 }

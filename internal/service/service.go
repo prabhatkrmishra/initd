@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"initd/internal/notify"
 	"os"
 	"os/exec"
 	"os/user"
@@ -13,7 +14,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"initd/internal/notify"
 
 	"initd/internal/logging"
 	"initd/internal/parser"
@@ -60,10 +60,10 @@ type ExitReaper interface {
 }
 
 type credentialSpec struct {
-	uid uint32
-	gid uint32
+	uid    uint32
+	gid    uint32
 	groups []uint32
-	set bool
+	set    bool
 }
 
 type commandOptions struct {
@@ -297,7 +297,6 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	}
 }
 
-
 func (u *Unit) waitSimple(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
 	if err := u.runExecStartPost(token, envMap, envList); err != nil {
 		u.killMainProcess(syscall.SIGTERM)
@@ -514,7 +513,6 @@ func (u *Unit) Stop(timeout time.Duration) error {
 	u.transitionState(StateFailed, "terminated after timeout")
 	return errors.New("stop timeout")
 }
-
 
 func (u *Unit) Restart(timeout time.Duration) error {
 	if err := u.Stop(timeout); err != nil {
@@ -814,7 +812,6 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		}
 	}
 }
-
 
 func (u *Unit) Log(level logging.Level, message string) {
 	u.mu.Lock()
