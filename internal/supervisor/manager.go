@@ -73,8 +73,10 @@ func (m *Manager) SetReaper(reaper service.ExitReaper) {
 }
 
 func (m *Manager) LoadUnits() error {
-	if err := tmpfiles.ApplyRuntimeDirs(); err != nil {
-		logKernelWarning(fmt.Sprintf("tmpfiles setup failed: %v", err))
+	if !m.UserMode {
+		if err := tmpfiles.ApplyRuntimeDirs(); err != nil {
+			logKernelWarning(fmt.Sprintf("tmpfiles setup failed: %v", err))
+		}
 	}
 
 	m.mu.Lock()
@@ -90,6 +92,9 @@ func (m *Manager) LoadUnits() error {
 		}
 		for _, entry := range entries {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".service") {
+				continue
+			}
+			if _, exists := units[entry.Name()]; exists {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -524,6 +529,9 @@ func (m *Manager) enabledUnitNames() (map[string]struct{}, error) {
 	}
 	dirs, err := os.ReadDir(root)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]struct{}{}, nil
+		}
 		return nil, err
 	}
 
