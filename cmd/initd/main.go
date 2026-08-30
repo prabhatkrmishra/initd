@@ -194,13 +194,13 @@ Options:
   -h, --help           Show this help.
   -V, --version        Show version.
 
-Report bugs to: https://github.com/EdwardLab/initd
+Report bugs to: https://github.com/prabhatkrmishra/initd.git
 `)
 }
 
 func printVersion() {
 	fmt.Printf(
-		"initd (initd) %s by EdwardLab (https://github.com/EdwardLab) MIT License\n",
+		"initd (initd) %s by prabhatkrmishra (https://github.com/prabhatkrmishra/initd.git) MIT License\n",
 		initdVersion,
 	)
 }

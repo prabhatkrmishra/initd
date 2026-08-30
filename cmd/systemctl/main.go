@@ -494,9 +494,9 @@ func printHelp() {
 	fmt.Println("  poweroff             Power off the system")
 	fmt.Println("  halt                 Halt the system")
 	fmt.Println()
-	fmt.Println("Report bugs to: https://github.com/EdwardLab/initd")
+	fmt.Println("Report bugs to: https://github.com/prabhatkrmishra/initd.git")
 }
 
 func printVersion() {
-	fmt.Printf("systemctl (initd) %s by EdwardLab (https://github.com/EdwardLab) MIT License\n", systemctlVersion)
+	fmt.Printf("systemctl (initd) %s by prabhatkrmishra (https://github.com/prabhatkrmishra/initd.git) MIT License\n", systemctlVersion)
 }
