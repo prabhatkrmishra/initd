@@ -114,9 +114,9 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 
 func abstractFallback(manager *supervisor.Manager) string {
 	if manager != nil && manager.UserMode {
-		return "@initd-user"
+		return "@initd-user.sock"
 	}
-	return "@initd-system"
+	return "@initd-system.sock"
 }
 
 func handleConn(conn net.Conn, manager *supervisor.Manager) {
@@ -236,6 +236,9 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "reboot", "poweroff", "halt":
+		if manager != nil && manager.UserMode {
+			return Response{Success: false, Message: "reboot/poweroff/halt not allowed for user manager"}
+		}
 		go func() {
 			boot.Shutdown(manager, req.Action)
 		}()
