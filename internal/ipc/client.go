@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
+	"time"
 )
 
 type Client struct {
@@ -20,6 +21,7 @@ func (c *Client) Do(req Request) (Response, error) {
 		return Response{}, err
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	encoder := json.NewEncoder(conn)
 	decoder := json.NewDecoder(conn)

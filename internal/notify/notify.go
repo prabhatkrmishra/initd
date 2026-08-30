@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"initd/internal/userpaths"
 )
 
 type Server struct {
@@ -32,7 +34,11 @@ func Start() (*Server, error) {
 		return s, nil
 	}
 
-	path := filepath.Join("/run/initd", fmt.Sprintf("notify-%d.sock", time.Now().UnixNano()))
+	baseDir := "/run/initd"
+	if os.Getuid() != 0 {
+		baseDir = filepath.Join(userpaths.UserRuntimeDir(), "initd")
+	}
+	path := filepath.Join(baseDir, fmt.Sprintf("notify-%d.sock", time.Now().UnixNano()))
 	_ = os.Remove(path)
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 

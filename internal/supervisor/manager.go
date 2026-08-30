@@ -549,7 +549,9 @@ func (m *Manager) enabledUnitNames() (map[string]struct{}, error) {
 			if !strings.HasSuffix(name, ".service") {
 				continue
 			}
-			if want.Type()&os.ModeSymlink == 0 {
+			linkPath := filepath.Join(wantsDir, name)
+			fi, err := os.Lstat(linkPath)
+			if err != nil || fi.Mode()&os.ModeSymlink == 0 {
 				continue
 			}
 			enabled[name] = struct{}{}

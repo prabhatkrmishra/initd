@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -113,10 +114,11 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 }
 
 func abstractFallback(manager *supervisor.Manager) string {
+	uid := os.Getuid()
 	if manager != nil && manager.UserMode {
-		return "@initd-user.sock"
+		return fmt.Sprintf("@initd-user-%d.sock", uid)
 	}
-	return "@initd-system.sock"
+	return fmt.Sprintf("@initd-system-%d.sock", uid)
 }
 
 func handleConn(conn net.Conn, manager *supervisor.Manager) {
