@@ -726,6 +726,22 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		return
 	}
 
+	if u.Runtime.State == StateStopping {
+		if u.notifyServer != nil {
+			u.notifyServer.Stop()
+			u.notifyServer = nil
+		}
+		if resetActive {
+			u.Runtime.MainPID = 0
+		}
+		u.Runtime.State = StateInactive
+		u.Runtime.LastError = ""
+		u.Runtime.ExitCode = exitCode
+		u.Runtime.FinishedAt = time.Now()
+		u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+		return
+	}
+
 	if serviceType == "notify" && watchedPID != 0 {
 		if adoptedPID := u.adoptedNotifyPIDWithCurrent(watchedPID, u.Runtime.MainPID); adoptedPID != 0 && adoptedPID != watchedPID {
 			if u.notifyServer != nil {

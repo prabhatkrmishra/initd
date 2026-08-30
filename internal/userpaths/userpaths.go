@@ -42,6 +42,17 @@ func UserEnabledRoot() string {
 }
 
 func SystemSocketPath() string {
+	if os.Getuid() != 0 {
+		if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+			return filepath.Join(xdg, "initd-system.sock")
+		}
+		uid := os.Getuid()
+		runUser := fmt.Sprintf("/run/user/%d", uid)
+		if st, err := os.Stat(runUser); err == nil && st.IsDir() {
+			return filepath.Join(runUser, "initd-system.sock")
+		}
+		return fmt.Sprintf("/tmp/initd-%d-system.sock", uid)
+	}
 	return "/run/initd.sock"
 }
 
