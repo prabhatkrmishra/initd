@@ -43,18 +43,19 @@ type Runtime struct {
 }
 
 type Unit struct {
-	mu             sync.Mutex
-	Config         *parser.Unit
-	Path           string
-	Runtime        Runtime
-	Cmd            *exec.Cmd
-	Logs           *logging.Buffer
-	restartHistory []time.Time
-	startToken     int
-	reaper         ExitReaper
-	notifyServer   *notify.Server
-	socketFiles    []*os.File
-	socketEnv      map[string]string
+	mu               sync.Mutex
+	Config           *parser.Unit
+	Path             string
+	Runtime          Runtime
+	Cmd              *exec.Cmd
+	Logs             *logging.Buffer
+	restartHistory   []time.Time
+	startToken       int
+	reaper           ExitReaper
+	notifyServer     *notify.Server
+	socketFiles      []*os.File
+	socketEnv        map[string]string
+	onFailureHandler func(string)
 }
 
 type ExitReaper interface {
@@ -86,6 +87,12 @@ func NewUnit(config *parser.Unit, path string) *Unit {
 func (u *Unit) SetReaper(reaper ExitReaper) {
 	u.mu.Lock()
 	u.reaper = reaper
+	u.mu.Unlock()
+}
+
+func (u *Unit) SetOnFailureHandler(fn func(string)) {
+	u.mu.Lock()
+	u.onFailureHandler = fn
 	u.mu.Unlock()
 }
 
@@ -736,9 +743,8 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 	}
 
 	u.mu.Lock()
-	defer u.mu.Unlock()
-
 	if u.startToken != token {
+		u.mu.Unlock()
 		return
 	}
 
@@ -755,6 +761,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		u.Runtime.ExitCode = exitCode
 		u.Runtime.FinishedAt = time.Now()
 		u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+		u.mu.Unlock()
 		return
 	}
 
@@ -768,6 +775,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 			u.Runtime.MainPID = adoptedPID
 			u.Runtime.ExitCode = 0
 			u.Runtime.LastError = ""
+			u.mu.Unlock()
 			return
 		}
 		if currentPID := u.Runtime.MainPID; currentPID != 0 && currentPID != watchedPID && processAlive(currentPID) {
@@ -778,6 +786,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 			u.Runtime.State = StateActive
 			u.Runtime.ExitCode = 0
 			u.Runtime.LastError = ""
+			u.mu.Unlock()
 			return
 		}
 	}
@@ -798,6 +807,14 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 			u.Runtime.ExitCode = exitCode
 			u.Runtime.FinishedAt = time.Now()
 			u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+			didFail := true
+			handler := u.onFailureHandler
+			name := u.Config.Name
+			u.mu.Unlock()
+			if handler != nil {
+				go handler(name)
+			}
+			_ = didFail
 			return
 		}
 	}
@@ -819,12 +836,27 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 	}
 
 	if err != nil {
-		if u.Runtime.State == StateActive && resetActive {
-			u.Runtime.State = StateInactive
+		if ignoreFailure {
+			if u.Runtime.State != StateActive {
+				u.Runtime.State = StateInactive
+			} else if resetActive {
+				u.Runtime.MainPID = 0
+				u.Runtime.State = StateInactive
+			}
+			u.Runtime.LastError = ""
+		} else if u.Runtime.State == StateActive && resetActive {
+			// Simple service that exited with failure -> mark failed so OnFailure triggers
+			u.Runtime.State = StateFailed
+			u.Runtime.MainPID = 0
+			u.Runtime.LastError = err.Error()
 		} else if u.Runtime.State != StateActive {
 			u.Runtime.State = StateFailed
+			u.Runtime.LastError = err.Error()
+		} else {
+			u.Runtime.State = StateFailed
+			u.Runtime.MainPID = 0
+			u.Runtime.LastError = err.Error()
 		}
-		u.Runtime.LastError = err.Error()
 		u.Runtime.ExitCode = exitCode
 	} else {
 		if u.Runtime.State != StateActive {
@@ -836,11 +868,13 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 	u.Runtime.FinishedAt = time.Now()
 	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 
-	if ignoreFailure {
-		if u.Runtime.State != StateActive {
-			u.Runtime.State = StateInactive
-			u.Runtime.LastError = ""
-		}
+	didFail2 := u.Runtime.State == StateFailed
+	handler2 := u.onFailureHandler
+	name2 := u.Config.Name
+	origErr := err
+	u.mu.Unlock()
+	if didFail2 && handler2 != nil && origErr != nil {
+		go handler2(name2)
 	}
 }
 

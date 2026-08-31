@@ -13,8 +13,14 @@ type Unit struct {
 	Type                string
 	Description         string
 	After               []string
+	Before              []string
 	Requires            []string
 	Wants               []string
+	Conflicts           []string
+	OnFailure           []string
+	PartOf              []string
+	BindsTo             []string
+	DefaultDependencies string
 	ConditionPathExists []string
 	Service             ServiceSection
 	Socket              SocketSection
@@ -133,7 +139,6 @@ var ignoredKeys = map[string]struct{}{
 	"CPUAccounting":           {},
 	"IOAccounting":            {},
 	"BlockIOAccounting":       {},
-	"DefaultDependencies":     {},
 }
 
 func ParseUnit(path string) (*Unit, error) {
@@ -265,6 +270,12 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				} else {
 					unit.After = append(unit.After, splitList(value)...)
 				}
+			case "Before":
+				if value == "" {
+					unit.Before = nil
+				} else {
+					unit.Before = append(unit.Before, splitList(value)...)
+				}
 			case "Requires":
 				if value == "" {
 					unit.Requires = nil
@@ -277,6 +288,32 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				} else {
 					unit.Wants = append(unit.Wants, splitList(value)...)
 				}
+			case "Conflicts":
+				if value == "" {
+					unit.Conflicts = nil
+				} else {
+					unit.Conflicts = append(unit.Conflicts, splitList(value)...)
+				}
+			case "OnFailure":
+				if value == "" {
+					unit.OnFailure = nil
+				} else {
+					unit.OnFailure = append(unit.OnFailure, splitList(value)...)
+				}
+			case "PartOf":
+				if value == "" {
+					unit.PartOf = nil
+				} else {
+					unit.PartOf = append(unit.PartOf, splitList(value)...)
+				}
+			case "BindsTo":
+				if value == "" {
+					unit.BindsTo = nil
+				} else {
+					unit.BindsTo = append(unit.BindsTo, splitList(value)...)
+				}
+			case "DefaultDependencies":
+				unit.DefaultDependencies = value
 			case "ConditionPathExists":
 				if value == "" {
 					unit.ConditionPathExists = nil
@@ -478,11 +515,29 @@ func mergeUnit(base, overlay *Unit) {
 	if len(overlay.After) > 0 {
 		base.After = append(base.After, overlay.After...)
 	}
+	if len(overlay.Before) > 0 {
+		base.Before = append(base.Before, overlay.Before...)
+	}
 	if len(overlay.Requires) > 0 {
 		base.Requires = append(base.Requires, overlay.Requires...)
 	}
 	if len(overlay.Wants) > 0 {
 		base.Wants = append(base.Wants, overlay.Wants...)
+	}
+	if len(overlay.Conflicts) > 0 {
+		base.Conflicts = append(base.Conflicts, overlay.Conflicts...)
+	}
+	if len(overlay.OnFailure) > 0 {
+		base.OnFailure = append(base.OnFailure, overlay.OnFailure...)
+	}
+	if len(overlay.PartOf) > 0 {
+		base.PartOf = append(base.PartOf, overlay.PartOf...)
+	}
+	if len(overlay.BindsTo) > 0 {
+		base.BindsTo = append(base.BindsTo, overlay.BindsTo...)
+	}
+	if overlay.DefaultDependencies != "" {
+		base.DefaultDependencies = overlay.DefaultDependencies
 	}
 	if len(overlay.ConditionPathExists) > 0 {
 		base.ConditionPathExists = append(base.ConditionPathExists, overlay.ConditionPathExists...)

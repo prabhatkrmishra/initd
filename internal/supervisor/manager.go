@@ -158,12 +158,14 @@ func (m *Manager) LoadUnits() error {
 				if old.Reaper() == nil && m.reaper != nil {
 					old.SetReaper(m.reaper)
 				}
+				old.SetOnFailureHandler(m.onFailureCallback(old.Config.Name))
 				units[entry.Name()] = old
 			} else {
 				unit := service.NewUnit(unitConfig, path)
 				if m.reaper != nil {
 					unit.SetReaper(m.reaper)
 				}
+				unit.SetOnFailureHandler(m.onFailureCallback(unit.Config.Name))
 				units[entry.Name()] = unit
 			}
 			order = append(order, entry.Name())
@@ -222,6 +224,46 @@ func (m *Manager) LoadUnits() error {
 	return nil
 }
 
+func (m *Manager) onFailureCallback(unitName string) func(string) {
+	return func(failedUnit string) {
+		m.mu.Lock()
+		cfg, ok := m.Units[failedUnit]
+		if !ok {
+			m.mu.Unlock()
+			return
+		}
+		targets := append([]string{}, cfg.Config.OnFailure...)
+		// Collect BindsTo dependents that should be stopped on failure
+		bindsDependents := []string{}
+		for otherName, otherUnit := range m.Units {
+			for _, b := range otherUnit.Config.BindsTo {
+				if strings.TrimSpace(b) == failedUnit {
+					bindsDependents = append(bindsDependents, otherName)
+					break
+				}
+			}
+		}
+		m.mu.Unlock()
+		for _, t := range targets {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			_ = m.StartUnit(t)
+		}
+		for _, dep := range bindsDependents {
+			if u, err := m.FindUnit(dep); err == nil {
+				if snap := u.Snapshot(); snap.State == service.StateActive || snap.State == service.StateActivating {
+					_ = u.Stop(u.StopTimeout())
+				} else if snap.State != service.StateFailed {
+					u.MarkFailed(fmt.Sprintf("BindsTo=%s failed", failedUnit))
+				}
+			}
+		}
+		_ = unitName
+	}
+}
+
 func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -238,6 +280,7 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 			if m.reaper != nil {
 				unit.SetReaper(m.reaper)
 			}
+			unit.SetOnFailureHandler(m.onFailureCallback(name))
 			m.Units[name] = unit
 			m.UnitOrder = append(m.UnitOrder, name)
 			return unit, nil
@@ -515,6 +558,45 @@ func (m *Manager) startUnitWithDependencies(name string, started map[string]stru
 	}
 	stack[name] = struct{}{}
 
+	// Conflicts: stop conflicting active units before starting
+	for _, conflict := range unit.Config.Conflicts {
+		conflict = strings.TrimSpace(conflict)
+		if conflict == "" {
+			continue
+		}
+		if cu, err := m.FindUnit(conflict); err == nil {
+			if snap := cu.Snapshot(); snap.State == service.StateActive || snap.State == service.StateActivating {
+				_ = cu.Stop(cu.StopTimeout())
+			}
+		}
+		if _, err := m.FindSocketUnit(conflict); err == nil {
+			_ = m.stopSocketUnit(conflict)
+		}
+	}
+	// Also check reverse conflicts: any active unit that conflicts with this one
+	m.mu.Lock()
+	allNames := make([]string, 0, len(m.Units))
+	for n := range m.Units {
+		allNames = append(allNames, n)
+	}
+	m.mu.Unlock()
+	for _, otherName := range allNames {
+		if otherName == name {
+			continue
+		}
+		other, err := m.FindUnit(otherName)
+		if err != nil {
+			continue
+		}
+		for _, c := range other.Config.Conflicts {
+			if strings.TrimSpace(c) == name {
+				if snap := other.Snapshot(); snap.State == service.StateActive || snap.State == service.StateActivating {
+					_ = other.Stop(other.StopTimeout())
+				}
+			}
+		}
+	}
+
 	deps := m.collectDependencies(unit)
 	if err := m.startDependencies(unit, deps, started, stack); err != nil {
 		unit.MarkFailed(err.Error())
@@ -575,7 +657,7 @@ type dependency struct {
 }
 
 func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
-	deps := make([]dependency, 0, len(unit.Config.Requires)+len(unit.Config.Wants))
+	deps := make([]dependency, 0, len(unit.Config.Requires)+len(unit.Config.Wants)+len(unit.Config.BindsTo))
 	seen := map[string]struct{}{}
 	add := func(name string, required bool) {
 		name = strings.TrimSpace(name)
@@ -589,6 +671,9 @@ func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
 		deps = append(deps, dependency{name: name, required: required})
 	}
 	for _, dep := range unit.Config.Requires {
+		add(dep, true)
+	}
+	for _, dep := range unit.Config.BindsTo {
 		add(dep, true)
 	}
 	for _, dep := range unit.Config.Wants {
@@ -692,7 +777,47 @@ func (m *Manager) StopUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	return unit.Stop(unit.StopTimeout())
+	if err := unit.Stop(unit.StopTimeout()); err != nil {
+		return err
+	}
+	// Cascade to PartOf and BindsTo dependents
+	m.mu.Lock()
+	dependents := []string{}
+	for otherName, otherUnit := range m.Units {
+		if otherName == name {
+			continue
+		}
+		for _, p := range otherUnit.Config.PartOf {
+			if strings.TrimSpace(p) == name {
+				dependents = append(dependents, otherName)
+				break
+			}
+		}
+		for _, b := range otherUnit.Config.BindsTo {
+			if strings.TrimSpace(b) == name {
+				found := false
+				for _, d := range dependents {
+					if d == otherName {
+						found = true
+						break
+					}
+				}
+				if !found {
+					dependents = append(dependents, otherName)
+				}
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, dep := range dependents {
+		if u, err := m.FindUnit(dep); err == nil {
+			if snap := u.Snapshot(); snap.State == service.StateActive || snap.State == service.StateActivating {
+				_ = u.Stop(u.StopTimeout())
+			}
+		}
+	}
+	return nil
 }
 
 func (m *Manager) RestartUnit(name string) error {
@@ -1177,24 +1302,30 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 	snap := unit.Snapshot()
 	cfg := unit.Config
 	data := map[string]string{
-		"Id":                cfg.Name,
-		"Names":             cfg.Name,
-		"Description":       unit.Description(),
-		"LoadState":         "loaded",
-		"ActiveState":       string(snap.State),
-		"SubState":          string(snap.State),
-		"FragmentPath":      unit.Path,
-		"UnitFileState":     m.UnitFileState(cfg.Name),
-		"MainPID":           fmt.Sprintf("%d", snap.MainPID),
-		"ExecMainPID":       fmt.Sprintf("%d", snap.MainPID),
-		"ExitCode":          fmt.Sprintf("%d", snap.ExitCode),
-		"Result":            snap.LastError,
-		"Type":              cfg.Service.Type,
-		"After":             strings.Join(cfg.After, " "),
-		"Requires":          strings.Join(cfg.Requires, " "),
-		"Wants":             strings.Join(cfg.Wants, " "),
-		"ExecStart":         cfg.Service.ExecStart,
-		"WantedBy":          strings.Join(cfg.Install.WantedBy, " "),
+		"Id":                  cfg.Name,
+		"Names":               cfg.Name,
+		"Description":         unit.Description(),
+		"LoadState":           "loaded",
+		"ActiveState":         string(snap.State),
+		"SubState":            string(snap.State),
+		"FragmentPath":        unit.Path,
+		"UnitFileState":       m.UnitFileState(cfg.Name),
+		"MainPID":             fmt.Sprintf("%d", snap.MainPID),
+		"ExecMainPID":         fmt.Sprintf("%d", snap.MainPID),
+		"ExitCode":            fmt.Sprintf("%d", snap.ExitCode),
+		"Result":              snap.LastError,
+		"Type":                cfg.Service.Type,
+		"After":               strings.Join(cfg.After, " "),
+		"Before":              strings.Join(cfg.Before, " "),
+		"Requires":            strings.Join(cfg.Requires, " "),
+		"Wants":               strings.Join(cfg.Wants, " "),
+		"Conflicts":           strings.Join(cfg.Conflicts, " "),
+		"OnFailure":           strings.Join(cfg.OnFailure, " "),
+		"PartOf":              strings.Join(cfg.PartOf, " "),
+		"BindsTo":             strings.Join(cfg.BindsTo, " "),
+		"DefaultDependencies": cfg.DefaultDependencies,
+		"ExecStart":           cfg.Service.ExecStart,
+		"WantedBy":            strings.Join(cfg.Install.WantedBy, " "),
 	}
 	if !snap.StartedAt.IsZero() {
 		data["ActiveEnterTimestamp"] = snap.StartedAt.Format(time.RFC3339)
@@ -1459,6 +1590,16 @@ func (m *Manager) orderUnitsByAfter(units []*service.Unit) []*service.Unit {
 			adj[dep] = append(adj[dep], unit.Config.Name)
 			indegree[unit.Config.Name]++
 		}
+		for _, dep := range unit.Config.Before {
+			if strings.HasSuffix(dep, ".target") || !strings.HasSuffix(dep, ".service") {
+				continue
+			}
+			if _, ok := nameToUnit[dep]; !ok || dep == unit.Config.Name {
+				continue
+			}
+			adj[unit.Config.Name] = append(adj[unit.Config.Name], dep)
+			indegree[dep]++
+		}
 	}
 
 	queue := make([]string, 0, len(units))
@@ -1534,8 +1675,13 @@ func cloneAndExpandTemplate(tmpl *parser.Unit, instanceName, instance string) *p
 	clone.Name = instanceName
 	clone.Description = expandSpecifiers(clone.Description, instanceName, instance)
 	clone.After = expandSlice(clone.After, instanceName, instance)
+	clone.Before = expandSlice(clone.Before, instanceName, instance)
 	clone.Requires = expandSlice(clone.Requires, instanceName, instance)
 	clone.Wants = expandSlice(clone.Wants, instanceName, instance)
+	clone.Conflicts = expandSlice(clone.Conflicts, instanceName, instance)
+	clone.OnFailure = expandSlice(clone.OnFailure, instanceName, instance)
+	clone.PartOf = expandSlice(clone.PartOf, instanceName, instance)
+	clone.BindsTo = expandSlice(clone.BindsTo, instanceName, instance)
 	clone.ConditionPathExists = expandSlice(clone.ConditionPathExists, instanceName, instance)
 	clone.Service.ExecStart = expandSpecifiers(clone.Service.ExecStart, instanceName, instance)
 	clone.Service.ExecStop = expandSpecifiers(clone.Service.ExecStop, instanceName, instance)
