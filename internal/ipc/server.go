@@ -102,9 +102,9 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 		return err
 	}
 	defer listener.Close()
-	if manager != nil && manager.UserMode {
-		_ = os.Chmod(socketPath, 0700)
-	}
+	// The control socket is privileged regardless of user/system mode; keep
+	// it owner-only so other users can't connect and issue commands.
+	_ = os.Chmod(socketPath, 0700)
 
 	for {
 		conn, err := listener.Accept()
