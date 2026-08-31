@@ -1051,10 +1051,21 @@ func processAlive(pid int) bool {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
-	if err == nil {
+	if err != nil && err != syscall.EPERM {
+		return false
+	}
+	// A zombie still passes kill(pid, 0) but is not a running process.
+	// Treat it as dead so a Type=notify process that exited before READY=1
+	// is not wrongly reported as active. /proc/<pid>/stat state is the
+	// field after the parenthesised comm (which may contain spaces).
+	data, rerr := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if rerr != nil {
 		return true
 	}
-	return err == syscall.EPERM
+	if idx := strings.LastIndexByte(string(data), ')'); idx >= 0 && idx+2 < len(data) {
+		return data[idx+2] != 'Z'
+	}
+	return true
 }
 
 func (u *Unit) canonicalServiceType() string {
@@ -1619,6 +1630,18 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 	timer := time.NewTimer(u.StartTimeout())
 	defer timer.Stop()
 
+	// Monitor process exit during the activating phase. Without this, a
+	// Type=notify process that dies before sending READY=1 is left as a
+	// zombie and the unit is stuck in "activating" until timeout, then
+	// wrongly marked "active" because a zombie still passes processAlive.
+	// A single Wait() goroutine is shared by all branches below.
+	waitCh := make(chan error, 1)
+	if u.reaper == nil && cmd != nil {
+		go func(c *exec.Cmd) {
+			waitCh <- c.Wait()
+		}(cmd)
+	}
+
 	select {
 
 	case <-server.Ready:
@@ -1637,15 +1660,16 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			return
 		}
 		if u.reaper == nil && cmd != nil {
-			go func(c *exec.Cmd) {
-				if err := c.Wait(); err != nil {
-					u.handleExit(token, err, ignoreFailure, true)
-				} else {
-					u.handleExit(token, nil, ignoreFailure, true)
-				}
-			}(cmd)
+			go func() {
+				u.handleExit(token, <-waitCh, ignoreFailure, true)
+			}()
 		}
 
+		return
+
+	case err := <-waitCh:
+		// Process exited before sending READY=1.
+		u.handleExit(token, err, ignoreFailure, true)
 		return
 
 	case <-timer.C:
@@ -1670,13 +1694,9 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			u.mu.Unlock()
 			u.Log(logging.LevelInfo, "Type=notify readiness timed out; falling back to active because process is still running")
 			if u.reaper == nil && cmd != nil {
-				go func(c *exec.Cmd) {
-					if err := c.Wait(); err != nil {
-						u.handleExit(token, err, ignoreFailure, true)
-					} else {
-						u.handleExit(token, nil, ignoreFailure, true)
-					}
-				}(cmd)
+				go func() {
+					u.handleExit(token, <-waitCh, ignoreFailure, true)
+				}()
 			}
 			return
 		}
@@ -1687,9 +1707,9 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 
 		u.markFailed(fmt.Errorf("notify timeout"), ignoreFailure)
 		if u.reaper == nil && cmd != nil {
-			go func(c *exec.Cmd) {
-				_ = c.Wait()
-			}(cmd)
+			go func() {
+				_ = <-waitCh
+			}()
 		}
 		return
 	}

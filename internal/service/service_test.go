@@ -2,7 +2,10 @@ package service
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -295,4 +298,78 @@ func TestSimpleServiceFailure(t *testing.T) {
 	if u.Snapshot().ExitCode == 0 {
 		t.Error("ExitCode should be non-zero for /bin/false")
 	}
+}
+
+// TestNotifyServiceExitsBeforeReady verifies that a Type=notify process that
+// exits before sending READY=1 is reaped and the unit is marked failed, rather
+// than being left stuck in "activating" or wrongly reported "active" because a
+// zombie still passes processAlive. This exercises the reaper==nil path.
+func TestNotifyServiceExitsBeforeReady(t *testing.T) {
+	u := newTestUnit(t, "notify-false.service", "[Service]\nType=notify\nExecStart=/bin/false\n")
+	if _, err := u.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		state := u.Snapshot().State
+		if state == StateFailed || state == StateInactive {
+			break
+		}
+		if state == StateActive {
+			t.Fatalf("notify service whose process exited before READY was marked active")
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("notify service did not settle, state=%s", state)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := u.Snapshot().State; got != StateFailed {
+		t.Errorf("state = %s, want failed", got)
+	}
+	if u.Snapshot().ExitCode == 0 {
+		t.Error("ExitCode should be non-zero for /bin/false")
+	}
+}
+
+func TestProcessAliveZombie(t *testing.T) {
+	// A zombie must not be reported as alive.
+	cmd := exec.Command("/bin/sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	pid := cmd.Process.Pid
+	if !processAlive(pid) {
+		t.Fatal("running process should be alive")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	// Wait for it to become a zombie (exited but not yet reaped).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if procState(pid) == 'Z' {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("process did not become a zombie")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		t.Fatal("zombie should not be reported as alive")
+	}
+	// Reap it to avoid leaking a zombie.
+	cmd.Process.Wait()
+}
+
+// procState reads the process state character from /proc/<pid>/stat.
+func procState(pid int) byte {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0
+	}
+	if idx := strings.LastIndexByte(string(data), ')'); idx >= 0 && idx+2 < len(data) {
+		return data[idx+2]
+	}
+	return 0
 }
