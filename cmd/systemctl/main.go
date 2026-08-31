@@ -7,9 +7,13 @@ import (
 	"initd/internal/ipc"
 	"initd/internal/userpaths"
 	"io"
+	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -59,6 +63,7 @@ func main() {
 	if resolvedSocket == "" {
 		if userFlag {
 			resolvedSocket = userpaths.UserSocketPath()
+			ensureUserDaemon(resolvedSocket)
 		} else {
 			resolvedSocket = userpaths.SystemSocketPath()
 		}
@@ -745,4 +750,64 @@ func printHelp() {
 
 func printVersion() {
 	fmt.Printf("systemctl (initd) %s by prabhatkrmishra (https://github.com/prabhatkrmishra/initd.git) MIT License\n", systemctlVersion)
+}
+
+func ensureUserDaemon(socketPath string) {
+	if strings.HasPrefix(socketPath, "@") {
+		return
+	}
+	if userpaths.IsUserDaemonRunning() {
+		return
+	}
+	if canDial(socketPath) {
+		return
+	}
+	bin := findInitdBinary()
+	if bin == "" {
+		return
+	}
+	cmd := exec.Command(bin, "--socket")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	_ = cmd.Start()
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if userpaths.IsUserDaemonRunning() || canDial(socketPath) {
+			return
+		}
+	}
+}
+
+func canDial(path string) bool {
+	if strings.HasPrefix(path, "@") {
+		path = "\x00" + strings.TrimPrefix(path, "@")
+	}
+	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func findInitdBinary() string {
+	if p, err := exec.LookPath("initd"); err == nil {
+		return p
+	}
+	candidates := []string{
+		"/usr/local/bin/initd",
+		"/usr/bin/initd",
+		filepath.Join(filepath.Dir(os.Args[0]), "initd"),
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return c
+		}
+	}
+	return ""
 }
