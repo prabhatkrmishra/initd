@@ -93,13 +93,6 @@ func (u *Unit) Reaper() ExitReaper {
 	return u.reaper
 }
 
-func (u *Unit) Description() string {
-	if u.Config.Description != "" {
-		return u.Config.Description
-	}
-	return u.Config.Name
-}
-
 func (u *Unit) Snapshot() Runtime {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -156,6 +149,7 @@ func (u *Unit) Start() (int, error) {
 	}
 
 	execStart, ignoreFailure := stripPrefix(execStart)
+	execStart = u.expandSpecifiers(execStart)
 	expandedStart := expandWithEnv(execStart, envMap)
 	args, err := shlex.Split(expandedStart)
 	if err != nil {
@@ -920,6 +914,44 @@ func expandWithEnv(input string, envMap map[string]string) string {
 	})
 }
 
+func (u *Unit) expandSpecifiers(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	fullName := u.Config.Name
+	prefix := fullName
+	instance := ""
+	if idx := strings.Index(fullName, "@"); idx >= 0 {
+		prefix = fullName[:idx]
+		rest := fullName[idx+1:]
+		rest = strings.TrimSuffix(rest, ".service")
+		rest = strings.TrimSuffix(rest, ".socket")
+		instance = rest
+		if instance == "." {
+			instance = ""
+		}
+	}
+	nameWithoutSuffix := strings.TrimSuffix(fullName, ".service")
+	nameWithoutSuffix = strings.TrimSuffix(nameWithoutSuffix, ".socket")
+	// user and home for %u/%h
+	userName := ""
+	homeDir := ""
+	if cur, err := user.Current(); err == nil {
+		userName = cur.Username
+		homeDir = cur.HomeDir
+	}
+	s = strings.ReplaceAll(s, "%%", "\x00")
+	s = strings.ReplaceAll(s, "%n", fullName)
+	s = strings.ReplaceAll(s, "%N", nameWithoutSuffix)
+	s = strings.ReplaceAll(s, "%p", prefix)
+	s = strings.ReplaceAll(s, "%i", instance)
+	s = strings.ReplaceAll(s, "%I", instance)
+	s = strings.ReplaceAll(s, "%u", userName)
+	s = strings.ReplaceAll(s, "%h", homeDir)
+	s = strings.ReplaceAll(s, "\x00", "%")
+	return s
+}
+
 func stripPrefix(command string) (string, bool) {
 	ignoreFailure := false
 	if strings.HasPrefix(command, "-") {
@@ -1160,6 +1192,7 @@ func (u *Unit) runCommand(command string, envMap map[string]string, envList []st
 
 func (u *Unit) runCommandStatus(command string, envMap map[string]string, envList []string, opts commandOptions) (int, error) {
 	command, ignoreFailure := stripPrefix(command)
+	command = u.expandSpecifiers(command)
 	expanded := expandWithEnv(command, envMap)
 	args, err := shlex.Split(expanded)
 	if err != nil {
@@ -1591,9 +1624,16 @@ func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error)
 
 func (u *Unit) workingDirectory() string {
 	if dir := strings.TrimSpace(u.Config.Service.WorkingDirectory); dir != "" {
-		return dir
+		return u.expandSpecifiers(dir)
 	}
 	return filepath.Dir(u.Path)
+}
+
+func (u *Unit) Description() string {
+	if u.Config.Description != "" {
+		return u.expandSpecifiers(u.Config.Description)
+	}
+	return u.Config.Name
 }
 
 func (u *Unit) SuccessExitStatus() map[int]struct{} {

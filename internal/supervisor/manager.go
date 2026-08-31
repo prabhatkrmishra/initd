@@ -100,7 +100,7 @@ func (m *Manager) LoadUnits() error {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			unitConfig, err := parser.ParseUnit(path)
+			unitConfig, err := parser.ParseUnitWithDropins(path, m.SearchPaths, m.EnabledRoot)
 			if err != nil {
 				continue
 			}
