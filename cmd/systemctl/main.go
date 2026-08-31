@@ -75,7 +75,9 @@ func main() {
 	client := &ipc.Client{SocketPath: resolvedSocket}
 
 	switch cmd {
-	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "enable", "disable", "mask", "unmask", "show", "cat", "kill":
+	case "enable", "disable":
+		handleEnableDisable(client, cmd, cmdArgs)
+	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "mask", "unmask", "show", "cat", "kill":
 		if cmd == "kill" {
 			handleKillCommand(client, cmdArgs)
 			break
@@ -143,6 +145,37 @@ func handleIsSystemRunning(client *ipc.Client) {
 		os.Exit(1)
 	default:
 		os.Exit(3)
+	}
+}
+
+func handleEnableDisable(client *ipc.Client, action string, args []string) {
+	now := false
+	units := []string{}
+	for _, a := range args {
+		if a == "--now" {
+			now = true
+		} else if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
+			os.Exit(1)
+		} else {
+			units = append(units, a)
+		}
+	}
+	if len(units) == 0 {
+		fmt.Fprintf(os.Stderr, "%s requires a unit name\n", action)
+		os.Exit(1)
+	}
+	for _, unit := range units {
+		resolved, _ := resolveUnitName(client, unit)
+		resp, err := client.Do(ipc.Request{Action: action, Unit: resolved, Now: now})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
 	}
 }
 

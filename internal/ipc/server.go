@@ -19,6 +19,7 @@ type Request struct {
 	Action string `json:"action"`
 	Unit   string `json:"unit,omitempty"`
 	Signal string `json:"signal,omitempty"`
+	Now    bool   `json:"now,omitempty"`
 }
 
 type Response struct {
@@ -210,13 +211,25 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true, Data: data}
 	case "enable":
-		if err := manager.EnableUnit(req.Unit); err != nil {
-			return Response{Success: false, Message: err.Error()}
+		if req.Now {
+			if err := manager.EnableUnitWithNow(req.Unit, true); err != nil {
+				return Response{Success: false, Message: err.Error()}
+			}
+		} else {
+			if err := manager.EnableUnit(req.Unit); err != nil {
+				return Response{Success: false, Message: err.Error()}
+			}
 		}
 		return Response{Success: true}
 	case "disable":
-		if err := manager.DisableUnit(req.Unit); err != nil {
-			return Response{Success: false, Message: err.Error()}
+		if req.Now {
+			if err := manager.DisableUnitWithNow(req.Unit, true); err != nil {
+				return Response{Success: false, Message: err.Error()}
+			}
+		} else {
+			if err := manager.DisableUnit(req.Unit); err != nil {
+				return Response{Success: false, Message: err.Error()}
+			}
 		}
 		return Response{Success: true}
 	case "is-enabled":

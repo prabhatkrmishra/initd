@@ -123,6 +123,33 @@ func (m *Manager) LoadUnits() error {
 		}
 	}
 
+	// Preserve template instances that were previously instantiated
+	for name, oldUnit := range oldUnits {
+		if _, exists := units[name]; exists {
+			continue
+		}
+		if !isTemplateInstance(name) {
+			continue
+		}
+		tmplName, instance := parseTemplateInstance(name)
+		if tmplName == "" {
+			continue
+		}
+		tmpl, ok := units[tmplName]
+		if !ok {
+			continue
+		}
+		// Re-instantiate from updated template
+		newConfig := cloneAndExpandTemplate(tmpl.Config, name, instance)
+		oldUnit.Config = newConfig
+		oldUnit.Path = tmpl.Path
+		if oldUnit.Reaper() == nil && m.reaper != nil {
+			oldUnit.SetReaper(m.reaper)
+		}
+		units[name] = oldUnit
+		order = append(order, name)
+	}
+
 	m.Units = units
 	m.UnitOrder = order
 	return nil
@@ -132,11 +159,44 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	unit, ok := m.Units[name]
-	if !ok {
-		return nil, fmt.Errorf("unit %s not found", name)
+	if unit, ok := m.Units[name]; ok {
+		return unit, nil
 	}
-	return unit, nil
+	// Try template instance: foo@bar.service -> foo@.service
+	if isTemplateInstance(name) {
+		tmplName, instance := parseTemplateInstance(name)
+		if tmpl, ok := m.Units[tmplName]; ok {
+			newConfig := cloneAndExpandTemplate(tmpl.Config, name, instance)
+			unit := service.NewUnit(newConfig, tmpl.Path)
+			if m.reaper != nil {
+				unit.SetReaper(m.reaper)
+			}
+			m.Units[name] = unit
+			m.UnitOrder = append(m.UnitOrder, name)
+			return unit, nil
+		}
+	}
+	return nil, fmt.Errorf("unit %s not found", name)
+}
+
+func (m *Manager) findUnitLocked(name string) (*service.Unit, error) {
+	if unit, ok := m.Units[name]; ok {
+		return unit, nil
+	}
+	if isTemplateInstance(name) {
+		tmplName, instance := parseTemplateInstance(name)
+		if tmpl, ok := m.Units[tmplName]; ok {
+			newConfig := cloneAndExpandTemplate(tmpl.Config, name, instance)
+			unit := service.NewUnit(newConfig, tmpl.Path)
+			if m.reaper != nil {
+				unit.SetReaper(m.reaper)
+			}
+			m.Units[name] = unit
+			m.UnitOrder = append(m.UnitOrder, name)
+			return unit, nil
+		}
+	}
+	return nil, fmt.Errorf("unit %s not found", name)
 }
 
 func (m *Manager) StartUnit(name string) error {
@@ -447,6 +507,14 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 }
 
 func (m *Manager) EnableUnit(name string) error {
+	return m.enableUnitInternal(name, false)
+}
+
+func (m *Manager) EnableUnitWithNow(name string, now bool) error {
+	return m.enableUnitInternal(name, now)
+}
+
+func (m *Manager) enableUnitInternal(name string, now bool) error {
 	if m.IsMasked(name) {
 		return fmt.Errorf("unit %s is masked", name)
 	}
@@ -454,7 +522,11 @@ func (m *Manager) EnableUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	if len(unit.Config.Install.WantedBy) == 0 {
+	// If WantedBy is empty but Also/Alias exist, still allow enable for those
+	hasWantedBy := len(unit.Config.Install.WantedBy) > 0
+	hasAlso := len(unit.Config.Install.Also) > 0
+	hasAlias := len(unit.Config.Install.Alias) > 0
+	if !hasWantedBy && !hasAlso && !hasAlias {
 		return errors.New("WantedBy not set")
 	}
 	root := m.EnabledRoot
@@ -472,10 +544,53 @@ func (m *Manager) EnableUnit(name string) error {
 			return err
 		}
 	}
+	// Handle Also= — enable those units as well
+	for _, alsoName := range unit.Config.Install.Also {
+		alsoName = strings.TrimSpace(alsoName)
+		if alsoName == "" {
+			continue
+		}
+		if alsoUnit, err := m.FindUnit(alsoName); err == nil {
+			for _, target := range alsoUnit.Config.Install.WantedBy {
+				wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
+				_ = os.MkdirAll(wantsDir, 0o755)
+				linkPath := filepath.Join(wantsDir, alsoName)
+				_ = os.Remove(linkPath)
+				_ = os.Symlink(alsoUnit.Path, linkPath)
+			}
+		}
+	}
+	// Handle Alias= — create alias symlinks at EnabledRoot
+	for _, alias := range unit.Config.Install.Alias {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return err
+		}
+		aliasPath := filepath.Join(root, alias)
+		_ = os.Remove(aliasPath)
+		if err := os.Symlink(unit.Path, aliasPath); err != nil {
+			return err
+		}
+	}
+	if now {
+		// Best-effort start; don't fail enable if start fails
+		_ = m.StartUnit(name)
+	}
 	return nil
 }
 
 func (m *Manager) DisableUnit(name string) error {
+	return m.disableUnitInternal(name, false)
+}
+
+func (m *Manager) DisableUnitWithNow(name string, now bool) error {
+	return m.disableUnitInternal(name, now)
+}
+
+func (m *Manager) disableUnitInternal(name string, now bool) error {
 	unit, err := m.FindUnit(name)
 	if err != nil {
 		return err
@@ -489,6 +604,36 @@ func (m *Manager) DisableUnit(name string) error {
 		linkPath := filepath.Join(wantsDir, name)
 		_ = os.Remove(linkPath)
 	}
+	// Also disable Also= units
+	for _, alsoName := range unit.Config.Install.Also {
+		alsoName = strings.TrimSpace(alsoName)
+		if alsoName == "" {
+			continue
+		}
+		if alsoUnit, err := m.FindUnit(alsoName); err == nil {
+			for _, target := range alsoUnit.Config.Install.WantedBy {
+				wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
+				linkPath := filepath.Join(wantsDir, alsoName)
+				_ = os.Remove(linkPath)
+			}
+		}
+	}
+	// Remove Alias symlinks
+	for _, alias := range unit.Config.Install.Alias {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		aliasPath := filepath.Join(root, alias)
+		if fi, err := os.Lstat(aliasPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if target, err := os.Readlink(aliasPath); err == nil && target == unit.Path {
+				_ = os.Remove(aliasPath)
+			}
+		}
+	}
+	if now {
+		_ = m.StopUnit(name)
+	}
 	return nil
 }
 
@@ -497,6 +642,24 @@ func (m *Manager) IsEnabled(name string) (bool, error) {
 	_, ok := m.Units[name]
 	m.mu.Unlock()
 	if !ok {
+		// Template instance not yet instantiated — check if template exists
+		if isTemplateInstance(name) {
+			tmplName, _ := parseTemplateInstance(name)
+			m.mu.Lock()
+			_, tmplOk := m.Units[tmplName]
+			m.mu.Unlock()
+			if tmplOk {
+				if m.IsMasked(name) {
+					return false, nil
+				}
+				enabled, err := m.enabledUnitNames()
+				if err != nil {
+					return false, err
+				}
+				_, ok = enabled[name]
+				return ok, nil
+			}
+		}
 		return false, fmt.Errorf("unit %s not found", name)
 	}
 	if m.IsMasked(name) {
@@ -860,4 +1023,95 @@ func (m *Manager) orderUnitsByAfter(units []*service.Unit) []*service.Unit {
 
 func logKernelWarning(message string) {
 	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "%s", message)
+}
+
+func isTemplateInstance(name string) bool {
+	if !strings.HasSuffix(name, ".service") {
+		return false
+	}
+	base := strings.TrimSuffix(name, ".service")
+	atIdx := strings.Index(base, "@")
+	if atIdx < 0 {
+		return false
+	}
+	instance := base[atIdx+1:]
+	return instance != "" && instance != "."
+}
+
+func parseTemplateInstance(name string) (string, string) {
+	if !isTemplateInstance(name) {
+		return "", ""
+	}
+	suffix := ".service"
+	base := strings.TrimSuffix(name, suffix)
+	atIdx := strings.Index(base, "@")
+	prefix := base[:atIdx]
+	instance := base[atIdx+1:]
+	tmpl := prefix + "@" + suffix
+	return tmpl, instance
+}
+
+func cloneAndExpandTemplate(tmpl *parser.Unit, instanceName, instance string) *parser.Unit {
+	if tmpl == nil {
+		return nil
+	}
+	clone := *tmpl
+	clone.Name = instanceName
+	clone.Description = expandSpecifiers(clone.Description, instanceName, instance)
+	clone.After = expandSlice(clone.After, instanceName, instance)
+	clone.Requires = expandSlice(clone.Requires, instanceName, instance)
+	clone.Wants = expandSlice(clone.Wants, instanceName, instance)
+	clone.ConditionPathExists = expandSlice(clone.ConditionPathExists, instanceName, instance)
+	clone.Service.ExecStart = expandSpecifiers(clone.Service.ExecStart, instanceName, instance)
+	clone.Service.ExecStop = expandSpecifiers(clone.Service.ExecStop, instanceName, instance)
+	clone.Service.ExecCondition = expandSlice(clone.Service.ExecCondition, instanceName, instance)
+	clone.Service.ExecStartPre = expandSlice(clone.Service.ExecStartPre, instanceName, instance)
+	clone.Service.ExecStartPost = expandSlice(clone.Service.ExecStartPost, instanceName, instance)
+	clone.Service.ExecStopPost = expandSlice(clone.Service.ExecStopPost, instanceName, instance)
+	clone.Service.ExecReload = expandSlice(clone.Service.ExecReload, instanceName, instance)
+	clone.Service.WorkingDirectory = expandSpecifiers(clone.Service.WorkingDirectory, instanceName, instance)
+	clone.Service.RootDirectory = expandSpecifiers(clone.Service.RootDirectory, instanceName, instance)
+	clone.Service.PIDFile = expandSpecifiers(clone.Service.PIDFile, instanceName, instance)
+	clone.Service.Environment = expandSlice(clone.Service.Environment, instanceName, instance)
+	clone.Service.EnvironmentFile = expandSlice(clone.Service.EnvironmentFile, instanceName, instance)
+	clone.Service.RuntimeDirectory = expandSlice(clone.Service.RuntimeDirectory, instanceName, instance)
+	clone.Service.StateDirectory = expandSlice(clone.Service.StateDirectory, instanceName, instance)
+	clone.Service.CacheDirectory = expandSlice(clone.Service.CacheDirectory, instanceName, instance)
+	clone.Service.LogsDirectory = expandSlice(clone.Service.LogsDirectory, instanceName, instance)
+	clone.Service.ConfigurationDirectory = expandSlice(clone.Service.ConfigurationDirectory, instanceName, instance)
+	clone.Install.WantedBy = expandSlice(clone.Install.WantedBy, instanceName, instance)
+	clone.Install.Also = expandSlice(clone.Install.Also, instanceName, instance)
+	clone.Install.Alias = expandSlice(clone.Install.Alias, instanceName, instance)
+	return &clone
+}
+
+func expandSlice(in []string, fullName, instance string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = expandSpecifiers(s, fullName, instance)
+	}
+	return out
+}
+
+func expandSpecifiers(s, fullName, instance string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	prefix := fullName
+	if idx := strings.Index(fullName, "@"); idx >= 0 {
+		prefix = fullName[:idx]
+	}
+	nameWithoutSuffix := strings.TrimSuffix(fullName, ".service")
+	// Escape handling: %% -> %
+	s = strings.ReplaceAll(s, "%%", "\x00")
+	s = strings.ReplaceAll(s, "%i", instance)
+	s = strings.ReplaceAll(s, "%I", instance)
+	s = strings.ReplaceAll(s, "%n", fullName)
+	s = strings.ReplaceAll(s, "%N", nameWithoutSuffix)
+	s = strings.ReplaceAll(s, "%p", prefix)
+	s = strings.ReplaceAll(s, "\x00", "%")
+	return s
 }

@@ -66,6 +66,8 @@ type SocketSection struct {
 
 type InstallSection struct {
 	WantedBy []string
+	Also     []string
+	Alias    []string
 }
 
 var ignoredKeys = map[string]struct{}{
@@ -281,6 +283,10 @@ func ParseUnit(path string) (*Unit, error) {
 			switch key {
 			case "WantedBy":
 				unit.Install.WantedBy = splitList(value)
+			case "Also":
+				unit.Install.Also = append(unit.Install.Also, splitList(value)...)
+			case "Alias":
+				unit.Install.Alias = append(unit.Install.Alias, splitList(value)...)
 			default:
 				unit.Ignored["Install."+key] = value
 			}
