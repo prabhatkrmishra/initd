@@ -162,41 +162,63 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "status":
-		unit, err := manager.FindUnit(req.Unit)
-		if err != nil {
-			return Response{Success: false, Message: err.Error()}
+		if unit, err := manager.FindUnit(req.Unit); err == nil {
+			snapshot := unit.Snapshot()
+			logs := unit.Logs.Entries()
+			logLines := make([]string, 0, len(logs))
+			for _, entry := range logs {
+				logLines = append(logLines, logging.FormatEntry(entry))
+			}
+			return Response{Success: true, Data: StatusData{
+				Name:                unit.Config.Name,
+				Description:         unit.Description(),
+				State:               snapshot.State,
+				MainPID:             snapshot.MainPID,
+				StartedAt:           snapshot.StartedAt,
+				FinishedAt:          snapshot.FinishedAt,
+				StartedAtMonotonic:  snapshot.StartedAtMonotonic,
+				FinishedAtMonotonic: snapshot.FinishedAtMonotonic,
+				LastError:           snapshot.LastError,
+				Logs:                logLines,
+			}}
 		}
-		snapshot := unit.Snapshot()
-		logs := unit.Logs.Entries()
-		logLines := make([]string, 0, len(logs))
-		for _, entry := range logs {
-			logLines = append(logLines, logging.FormatEntry(entry))
+		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
+			state, _ := manager.SocketActiveState(req.Unit)
+			return Response{Success: true, Data: StatusData{
+				Name:        req.Unit,
+				Description: req.Unit,
+				State:       service.State(state),
+			}}
 		}
-		return Response{Success: true, Data: StatusData{
-			Name:                unit.Config.Name,
-			Description:         unit.Description(),
-			State:               snapshot.State,
-			MainPID:             snapshot.MainPID,
-			StartedAt:           snapshot.StartedAt,
-			FinishedAt:          snapshot.FinishedAt,
-			StartedAtMonotonic:  snapshot.StartedAtMonotonic,
-			FinishedAtMonotonic: snapshot.FinishedAtMonotonic,
-			LastError:           snapshot.LastError,
-			Logs:                logLines,
-		}}
+		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "is-active":
-		unit, err := manager.FindUnit(req.Unit)
-		if err != nil {
-			return Response{Success: false, Message: err.Error()}
+		if unit, err := manager.FindUnit(req.Unit); err == nil {
+			state := unit.Snapshot().State
+			return Response{Success: true, Data: state}
 		}
-		state := unit.Snapshot().State
-		return Response{Success: true, Data: state}
+		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
+			state, _ := manager.SocketActiveState(req.Unit)
+			return Response{Success: true, Data: state}
+		}
+		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "list-units":
 		units := manager.ListUnits()
-		data := make([]UnitData, 0, len(units))
+		data := make([]UnitData, 0, len(units)+len(manager.SocketUnitNames()))
 		for _, unit := range units {
 			snapshot := unit.Snapshot()
 			data = append(data, UnitData{Name: unit.Config.Name, Description: unit.Description(), State: snapshot.State, Type: unit.Config.Type})
+		}
+		for _, name := range manager.SocketUnitNames() {
+			state, _ := manager.SocketActiveState(name)
+			cfg, _ := manager.FindSocketUnit(name)
+			desc := name
+			if cfg != nil {
+				desc = cfg.Description
+				if desc == "" {
+					desc = name
+				}
+			}
+			data = append(data, UnitData{Name: name, Description: desc, State: service.State(state), Type: "socket"})
 		}
 		return Response{Success: true, Data: data}
 	case "list-unit-files":
@@ -259,17 +281,21 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "show":
-		data, err := manager.ShowUnit(req.Unit)
-		if err != nil {
-			return Response{Success: false, Message: err.Error()}
+		if data, err := manager.ShowUnit(req.Unit); err == nil {
+			return Response{Success: true, Data: data}
 		}
-		return Response{Success: true, Data: data}
+		if data, err := manager.ShowSocketUnit(req.Unit); err == nil {
+			return Response{Success: true, Data: data}
+		}
+		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "cat":
-		content, err := manager.CatUnit(req.Unit)
-		if err != nil {
-			return Response{Success: false, Message: err.Error()}
+		if content, err := manager.CatUnit(req.Unit); err == nil {
+			return Response{Success: true, Data: content}
 		}
-		return Response{Success: true, Data: content}
+		if content, err := manager.CatSocketUnit(req.Unit); err == nil {
+			return Response{Success: true, Data: content}
+		}
+		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "mask":
 		if err := manager.MaskUnit(req.Unit); err != nil {
 			return Response{Success: false, Message: err.Error()}

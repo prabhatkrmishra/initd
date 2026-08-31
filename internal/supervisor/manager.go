@@ -3,9 +3,11 @@ package supervisor
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,16 +21,31 @@ import (
 )
 
 type Manager struct {
-	mu          sync.Mutex
-	startMu     sync.Mutex
-	Units       map[string]*service.Unit
-	SearchPaths []string
-	UnitOrder   []string
-	reaper      service.ExitReaper
-	bootStarted bool
-	bootDone    bool
-	UserMode    bool
-	EnabledRoot string
+	mu             sync.Mutex
+	startMu        sync.Mutex
+	Units          map[string]*service.Unit
+	SocketUnits    map[string]*parser.Unit
+	SocketPaths    map[string]string
+	SocketRuntimes map[string]*socketRuntime
+	SearchPaths    []string
+	UnitOrder      []string
+	reaper         service.ExitReaper
+	bootStarted    bool
+	bootDone       bool
+	UserMode       bool
+	EnabledRoot    string
+}
+
+type socketRuntime struct {
+	unit      *parser.Unit
+	listeners []net.Listener
+	packets   []net.PacketConn
+	paths     []string
+	path      string
+	listener  net.Listener
+	packet    net.PacketConn
+	active    bool
+	stopCh    chan struct{}
 }
 
 func NewManager() *Manager {
@@ -37,7 +54,9 @@ func NewManager() *Manager {
 
 func NewSystemManager() *Manager {
 	return &Manager{
-		Units: map[string]*service.Unit{},
+		Units:          map[string]*service.Unit{},
+		SocketUnits:    map[string]*parser.Unit{},
+		SocketRuntimes: map[string]*socketRuntime{},
 		SearchPaths: []string{
 			"/etc/systemd/system",
 			"/lib/systemd/system",
@@ -50,10 +69,12 @@ func NewSystemManager() *Manager {
 
 func NewUserManager() *Manager {
 	return &Manager{
-		Units:       map[string]*service.Unit{},
-		SearchPaths: userpaths.UserUnitsPaths(),
-		EnabledRoot: userpaths.UserEnabledRoot(),
-		UserMode:    true,
+		Units:          map[string]*service.Unit{},
+		SocketUnits:    map[string]*parser.Unit{},
+		SocketRuntimes: map[string]*socketRuntime{},
+		SearchPaths:    userpaths.UserUnitsPaths(),
+		EnabledRoot:    userpaths.UserEnabledRoot(),
+		UserMode:       true,
 	}
 }
 
@@ -84,8 +105,16 @@ func (m *Manager) LoadUnits() error {
 	defer m.mu.Unlock()
 
 	oldUnits := m.Units
+	oldSocketUnits := m.SocketUnits
+	oldSocketPaths := m.SocketPaths
 	units := map[string]*service.Unit{}
 	order := []string{}
+	newSocketUnits := map[string]*parser.Unit{}
+	newSocketPaths := map[string]string{}
+	// Preserve existing runtimes map
+	if m.SocketRuntimes == nil {
+		m.SocketRuntimes = map[string]*socketRuntime{}
+	}
 
 	for _, dir := range m.SearchPaths {
 		entries, err := os.ReadDir(dir)
@@ -93,10 +122,18 @@ func (m *Manager) LoadUnits() error {
 			continue
 		}
 		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".service") {
+			if entry.IsDir() {
+				continue
+			}
+			isService := strings.HasSuffix(entry.Name(), ".service")
+			isSocket := strings.HasSuffix(entry.Name(), ".socket")
+			if !isService && !isSocket {
 				continue
 			}
 			if _, exists := units[entry.Name()]; exists {
+				continue
+			}
+			if _, exists := newSocketUnits[entry.Name()]; exists {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -105,6 +142,16 @@ func (m *Manager) LoadUnits() error {
 				continue
 			}
 			unitConfig.Name = entry.Name()
+			if isSocket {
+				newSocketUnits[entry.Name()] = unitConfig
+				newSocketPaths[entry.Name()] = path
+				// Preserve old config if exists but update
+				if _, ok := oldSocketUnits[entry.Name()]; ok {
+					// keep runtime if active
+				}
+				_ = oldSocketPaths
+				continue
+			}
 			if old, ok := oldUnits[entry.Name()]; ok {
 				old.Config = unitConfig
 				old.Path = path
@@ -152,6 +199,26 @@ func (m *Manager) LoadUnits() error {
 
 	m.Units = units
 	m.UnitOrder = order
+	m.SocketUnits = newSocketUnits
+	m.SocketPaths = newSocketPaths
+	// Clean up runtimes for removed socket units
+	for name, rt := range m.SocketRuntimes {
+		if _, ok := newSocketUnits[name]; !ok {
+			if rt.active {
+				close(rt.stopCh)
+				if rt.listener != nil {
+					_ = rt.listener.Close()
+				}
+				if rt.packet != nil {
+					_ = rt.packet.Close()
+				}
+				if rt.path != "" {
+					_ = os.Remove(rt.path)
+				}
+			}
+			delete(m.SocketRuntimes, name)
+		}
+	}
 	return nil
 }
 
@@ -203,12 +270,234 @@ func (m *Manager) StartUnit(name string) error {
 	if m.IsMasked(name) {
 		return fmt.Errorf("unit %s is masked", name)
 	}
+	if strings.HasSuffix(name, ".socket") {
+		return m.startSocketUnit(name)
+	}
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 
 	started := map[string]struct{}{}
 	stack := map[string]struct{}{}
 	return m.startUnitWithDependencies(name, started, stack)
+}
+
+func (m *Manager) startSocketUnit(name string) error {
+	m.mu.Lock()
+	cfg, ok := m.SocketUnits[name]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("unit %s not found", name)
+	}
+	if rt, ok := m.SocketRuntimes[name]; ok && rt.active {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	if len(cfg.Socket.ListenStream) == 0 && len(cfg.Socket.ListenDatagram) == 0 {
+		return fmt.Errorf("socket unit %s has no ListenStream/ListenDatagram", name)
+	}
+
+	var listeners []net.Listener
+	var packets []net.PacketConn
+	var paths []string
+	var firstPath string
+
+	for _, sockPath := range cfg.Socket.ListenStream {
+		dir := filepath.Dir(sockPath)
+		_ = os.MkdirAll(dir, 0755)
+		_ = os.Remove(sockPath)
+		l, err := net.Listen("unix", sockPath)
+		if err != nil {
+			for _, ll := range listeners {
+				_ = ll.Close()
+			}
+			for _, pp := range packets {
+				_ = pp.Close()
+			}
+			for _, p := range paths {
+				_ = os.Remove(p)
+			}
+			return fmt.Errorf("failed to listen on %s: %w", sockPath, err)
+		}
+		if cfg.Socket.SocketMode != "" {
+			if mode, perr := strconv.ParseUint(cfg.Socket.SocketMode, 8, 32); perr == nil {
+				_ = os.Chmod(sockPath, os.FileMode(mode))
+			}
+		}
+		listeners = append(listeners, l)
+		paths = append(paths, sockPath)
+		if firstPath == "" {
+			firstPath = sockPath
+		}
+	}
+	for _, sockPath := range cfg.Socket.ListenDatagram {
+		dir := filepath.Dir(sockPath)
+		_ = os.MkdirAll(dir, 0755)
+		_ = os.Remove(sockPath)
+		addr := &net.UnixAddr{Name: sockPath, Net: "unixgram"}
+		pc, err := net.ListenUnixgram("unixgram", addr)
+		if err != nil {
+			for _, ll := range listeners {
+				_ = ll.Close()
+			}
+			for _, pp := range packets {
+				_ = pp.Close()
+			}
+			for _, p := range paths {
+				_ = os.Remove(p)
+			}
+			return fmt.Errorf("failed to listen on %s: %w", sockPath, err)
+		}
+		if cfg.Socket.SocketMode != "" {
+			if mode, perr := strconv.ParseUint(cfg.Socket.SocketMode, 8, 32); perr == nil {
+				_ = os.Chmod(sockPath, os.FileMode(mode))
+			}
+		}
+		packets = append(packets, pc)
+		paths = append(paths, sockPath)
+		if firstPath == "" {
+			firstPath = sockPath
+		}
+	}
+
+	rt := &socketRuntime{
+		unit:      cfg,
+		listeners: listeners,
+		packets:   packets,
+		paths:     paths,
+		path:      firstPath,
+		active:    true,
+		stopCh:    make(chan struct{}),
+	}
+	if len(listeners) > 0 {
+		rt.listener = listeners[0]
+	}
+	if len(packets) > 0 {
+		rt.packet = packets[0]
+	}
+
+	m.mu.Lock()
+	m.SocketRuntimes[name] = rt
+	m.mu.Unlock()
+
+	for _, l := range listeners {
+		go m.acceptLoop(name, rt, l)
+	}
+
+	return nil
+}
+
+func (m *Manager) acceptLoop(socketName string, rt *socketRuntime, l net.Listener) {
+	serviceName := strings.TrimSuffix(socketName, ".socket") + ".service"
+	for {
+		select {
+		case <-rt.stopCh:
+			return
+		default:
+		}
+		conn, err := l.Accept()
+		if err != nil {
+			select {
+			case <-rt.stopCh:
+				return
+			default:
+				continue
+			}
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			unit, err := m.FindUnit(serviceName)
+			if err != nil {
+				return
+			}
+			snap := unit.Snapshot()
+			if snap.State == service.StateActive || snap.State == service.StateActivating {
+				return
+			}
+			if err := m.startWithSocketActivation(serviceName, socketName, rt); err != nil {
+				_ = m.StartUnit(serviceName)
+			}
+		}(conn)
+	}
+}
+
+func (m *Manager) startWithSocketActivation(serviceName, socketName string, rt *socketRuntime) error {
+	unit, err := m.FindUnit(serviceName)
+	if err != nil {
+		return err
+	}
+	var files []*os.File
+	for _, l := range rt.listeners {
+		if ul, ok := l.(*net.UnixListener); ok {
+			if f, err := ul.File(); err == nil {
+				files = append(files, f)
+			}
+		} else if fder, ok := l.(interface{ File() (*os.File, error) }); ok {
+			if f, err := fder.File(); err == nil {
+				files = append(files, f)
+			}
+		}
+	}
+	for _, pc := range rt.packets {
+		if fder, ok := interface{}(pc).(interface{ File() (*os.File, error) }); ok {
+			if f, err := fder.File(); err == nil {
+				files = append(files, f)
+			}
+		}
+	}
+	if len(files) > 0 {
+		listenEnv := map[string]string{
+			"LISTEN_PID": "1",
+			"LISTEN_FDS": strconv.Itoa(len(files)),
+		}
+		unit.SetSocketActivation(files, listenEnv)
+	}
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	started := map[string]struct{}{}
+	stack := map[string]struct{}{}
+	return m.startUnitWithDependencies(serviceName, started, stack)
+}
+
+func (m *Manager) stopSocketUnit(name string) error {
+	m.mu.Lock()
+	rt, ok := m.SocketRuntimes[name]
+	if !ok || !rt.active {
+		m.mu.Unlock()
+		return nil
+	}
+	close(rt.stopCh)
+	for _, l := range rt.listeners {
+		_ = l.Close()
+	}
+	if rt.listener != nil && len(rt.listeners) == 0 {
+		_ = rt.listener.Close()
+	}
+	for _, pc := range rt.packets {
+		_ = pc.Close()
+	}
+	if rt.packet != nil && len(rt.packets) == 0 {
+		_ = rt.packet.Close()
+	}
+	for _, p := range rt.paths {
+		_ = os.Remove(p)
+	}
+	if len(rt.paths) == 0 && rt.path != "" {
+		_ = os.Remove(rt.path)
+	}
+	rt.active = false
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) IsSocketActive(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rt, ok := m.SocketRuntimes[name]; ok {
+		return rt.active
+	}
+	return false
 }
 
 func (m *Manager) startUnitWithDependencies(name string, started map[string]struct{}, stack map[string]struct{}) error {
@@ -269,6 +558,12 @@ func (m *Manager) StartEnabledUnits() error {
 	for _, unit := range ordered {
 		if err := m.startUnitWithDependencies(unit.Config.Name, started, map[string]struct{}{}); err != nil {
 			unit.Log(logging.LevelError, fmt.Sprintf("Failed to start enabled unit: %v", err))
+		}
+	}
+	// Start enabled socket units
+	for _, name := range m.EnabledSocketUnits() {
+		if err := m.startSocketUnit(name); err != nil {
+			logKernelWarning(fmt.Sprintf("Failed to start enabled socket %s: %v", name, err))
 		}
 	}
 	return nil
@@ -377,9 +672,22 @@ func (m *Manager) StopAllUnits() {
 		unit.Log(logging.LevelInfo, "Stopping for system shutdown")
 		_ = unit.Stop(unit.StopTimeout())
 	}
+	// Stop socket units
+	m.mu.Lock()
+	sockets := make([]string, 0, len(m.SocketRuntimes))
+	for name := range m.SocketRuntimes {
+		sockets = append(sockets, name)
+	}
+	m.mu.Unlock()
+	for _, name := range sockets {
+		_ = m.stopSocketUnit(name)
+	}
 }
 
 func (m *Manager) StopUnit(name string) error {
+	if strings.HasSuffix(name, ".socket") {
+		return m.stopSocketUnit(name)
+	}
 	unit, err := m.FindUnit(name)
 	if err != nil {
 		return err
@@ -412,6 +720,40 @@ func (m *Manager) ListUnits() []*service.Unit {
 		units = append(units, unit)
 	}
 	return units
+}
+
+func (m *Manager) ListAllUnitNames() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.Units)+len(m.SocketUnits))
+	for name := range m.Units {
+		names = append(names, name)
+	}
+	for name := range m.SocketUnits {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (m *Manager) SocketUnitNames() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.SocketUnits))
+	for name := range m.SocketUnits {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (m *Manager) FindSocketUnit(name string) (*parser.Unit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if unit, ok := m.SocketUnits[name]; ok {
+		return unit, nil
+	}
+	return nil, fmt.Errorf("unit %s not found", name)
 }
 
 func (m *Manager) SystemState() string {
@@ -518,14 +860,30 @@ func (m *Manager) enableUnitInternal(name string, now bool) error {
 	if m.IsMasked(name) {
 		return fmt.Errorf("unit %s is masked", name)
 	}
-	unit, err := m.FindUnit(name)
-	if err != nil {
+	// Try service unit first, then socket
+	var unitPath string
+	var install parser.InstallSection
+	var alsoList, aliasList []string
+	if unit, err := m.FindUnit(name); err == nil {
+		unitPath = unit.Path
+		install = unit.Config.Install
+		alsoList = unit.Config.Install.Also
+		aliasList = unit.Config.Install.Alias
+	} else if sock, err := m.FindSocketUnit(name); err == nil {
+		if p, ok := m.SocketPaths[name]; ok {
+			unitPath = p
+		} else {
+			unitPath = sock.Name
+		}
+		install = sock.Install
+		alsoList = sock.Install.Also
+		aliasList = sock.Install.Alias
+	} else {
 		return err
 	}
-	// If WantedBy is empty but Also/Alias exist, still allow enable for those
-	hasWantedBy := len(unit.Config.Install.WantedBy) > 0
-	hasAlso := len(unit.Config.Install.Also) > 0
-	hasAlias := len(unit.Config.Install.Alias) > 0
+	hasWantedBy := len(install.WantedBy) > 0
+	hasAlso := len(alsoList) > 0
+	hasAlias := len(aliasList) > 0
 	if !hasWantedBy && !hasAlso && !hasAlias {
 		return errors.New("WantedBy not set")
 	}
@@ -533,19 +891,19 @@ func (m *Manager) enableUnitInternal(name string, now bool) error {
 	if root == "" {
 		root = "/etc/systemd/system"
 	}
-	for _, target := range unit.Config.Install.WantedBy {
+	for _, target := range install.WantedBy {
 		wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
 		if err := os.MkdirAll(wantsDir, 0o755); err != nil {
 			return err
 		}
 		linkPath := filepath.Join(wantsDir, name)
 		_ = os.Remove(linkPath)
-		if err := os.Symlink(unit.Path, linkPath); err != nil {
+		if err := os.Symlink(unitPath, linkPath); err != nil {
 			return err
 		}
 	}
 	// Handle Also= — enable those units as well
-	for _, alsoName := range unit.Config.Install.Also {
+	for _, alsoName := range alsoList {
 		alsoName = strings.TrimSpace(alsoName)
 		if alsoName == "" {
 			continue
@@ -558,10 +916,20 @@ func (m *Manager) enableUnitInternal(name string, now bool) error {
 				_ = os.Remove(linkPath)
 				_ = os.Symlink(alsoUnit.Path, linkPath)
 			}
+		} else if alsoSock, err := m.FindSocketUnit(alsoName); err == nil {
+			for _, target := range alsoSock.Install.WantedBy {
+				wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
+				_ = os.MkdirAll(wantsDir, 0o755)
+				linkPath := filepath.Join(wantsDir, alsoName)
+				_ = os.Remove(linkPath)
+				if p, ok := m.SocketPaths[alsoName]; ok {
+					_ = os.Symlink(p, linkPath)
+				}
+			}
 		}
 	}
 	// Handle Alias= — create alias symlinks at EnabledRoot
-	for _, alias := range unit.Config.Install.Alias {
+	for _, alias := range aliasList {
 		alias = strings.TrimSpace(alias)
 		if alias == "" {
 			continue
@@ -571,7 +939,7 @@ func (m *Manager) enableUnitInternal(name string, now bool) error {
 		}
 		aliasPath := filepath.Join(root, alias)
 		_ = os.Remove(aliasPath)
-		if err := os.Symlink(unit.Path, aliasPath); err != nil {
+		if err := os.Symlink(unitPath, aliasPath); err != nil {
 			return err
 		}
 	}
@@ -591,21 +959,36 @@ func (m *Manager) DisableUnitWithNow(name string, now bool) error {
 }
 
 func (m *Manager) disableUnitInternal(name string, now bool) error {
-	unit, err := m.FindUnit(name)
-	if err != nil {
+	var unitPath string
+	var install parser.InstallSection
+	var alsoList, aliasList []string
+	if unit, err := m.FindUnit(name); err == nil {
+		unitPath = unit.Path
+		install = unit.Config.Install
+		alsoList = unit.Config.Install.Also
+		aliasList = unit.Config.Install.Alias
+	} else if sock, err := m.FindSocketUnit(name); err == nil {
+		if p, ok := m.SocketPaths[name]; ok {
+			unitPath = p
+		} else {
+			unitPath = sock.Name
+		}
+		install = sock.Install
+		alsoList = sock.Install.Also
+		aliasList = sock.Install.Alias
+	} else {
 		return err
 	}
 	root := m.EnabledRoot
 	if root == "" {
 		root = "/etc/systemd/system"
 	}
-	for _, target := range unit.Config.Install.WantedBy {
+	for _, target := range install.WantedBy {
 		wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
 		linkPath := filepath.Join(wantsDir, name)
 		_ = os.Remove(linkPath)
 	}
-	// Also disable Also= units
-	for _, alsoName := range unit.Config.Install.Also {
+	for _, alsoName := range alsoList {
 		alsoName = strings.TrimSpace(alsoName)
 		if alsoName == "" {
 			continue
@@ -616,17 +999,22 @@ func (m *Manager) disableUnitInternal(name string, now bool) error {
 				linkPath := filepath.Join(wantsDir, alsoName)
 				_ = os.Remove(linkPath)
 			}
+		} else if alsoSock, err := m.FindSocketUnit(alsoName); err == nil {
+			for _, target := range alsoSock.Install.WantedBy {
+				wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
+				linkPath := filepath.Join(wantsDir, alsoName)
+				_ = os.Remove(linkPath)
+			}
 		}
 	}
-	// Remove Alias symlinks
-	for _, alias := range unit.Config.Install.Alias {
+	for _, alias := range aliasList {
 		alias = strings.TrimSpace(alias)
 		if alias == "" {
 			continue
 		}
 		aliasPath := filepath.Join(root, alias)
 		if fi, err := os.Lstat(aliasPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if target, err := os.Readlink(aliasPath); err == nil && target == unit.Path {
+			if target, err := os.Readlink(aliasPath); err == nil && target == unitPath {
 				_ = os.Remove(aliasPath)
 			}
 		}
@@ -640,9 +1028,9 @@ func (m *Manager) disableUnitInternal(name string, now bool) error {
 func (m *Manager) IsEnabled(name string) (bool, error) {
 	m.mu.Lock()
 	_, ok := m.Units[name]
+	_, sockOk := m.SocketUnits[name]
 	m.mu.Unlock()
-	if !ok {
-		// Template instance not yet instantiated — check if template exists
+	if !ok && !sockOk {
 		if isTemplateInstance(name) {
 			tmplName, _ := parseTemplateInstance(name)
 			m.mu.Lock()
@@ -693,8 +1081,9 @@ func (m *Manager) IsMasked(name string) bool {
 func (m *Manager) MaskUnit(name string) error {
 	m.mu.Lock()
 	_, ok := m.Units[name]
+	_, sockOk := m.SocketUnits[name]
 	m.mu.Unlock()
-	if !ok {
+	if !ok && !sockOk {
 		return fmt.Errorf("unit %s not found", name)
 	}
 	root := m.EnabledRoot
@@ -889,9 +1278,17 @@ func (m *Manager) ListUnitFiles() ([]*service.Unit, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	units := make([]*service.Unit, 0, len(m.Units))
+	units := make([]*service.Unit, 0, len(m.Units)+len(m.SocketUnits))
 	for _, unit := range m.Units {
 		units = append(units, unit)
+	}
+	// Add socket units as pseudo service units for listing
+	for name, cfg := range m.SocketUnits {
+		path := ""
+		if p, ok := m.SocketPaths[name]; ok {
+			path = p
+		}
+		units = append(units, service.NewUnit(cfg, path))
 	}
 	return units, nil
 }
@@ -941,7 +1338,7 @@ func (m *Manager) enabledUnitNames() (map[string]struct{}, error) {
 		}
 		for _, want := range wantsEntries {
 			name := want.Name()
-			if !strings.HasSuffix(name, ".service") {
+			if !strings.HasSuffix(name, ".service") && !strings.HasSuffix(name, ".socket") {
 				continue
 			}
 			linkPath := filepath.Join(wantsDir, name)
@@ -953,6 +1350,84 @@ func (m *Manager) enabledUnitNames() (map[string]struct{}, error) {
 		}
 	}
 	return enabled, nil
+}
+
+func (m *Manager) EnabledSocketUnits() []string {
+	enabled, err := m.enabledUnitNames()
+	if err != nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []string
+	for name := range enabled {
+		if strings.HasSuffix(name, ".socket") {
+			if _, ok := m.SocketUnits[name]; ok {
+				result = append(result, name)
+			}
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (m *Manager) ShowSocketUnit(name string) (map[string]string, error) {
+	m.mu.Lock()
+	cfg, ok := m.SocketUnits[name]
+	path := m.SocketPaths[name]
+	rt, hasRt := m.SocketRuntimes[name]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("unit %s not found", name)
+	}
+	activeState := "inactive"
+	if hasRt && rt.active {
+		activeState = "active"
+	}
+	data := map[string]string{
+		"Id":            cfg.Name,
+		"Names":         cfg.Name,
+		"Description":   cfg.Description,
+		"LoadState":     "loaded",
+		"ActiveState":   activeState,
+		"SubState":      activeState,
+		"FragmentPath":  path,
+		"UnitFileState": m.UnitFileState(cfg.Name),
+		"Type":          "socket",
+		"ListenStream":  strings.Join(cfg.Socket.ListenStream, " "),
+		"ListenDatagram": strings.Join(cfg.Socket.ListenDatagram, " "),
+		"WantedBy":      strings.Join(cfg.Install.WantedBy, " "),
+	}
+	return data, nil
+}
+
+func (m *Manager) CatSocketUnit(name string) (string, error) {
+	m.mu.Lock()
+	path := m.SocketPaths[name]
+	_, hasUnit := m.SocketUnits[name]
+	m.mu.Unlock()
+	if !hasUnit {
+		return "", fmt.Errorf("unit %s not found", name)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (m *Manager) SocketActiveState(name string) (string, error) {
+	m.mu.Lock()
+	_, ok := m.SocketUnits[name]
+	rt, hasRt := m.SocketRuntimes[name]
+	m.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("unit %s not found", name)
+	}
+	if hasRt && rt.active {
+		return "active", nil
+	}
+	return "inactive", nil
 }
 
 func (m *Manager) orderUnitsByAfter(units []*service.Unit) []*service.Unit {

@@ -53,6 +53,8 @@ type Unit struct {
 	startToken     int
 	reaper         ExitReaper
 	notifyServer   *notify.Server
+	socketFiles    []*os.File
+	socketEnv      map[string]string
 }
 
 type ExitReaper interface {
@@ -191,6 +193,22 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	if err != nil {
 		u.markFailed(err, ignoreFailure)
 		return
+	}
+	// Socket activation: pass listening fds if present
+	if files, env := u.takeSocketActivation(); len(files) > 0 {
+		cmd.ExtraFiles = files
+		for k, v := range env {
+			if k == "LISTEN_PID" {
+				continue
+			}
+			envList = append(envList, k+"="+v)
+		}
+		wrappedArgs := []string{"/bin/sh", "-c", `LISTEN_PID=$$ exec "$@"`, "_"}
+		wrappedArgs = append(wrappedArgs, args...)
+		if wrappedCmd, werr := u.buildExecCommand(wrappedArgs, commandOptions{}); werr == nil {
+			wrappedCmd.ExtraFiles = files
+			cmd = wrappedCmd
+		}
 	}
 
 	// -------------------------------------------------
@@ -1283,10 +1301,33 @@ func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, 
 	return cmd, nil
 }
 
+func (u *Unit) SetSocketActivation(files []*os.File, env map[string]string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.socketFiles = files
+	u.socketEnv = env
+}
+
+func (u *Unit) takeSocketActivation() ([]*os.File, map[string]string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	files := u.socketFiles
+	env := u.socketEnv
+	u.socketFiles = nil
+	u.socketEnv = nil
+	return files, env
+}
+
 func (u *Unit) configureCommand(cmd *exec.Cmd, envList []string, stdoutLogger, stderrLogger *logging.LineLogger) {
-	cmd.Env = mergeEnvList(envList, map[string]string{
+	extra := map[string]string{
 		"MAINPID": strconv.Itoa(u.mainPID()),
-	})
+	}
+	u.mu.Lock()
+	for k, v := range u.socketEnv {
+		extra[k] = v
+	}
+	u.mu.Unlock()
+	cmd.Env = mergeEnvList(envList, extra)
 	cmd.Stdout = stdoutLogger
 	cmd.Stderr = stderrLogger
 }
