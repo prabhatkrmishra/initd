@@ -13,6 +13,7 @@ import (
 	"initd/internal/logging"
 	"initd/internal/service"
 	"initd/internal/supervisor"
+	"initd/internal/userpaths"
 )
 
 type Request struct {
@@ -118,6 +119,9 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 func abstractFallback(manager *supervisor.Manager) string {
 	uid := os.Getuid()
 	if manager != nil && manager.UserMode {
+		// Keep the abstract fallback consistent with the filesystem user
+		// socket so a daemon started via sudo and its client agree.
+		uid = userpaths.RealUID()
 		return fmt.Sprintf("@initd-user-%d.sock", uid)
 	}
 	return fmt.Sprintf("@initd-system-%d.sock", uid)

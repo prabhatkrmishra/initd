@@ -1,8 +1,12 @@
 package userpaths
 
 import (
+	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -78,5 +82,53 @@ func TestUserSocketPathXDG(t *testing.T) {
 	os.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 	if got := UserSocketPath(); got != filepath.Join("/run/user/1000", "initd.sock") {
 		t.Errorf("UserSocketPath = %q", got)
+	}
+}
+
+func TestRealUIDAndSocketPathWithSudo(t *testing.T) {
+	// When SUDO_USER is set to the current user, the socket path must use
+	// that user's UID so a root daemon started via sudo serves the same
+	// socket that the user's systemctl --user connects to.
+	cur, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+	uid, err := strconv.Atoi(cur.Uid)
+	if err != nil {
+		t.Fatalf("parse uid %q: %v", cur.Uid, err)
+	}
+
+	oldSudoUser := os.Getenv("SUDO_USER")
+	oldSudoUID := os.Getenv("SUDO_UID")
+	oldXDG := os.Getenv("XDG_RUNTIME_DIR")
+	defer func() {
+		os.Setenv("SUDO_USER", oldSudoUser)
+		os.Setenv("SUDO_UID", oldSudoUID)
+		os.Setenv("XDG_RUNTIME_DIR", oldXDG)
+	}()
+	os.Setenv("SUDO_UID", "")
+	os.Setenv("SUDO_USER", cur.Username)
+	os.Setenv("XDG_RUNTIME_DIR", "")
+
+	if got := RealUID(); got != uid {
+		t.Errorf("RealUID via SUDO_USER = %d, want %d", got, uid)
+	}
+	// The socket path must embed the sudo user's UID, whether it resolves to
+	// /run/user/<uid> or the /tmp fallback.
+	if got := UserSocketPath(); !strings.Contains(got, fmt.Sprintf("%d", uid)) {
+		t.Errorf("UserSocketPath = %q, want it to contain uid %d", got, uid)
+	}
+	if got := UserRuntimeDir(); !strings.Contains(got, fmt.Sprintf("%d", uid)) {
+		t.Errorf("UserRuntimeDir = %q, want it to contain uid %d", got, uid)
+	}
+
+	// SUDO_UID takes precedence and avoids a user.Lookup.
+	fakeUID := uid + 99999
+	os.Setenv("SUDO_UID", strconv.Itoa(fakeUID))
+	if got := RealUID(); got != fakeUID {
+		t.Errorf("RealUID via SUDO_UID = %d, want %d", got, fakeUID)
+	}
+	if got := UserSocketPath(); !strings.Contains(got, fmt.Sprintf("%d", fakeUID)) {
+		t.Errorf("UserSocketPath via SUDO_UID = %q, want it to contain uid %d", got, fakeUID)
 	}
 }
