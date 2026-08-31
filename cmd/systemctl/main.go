@@ -80,6 +80,14 @@ func main() {
 	cmdArgs := flags.Args()[1:]
 
 	client := &ipc.Client{SocketPath: resolvedSocket}
+	// Like systemd, timeouts are server-side (TimeoutStartSec/
+	// TimeoutStopSec). The client just waits for the job to finish.
+	// Use a longer deadline for restart/stop which blocks for
+	// Stop+Start (default 10s+30s=40s, custom may be larger).
+	switch cmd {
+	case "restart", "stop":
+		client.Timeout = 90 * time.Second
+	}
 
 	switch cmd {
 	case "enable", "disable":

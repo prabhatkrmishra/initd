@@ -7,8 +7,21 @@ import (
 	"time"
 )
 
+const DefaultTimeout = 60 * time.Second
+
 type Client struct {
 	SocketPath string
+	Timeout    time.Duration // 0 means DefaultTimeout
+}
+
+func (c *Client) effectiveTimeout() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	if c.Timeout < 0 {
+		return 0 // no deadline
+	}
+	return DefaultTimeout
 }
 
 func (c *Client) Do(req Request) (Response, error) {
@@ -21,7 +34,9 @@ func (c *Client) Do(req Request) (Response, error) {
 		return Response{}, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+	if d := c.effectiveTimeout(); d > 0 {
+		_ = conn.SetDeadline(time.Now().Add(d))
+	}
 
 	encoder := json.NewEncoder(conn)
 	decoder := json.NewDecoder(conn)

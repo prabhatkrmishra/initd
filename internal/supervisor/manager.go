@@ -1559,18 +1559,18 @@ func (m *Manager) ShowSocketUnit(name string) (map[string]string, error) {
 		activeState = "active"
 	}
 	data := map[string]string{
-		"Id":            cfg.Name,
-		"Names":         cfg.Name,
-		"Description":   cfg.Description,
-		"LoadState":     "loaded",
-		"ActiveState":   activeState,
-		"SubState":      activeState,
-		"FragmentPath":  path,
-		"UnitFileState": m.UnitFileState(cfg.Name),
-		"Type":          "socket",
-		"ListenStream":  strings.Join(cfg.Socket.ListenStream, " "),
+		"Id":             cfg.Name,
+		"Names":          cfg.Name,
+		"Description":    cfg.Description,
+		"LoadState":      "loaded",
+		"ActiveState":    activeState,
+		"SubState":       activeState,
+		"FragmentPath":   path,
+		"UnitFileState":  m.UnitFileState(cfg.Name),
+		"Type":           "socket",
+		"ListenStream":   strings.Join(cfg.Socket.ListenStream, " "),
 		"ListenDatagram": strings.Join(cfg.Socket.ListenDatagram, " "),
-		"WantedBy":      strings.Join(cfg.Install.WantedBy, " "),
+		"WantedBy":       strings.Join(cfg.Install.WantedBy, " "),
 	}
 	return data, nil
 }
