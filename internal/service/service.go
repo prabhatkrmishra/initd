@@ -726,7 +726,7 @@ func (u *Unit) handleExitStatusForPID(token int, watchedPID int, status syscall.
 
 func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
 	serviceType := u.canonicalServiceType()
-	if serviceType == "notify" && watchedPID != 0 {
+	if serviceType == "notify" && watchedPID != 0 && !u.StopRequested() {
 		adoptTimeout := u.StartTimeout()
 		if adoptTimeout <= 0 {
 			adoptTimeout = 30 * time.Second
@@ -754,7 +754,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		return
 	}
 
-	if u.Runtime.State == StateStopping {
+	if u.Runtime.State == StateStopping || u.stopRequested {
 		if u.notifyServer != nil {
 			u.notifyServer.Stop()
 			u.notifyServer = nil
@@ -1597,14 +1597,14 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 	case <-server.Ready:
 		pid := u.notifyMainPID(cmd)
 		u.mu.Lock()
-		if u.startToken == token {
+		if u.startToken == token && !u.stopRequested {
 			u.Runtime.State = StateActive
 			if pid != 0 {
 				u.Runtime.MainPID = pid
 			}
 		}
 		u.mu.Unlock()
-		if err := u.runExecStartPost(token, envMap, envList); err != nil {
+		if err := u.runExecStartPost(token, envMap, envList); err != nil && !u.StopRequested() {
 			u.killMainProcess(syscall.SIGTERM)
 			u.markFailed(err, ignoreFailure)
 			return
@@ -1614,7 +1614,7 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 
 	case <-timer.C:
 		u.mu.Lock()
-		if u.startToken != token {
+		if u.startToken != token || u.stopRequested {
 			u.mu.Unlock()
 			return
 		}
