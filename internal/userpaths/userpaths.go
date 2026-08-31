@@ -6,6 +6,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 )
 
 func RealHome() string {
@@ -99,4 +101,55 @@ func UserRuntimeDir() string {
 		return runUser
 	}
 	return fmt.Sprintf("/tmp/initd-%d", uid)
+}
+
+func UserLockPath() string {
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		return filepath.Join(xdg, "initd.lock")
+	}
+	uid := RealUID()
+	runUser := fmt.Sprintf("/run/user/%d", uid)
+	if st, err := os.Stat(runUser); err == nil && st.IsDir() {
+		return filepath.Join(runUser, "initd.lock")
+	}
+	return fmt.Sprintf("/tmp/initd-%d.lock", uid)
+}
+
+func AcquireUserLock() (*os.File, error) {
+	path := UserLockPath()
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	_ = f.Truncate(0)
+	_, _ = f.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
+	return f, nil
+}
+
+func IsUserDaemonRunning() bool {
+	path := UserSocketPath()
+	if strings.HasPrefix(path, "@") {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	conn, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return false
+	}
+	defer syscall.Close(conn)
+	sa := &syscall.SockaddrUnix{Name: path}
+	if err := syscall.Connect(conn, sa); err != nil {
+		return false
+	}
+	return true
 }

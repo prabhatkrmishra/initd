@@ -77,10 +77,42 @@ func main() {
 		}
 	}
 
+	// Singleton for the user manager: same user logging in many times must
+	// not create duplicate daemons/sockets. Use a flock on a per-user lock
+	// file and probe the socket to handle stale files.
+	var userLock *os.File
+	startUserManager := func(path string, mgr *supervisor.Manager) {
+		if lock, err := userpaths.AcquireUserLock(); err == nil {
+			userLock = lock
+			go serveManager(path, mgr)
+			return
+		}
+		if userpaths.IsUserDaemonRunning() {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"user daemon already running at %s - skipping", path)
+			return
+		}
+		// Stale socket/lock - clean up and try once more.
+		_ = os.Remove(path)
+		if lock, err := userpaths.AcquireUserLock(); err == nil {
+			userLock = lock
+			go serveManager(path, mgr)
+		} else {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"failed to acquire user lock for %s: %v", path, err)
+		}
+	}
+
 	go serveManager(socketPath, systemManager)
 	userSocket := userpaths.UserSocketPath()
 	if userSocket != socketPath {
-		go serveManager(userSocket, userManager)
+		startUserManager(userSocket, userManager)
+	}
+	// Hold the lock for the lifetime of the daemon.
+	if userLock != nil {
+		defer func() {
+			_ = userLock.Close()
+		}()
 	}
 
 	if initMode {
