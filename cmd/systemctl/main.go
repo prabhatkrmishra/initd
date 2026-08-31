@@ -75,15 +75,25 @@ func main() {
 	client := &ipc.Client{SocketPath: resolvedSocket}
 
 	switch cmd {
-	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "enable", "disable":
+	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "enable", "disable", "mask", "unmask", "show", "cat", "kill":
+		if cmd == "kill" {
+			handleKillCommand(client, cmdArgs)
+			break
+		}
 		if len(cmdArgs) < 1 {
 			fmt.Fprintf(os.Stderr, "%s requires a unit name\n", cmd)
 			os.Exit(1)
 		}
 		handleUnitCommand(client, cmd, cmdArgs[0])
 
+	case "is-failed":
+		handleIsFailed(client, cmdArgs)
+
+	case "reset-failed":
+		handleResetFailed(client, cmdArgs)
+
 	case "list-units":
-		handleListUnits(client)
+		handleListUnits(client, cmdArgs)
 
 	case "list-unit-files":
 		handleListUnitFiles(client)
@@ -172,6 +182,134 @@ func handleUnitCommand(client *ipc.Client, action, unit string) {
 			os.Exit(0)
 		}
 		os.Exit(1)
+	case "show":
+		dataMap := map[string]string{}
+		raw, _ := json.Marshal(resp.Data)
+		_ = json.Unmarshal(raw, &dataMap)
+		keys := make([]string, 0, len(dataMap))
+		for k := range dataMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Printf("%s=%s\n", k, dataMap[k])
+		}
+	case "cat":
+		content := fmt.Sprintf("%v", resp.Data)
+		fmt.Print(content)
+		if !strings.HasSuffix(content, "\n") {
+			fmt.Println()
+		}
+	}
+}
+
+func handleIsFailed(client *ipc.Client, args []string) {
+	if len(args) == 0 {
+		resp, err := client.Do(ipc.Request{Action: "is-failed"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
+		state := fmt.Sprintf("%v", resp.Data)
+		fmt.Println(state)
+		if state == "failed" {
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}
+	anyFailed := false
+	for _, unit := range args {
+		resolved, _ := resolveUnitName(client, unit)
+		resp, err := client.Do(ipc.Request{Action: "is-failed", Unit: resolved})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
+		state := fmt.Sprintf("%v", resp.Data)
+		fmt.Println(state)
+		if state == "failed" {
+			anyFailed = true
+		}
+	}
+	if anyFailed {
+		os.Exit(0)
+	}
+	os.Exit(1)
+}
+
+func handleResetFailed(client *ipc.Client, args []string) {
+	if len(args) == 0 {
+		resp, err := client.Do(ipc.Request{Action: "reset-failed"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
+		return
+	}
+	for _, unit := range args {
+		resolved, _ := resolveUnitName(client, unit)
+		resp, err := client.Do(ipc.Request{Action: "reset-failed", Unit: resolved})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
+	}
+}
+
+func handleKillCommand(client *ipc.Client, args []string) {
+	signal := ""
+	units := []string{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--signal" || a == "-s" {
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "kill: --signal requires an argument")
+				os.Exit(1)
+			}
+			signal = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--signal=") {
+			signal = strings.TrimPrefix(a, "--signal=")
+		} else if strings.HasPrefix(a, "-s=") {
+			signal = strings.TrimPrefix(a, "-s=")
+		} else if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
+			os.Exit(1)
+		} else {
+			units = append(units, a)
+		}
+	}
+	if len(units) == 0 {
+		fmt.Fprintln(os.Stderr, "kill requires a unit name")
+		os.Exit(1)
+	}
+	for _, unit := range units {
+		resolved, _ := resolveUnitName(client, unit)
+		resp, err := client.Do(ipc.Request{Action: "kill", Unit: resolved, Signal: signal})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -197,7 +335,54 @@ func resolveUnitName(_ *ipc.Client, unit string) (string, error) {
 	return unit + ".service", nil
 }
 
-func handleListUnits(client *ipc.Client) {
+func handleListUnits(client *ipc.Client, args []string) {
+	all := false
+	stateFilter := map[string]struct{}{}
+	typeFilter := map[string]struct{}{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--all" || a == "-a":
+			all = true
+		case strings.HasPrefix(a, "--state="):
+			for _, s := range strings.Split(strings.TrimPrefix(a, "--state="), ",") {
+				s = strings.ToLower(strings.TrimSpace(s))
+				if s != "" {
+					stateFilter[s] = struct{}{}
+				}
+			}
+		case a == "--state" && i+1 < len(args):
+			i++
+			for _, s := range strings.Split(args[i], ",") {
+				s = strings.ToLower(strings.TrimSpace(s))
+				if s != "" {
+					stateFilter[s] = struct{}{}
+				}
+			}
+		case strings.HasPrefix(a, "--type="):
+			for _, t := range strings.Split(strings.TrimPrefix(a, "--type="), ",") {
+				t = strings.ToLower(strings.TrimSpace(t))
+				if t != "" {
+					typeFilter[t] = struct{}{}
+				}
+			}
+		case a == "--type" && i+1 < len(args):
+			i++
+			for _, t := range strings.Split(args[i], ",") {
+				t = strings.ToLower(strings.TrimSpace(t))
+				if t != "" {
+					typeFilter[t] = struct{}{}
+				}
+			}
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
+			os.Exit(1)
+		default:
+			fmt.Fprintf(os.Stderr, "unexpected argument %s\n", a)
+			os.Exit(1)
+		}
+	}
+
 	resp, err := client.Do(ipc.Request{Action: "list-units"})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -211,6 +396,28 @@ func handleListUnits(client *ipc.Client) {
 	var units []ipc.UnitData
 	data, _ := json.Marshal(resp.Data)
 	_ = json.Unmarshal(data, &units)
+
+	// Apply filters.
+	_ = all // --all currently means show all (compat); filtering is via --state/--type
+	filtered := make([]ipc.UnitData, 0, len(units))
+	for _, u := range units {
+		if len(stateFilter) > 0 {
+			if _, ok := stateFilter[strings.ToLower(string(u.State))]; !ok {
+				continue
+			}
+		}
+		if len(typeFilter) > 0 {
+			t := strings.ToLower(u.Type)
+			if t == "" {
+				t = "service"
+			}
+			if _, ok := typeFilter[t]; !ok {
+				continue
+			}
+		}
+		filtered = append(filtered, u)
+	}
+	units = filtered
 
 	if len(units) == 0 {
 		fmt.Println("No units loaded.")
@@ -481,11 +688,18 @@ func printHelp() {
 	fmt.Println("  reload UNIT...       Reload one or more units")
 	fmt.Println("  status UNIT...       Show runtime status of one or more units")
 	fmt.Println("  is-active UNIT...    Check whether units are active")
-	fmt.Println("  is-system-running    Check overall system state")
+	fmt.Println("  is-failed [UNIT...]  Check whether units are failed")
 	fmt.Println("  is-enabled UNIT...   Check whether unit files are enabled")
+	fmt.Println("  is-system-running    Check overall system state")
 	fmt.Println("  enable UNIT...       Enable one or more unit files")
 	fmt.Println("  disable UNIT...      Disable one or more unit files")
-	fmt.Println("  list-units           List loaded units")
+	fmt.Println("  mask UNIT...         Mask one or more unit files")
+	fmt.Println("  unmask UNIT...       Unmask one or more unit files")
+	fmt.Println("  show UNIT...         Show properties of one or more units")
+	fmt.Println("  cat UNIT...          Show unit file contents")
+	fmt.Println("  kill UNIT...         Send signal to unit main process")
+	fmt.Println("  reset-failed [UNIT...] Reset failed state")
+	fmt.Println("  list-units [OPTIONS] List loaded units (--all, --state=, --type=)")
 	fmt.Println("  list-unit-files      List installed unit files")
 	fmt.Println("  daemon-reload        Reload unit files")
 	fmt.Println("System Commands:")

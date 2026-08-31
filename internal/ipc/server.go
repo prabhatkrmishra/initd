@@ -18,6 +18,7 @@ import (
 type Request struct {
 	Action string `json:"action"`
 	Unit   string `json:"unit,omitempty"`
+	Signal string `json:"signal,omitempty"`
 }
 
 type Response struct {
@@ -43,6 +44,7 @@ type UnitData struct {
 	Name        string        `json:"name"`
 	Description string        `json:"description"`
 	State       service.State `json:"state"`
+	Type        string        `json:"type"`
 }
 
 type UnitFileData struct {
@@ -193,7 +195,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		data := make([]UnitData, 0, len(units))
 		for _, unit := range units {
 			snapshot := unit.Snapshot()
-			data = append(data, UnitData{Name: unit.Config.Name, Description: unit.Description(), State: snapshot.State})
+			data = append(data, UnitData{Name: unit.Config.Name, Description: unit.Description(), State: snapshot.State, Type: unit.Config.Type})
 		}
 		return Response{Success: true, Data: data}
 	case "list-unit-files":
@@ -203,11 +205,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		data := make([]UnitFileData, 0, len(units))
 		for _, unit := range units {
-			enabled, _ := manager.IsEnabled(unit.Config.Name)
-			state := "disabled"
-			if enabled {
-				state = "enabled"
-			}
+			state := manager.UnitFileState(unit.Config.Name)
 			data = append(data, UnitFileData{Name: unit.Config.Name, State: state, Path: unit.Path})
 		}
 		return Response{Success: true, Data: data}
@@ -222,6 +220,9 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "is-enabled":
+		if manager.IsMasked(req.Unit) {
+			return Response{Success: true, Data: "masked"}
+		}
 		enabled, err := manager.IsEnabled(req.Unit)
 		if err != nil {
 			return Response{Success: false, Message: err.Error()}
@@ -230,6 +231,47 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: true, Data: "enabled"}
 		}
 		return Response{Success: true, Data: "disabled"}
+	case "is-failed":
+		failed, err := manager.IsFailed(req.Unit)
+		if err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		if failed {
+			return Response{Success: true, Data: "failed"}
+		}
+		return Response{Success: true, Data: "active"}
+	case "reset-failed":
+		if err := manager.ResetFailed(req.Unit); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
+	case "show":
+		data, err := manager.ShowUnit(req.Unit)
+		if err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true, Data: data}
+	case "cat":
+		content, err := manager.CatUnit(req.Unit)
+		if err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true, Data: content}
+	case "mask":
+		if err := manager.MaskUnit(req.Unit); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
+	case "unmask":
+		if err := manager.UnmaskUnit(req.Unit); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
+	case "kill":
+		if err := manager.KillUnit(req.Unit, req.Signal); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
 	case "is-system-running":
 		return Response{Success: true, Data: manager.SystemState()}
 	case "daemon-reload":

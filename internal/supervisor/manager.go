@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"initd/internal/logging"
@@ -139,6 +140,9 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 }
 
 func (m *Manager) StartUnit(name string) error {
+	if m.IsMasked(name) {
+		return fmt.Errorf("unit %s is masked", name)
+	}
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 
@@ -443,6 +447,9 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 }
 
 func (m *Manager) EnableUnit(name string) error {
+	if m.IsMasked(name) {
+		return fmt.Errorf("unit %s is masked", name)
+	}
 	unit, err := m.FindUnit(name)
 	if err != nil {
 		return err
@@ -492,12 +499,227 @@ func (m *Manager) IsEnabled(name string) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("unit %s not found", name)
 	}
+	if m.IsMasked(name) {
+		return false, nil
+	}
 	enabled, err := m.enabledUnitNames()
 	if err != nil {
 		return false, err
 	}
 	_, ok = enabled[name]
 	return ok, nil
+}
+
+func (m *Manager) IsMasked(name string) bool {
+	root := m.EnabledRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
+	linkPath := filepath.Join(root, name)
+	fi, err := os.Lstat(linkPath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		return false
+	}
+	return target == "/dev/null"
+}
+
+func (m *Manager) MaskUnit(name string) error {
+	m.mu.Lock()
+	_, ok := m.Units[name]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("unit %s not found", name)
+	}
+	root := m.EnabledRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	linkPath := filepath.Join(root, name)
+	_ = os.Remove(linkPath)
+	if err := os.Symlink("/dev/null", linkPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) UnmaskUnit(name string) error {
+	root := m.EnabledRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
+	linkPath := filepath.Join(root, name)
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		return err
+	}
+	if target != "/dev/null" {
+		return nil
+	}
+	return os.Remove(linkPath)
+}
+
+func (m *Manager) IsFailed(name string) (bool, error) {
+	if name == "" {
+		units := m.ListUnits()
+		for _, u := range units {
+			if u.Snapshot().State == service.StateFailed {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	unit, err := m.FindUnit(name)
+	if err != nil {
+		return false, err
+	}
+	return unit.Snapshot().State == service.StateFailed, nil
+}
+
+func (m *Manager) ResetFailed(name string) error {
+	if name == "" {
+		units := m.ListUnits()
+		for _, u := range units {
+			u.ResetFailed()
+		}
+		return nil
+	}
+	unit, err := m.FindUnit(name)
+	if err != nil {
+		return err
+	}
+	unit.ResetFailed()
+	return nil
+}
+
+func (m *Manager) KillUnit(name string, sigStr string) error {
+	unit, err := m.FindUnit(name)
+	if err != nil {
+		return err
+	}
+	sig := parseKillSignal(sigStr)
+	return unit.Kill(sig)
+}
+
+func (m *Manager) ShowUnit(name string) (map[string]string, error) {
+	unit, err := m.FindUnit(name)
+	if err != nil {
+		return nil, err
+	}
+	snap := unit.Snapshot()
+	cfg := unit.Config
+	data := map[string]string{
+		"Id":                cfg.Name,
+		"Names":             cfg.Name,
+		"Description":       unit.Description(),
+		"LoadState":         "loaded",
+		"ActiveState":       string(snap.State),
+		"SubState":          string(snap.State),
+		"FragmentPath":      unit.Path,
+		"UnitFileState":     m.UnitFileState(cfg.Name),
+		"MainPID":           fmt.Sprintf("%d", snap.MainPID),
+		"ExecMainPID":       fmt.Sprintf("%d", snap.MainPID),
+		"ExitCode":          fmt.Sprintf("%d", snap.ExitCode),
+		"Result":            snap.LastError,
+		"Type":              cfg.Service.Type,
+		"After":             strings.Join(cfg.After, " "),
+		"Requires":          strings.Join(cfg.Requires, " "),
+		"Wants":             strings.Join(cfg.Wants, " "),
+		"ExecStart":         cfg.Service.ExecStart,
+		"WantedBy":          strings.Join(cfg.Install.WantedBy, " "),
+	}
+	if !snap.StartedAt.IsZero() {
+		data["ActiveEnterTimestamp"] = snap.StartedAt.Format(time.RFC3339)
+		data["ActiveEnterTimestampMonotonic"] = fmt.Sprintf("%d", snap.StartedAtMonotonic.Microseconds())
+	}
+	if !snap.FinishedAt.IsZero() {
+		data["InactiveEnterTimestamp"] = snap.FinishedAt.Format(time.RFC3339)
+		data["InactiveEnterTimestampMonotonic"] = fmt.Sprintf("%d", snap.FinishedAtMonotonic.Microseconds())
+	}
+	return data, nil
+}
+
+func (m *Manager) CatUnit(name string) (string, error) {
+	unit, err := m.FindUnit(name)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(unit.Path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (m *Manager) UnitFileState(name string) string {
+	if m.IsMasked(name) {
+		return "masked"
+	}
+	enabled, _ := m.IsEnabled(name)
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+func parseKillSignal(raw string) syscall.Signal {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return syscall.SIGTERM
+	}
+	raw = strings.TrimPrefix(raw, "-")
+	// numeric signal like "9" or "15"
+	if n, err := fmt.Sscanf(raw, "%d", new(int)); err == nil && n == 1 {
+		var num int
+		fmt.Sscanf(raw, "%d", &num)
+		if num > 0 {
+			return syscall.Signal(num)
+		}
+	}
+	raw = strings.ToUpper(raw)
+	if !strings.HasPrefix(raw, "SIG") {
+		raw = "SIG" + raw
+	}
+	signals := map[string]syscall.Signal{
+		"SIGHUP":  syscall.SIGHUP,
+		"SIGINT":  syscall.SIGINT,
+		"SIGQUIT": syscall.SIGQUIT,
+		"SIGILL":  syscall.SIGILL,
+		"SIGTRAP": syscall.SIGTRAP,
+		"SIGABRT": syscall.SIGABRT,
+		"SIGBUS":  syscall.SIGBUS,
+		"SIGFPE":  syscall.SIGFPE,
+		"SIGKILL": syscall.SIGKILL,
+		"SIGUSR1": syscall.SIGUSR1,
+		"SIGSEGV": syscall.SIGSEGV,
+		"SIGUSR2": syscall.SIGUSR2,
+		"SIGPIPE": syscall.SIGPIPE,
+		"SIGALRM": syscall.SIGALRM,
+		"SIGTERM": syscall.SIGTERM,
+		"SIGCHLD": syscall.SIGCHLD,
+		"SIGCONT": syscall.SIGCONT,
+		"SIGSTOP": syscall.SIGSTOP,
+	}
+	if sig, ok := signals[raw]; ok {
+		return sig
+	}
+	return syscall.SIGTERM
 }
 
 func (m *Manager) ListUnitFiles() ([]*service.Unit, error) {

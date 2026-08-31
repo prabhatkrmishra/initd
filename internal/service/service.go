@@ -870,6 +870,47 @@ func (u *Unit) MarkFailed(reason string) {
 	u.transitionState(StateFailed, reason)
 }
 
+func (u *Unit) ResetFailed() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.Runtime.State != StateFailed {
+		return false
+	}
+	u.Runtime.State = StateInactive
+	u.Runtime.LastError = ""
+	u.Runtime.ExitCode = 0
+	u.Runtime.FinishedAt = time.Time{}
+	u.Runtime.FinishedAtMonotonic = 0
+	return true
+}
+
+func (u *Unit) IsFailed() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.Runtime.State == StateFailed
+}
+
+func (u *Unit) Kill(sig syscall.Signal) error {
+	u.mu.Lock()
+	pid := u.Runtime.MainPID
+	state := u.Runtime.State
+	killProcessGroup := !u.killModeProcess()
+	u.mu.Unlock()
+	if state != StateActive && state != StateActivating {
+		return fmt.Errorf("unit not active")
+	}
+	if pid <= 0 || !processAlive(pid) {
+		return fmt.Errorf("no main PID")
+	}
+	if killProcessGroup {
+		if err := syscall.Kill(-pid, sig); err != nil {
+			return err
+		}
+		return nil
+	}
+	return syscall.Kill(pid, sig)
+}
+
 func expandWithEnv(input string, envMap map[string]string) string {
 	return os.Expand(input, func(key string) string {
 		if value, ok := envMap[key]; ok {
