@@ -690,6 +690,23 @@ func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, start
 	depUnits := make([]*service.Unit, 0, len(deps))
 	depMeta := make(map[string]dependency, len(deps))
 	for _, dep := range deps {
+		// Socket dependencies are started directly rather than as services.
+		if strings.HasSuffix(dep.name, ".socket") {
+			if _, err := m.FindSocketUnit(dep.name); err != nil {
+				if dep.required {
+					return fmt.Errorf("required unit %s not found", dep.name)
+				}
+				unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s not found", dep.name))
+				continue
+			}
+			if err := m.startSocketUnit(dep.name); err != nil {
+				if dep.required {
+					return fmt.Errorf("required unit %s failed: %w", dep.name, err)
+				}
+				unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s failed: %v", dep.name, err))
+			}
+			continue
+		}
 		depUnit, err := m.FindUnit(dep.name)
 		if err != nil {
 			if dep.required {
