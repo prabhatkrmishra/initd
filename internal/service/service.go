@@ -178,12 +178,19 @@ func (u *Unit) Start() (int, error) {
 		}
 		return token, err
 	}
+	// Handle systemd argv[0] override: ExecStart=@/path/to/exe @argv0 args...
+	// After stripPrefix removes the leading @, args[1] may still carry @argv0.
+	var argv0 string
+	if len(args) > 1 && strings.HasPrefix(args[1], "@") {
+		argv0 = args[1][1:]
+		args = append(args[:1], args[2:]...)
+	}
 
-	go u.runStartSequence(token, args, envMap, envList, ignoreFailure)
+	go u.runStartSequence(token, args, envMap, envList, ignoreFailure, argv0)
 	return token, nil
 }
 
-func (u *Unit) runStartSequence(token int, args []string, envMap map[string]string, envList []string, ignoreFailure bool) {
+func (u *Unit) runStartSequence(token int, args []string, envMap map[string]string, envList []string, ignoreFailure bool, argv0 string) {
 	if !u.isCurrentToken(token) {
 		return
 	}
@@ -204,6 +211,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		return
 	}
 	// Socket activation: pass listening fds if present
+	socketActivated := false
 	if files, env := u.takeSocketActivation(); len(files) > 0 {
 		cmd.ExtraFiles = files
 		for k, v := range env {
@@ -217,7 +225,11 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		if wrappedCmd, werr := u.buildExecCommand(wrappedArgs, commandOptions{}); werr == nil {
 			wrappedCmd.ExtraFiles = files
 			cmd = wrappedCmd
+			socketActivated = true
 		}
+	}
+	if argv0 != "" && !socketActivated {
+		cmd.Args[0] = argv0
 	}
 
 	// -------------------------------------------------
@@ -1012,11 +1024,26 @@ func (u *Unit) expandSpecifiers(s string) string {
 
 func stripPrefix(command string) (string, bool) {
 	ignoreFailure := false
-	if strings.HasPrefix(command, "-") {
-		ignoreFailure = true
-		command = strings.TrimSpace(strings.TrimPrefix(command, "-"))
+	for {
+		command = strings.TrimSpace(command)
+		switch {
+		case strings.HasPrefix(command, "-"):
+			ignoreFailure = true
+			command = strings.TrimPrefix(command, "-")
+		case strings.HasPrefix(command, "@"):
+			command = strings.TrimPrefix(command, "@")
+		case strings.HasPrefix(command, ":"):
+			command = strings.TrimPrefix(command, ":")
+		case strings.HasPrefix(command, "+"):
+			command = strings.TrimPrefix(command, "+")
+		case strings.HasPrefix(command, "!!"):
+			command = strings.TrimPrefix(command, "!!")
+		case strings.HasPrefix(command, "!"):
+			command = strings.TrimPrefix(command, "!")
+		default:
+			return command, ignoreFailure
+		}
 	}
-	return command, ignoreFailure
 }
 
 func processAlive(pid int) bool {
@@ -1609,6 +1636,15 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			u.markFailed(err, ignoreFailure)
 			return
 		}
+		if u.reaper == nil && cmd != nil {
+			go func(c *exec.Cmd) {
+				if err := c.Wait(); err != nil {
+					u.handleExit(token, err, ignoreFailure, true)
+				} else {
+					u.handleExit(token, nil, ignoreFailure, true)
+				}
+			}(cmd)
+		}
 
 		return
 
@@ -1633,6 +1669,15 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			}
 			u.mu.Unlock()
 			u.Log(logging.LevelInfo, "Type=notify readiness timed out; falling back to active because process is still running")
+			if u.reaper == nil && cmd != nil {
+				go func(c *exec.Cmd) {
+					if err := c.Wait(); err != nil {
+						u.handleExit(token, err, ignoreFailure, true)
+					} else {
+						u.handleExit(token, nil, ignoreFailure, true)
+					}
+				}(cmd)
+			}
 			return
 		}
 
@@ -1641,6 +1686,11 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 		}
 
 		u.markFailed(fmt.Errorf("notify timeout"), ignoreFailure)
+		if u.reaper == nil && cmd != nil {
+			go func(c *exec.Cmd) {
+				_ = c.Wait()
+			}(cmd)
+		}
 		return
 	}
 }

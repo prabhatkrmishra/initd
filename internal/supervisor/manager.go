@@ -661,7 +661,7 @@ func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
 	seen := map[string]struct{}{}
 	add := func(name string, required bool) {
 		name = strings.TrimSpace(name)
-		if name == "" {
+		if name == "" || strings.HasSuffix(name, ".target") {
 			return
 		}
 		if _, ok := seen[name]; ok {
@@ -705,6 +705,10 @@ func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, start
 				}
 				unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s failed: %v", dep.name, err))
 			}
+			continue
+		}
+		// Targets are not loadable as units; skip them.
+		if strings.HasSuffix(dep.name, ".target") {
 			continue
 		}
 		depUnit, err := m.FindUnit(dep.name)
