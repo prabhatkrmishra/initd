@@ -1269,6 +1269,27 @@ func (m *Manager) IsFailed(name string) (bool, error) {
 	return unit.Snapshot().State == service.StateFailed, nil
 }
 
+// UnitState returns the current state of a service or socket unit as a string.
+// With an empty name it reports the overall system state: "failed" if any unit
+// has failed, otherwise "running".
+func (m *Manager) UnitState(name string) (string, error) {
+	if name == "" {
+		for _, u := range m.ListUnits() {
+			if u.Snapshot().State == service.StateFailed {
+				return "failed", nil
+			}
+		}
+		return "running", nil
+	}
+	if unit, err := m.FindUnit(name); err == nil {
+		return string(unit.Snapshot().State), nil
+	}
+	if _, err := m.FindSocketUnit(name); err == nil {
+		return m.SocketActiveState(name)
+	}
+	return "", fmt.Errorf("unit %s not found", name)
+}
+
 func (m *Manager) ResetFailed(name string) error {
 	if name == "" {
 		units := m.ListUnits()

@@ -1701,7 +1701,9 @@ func (u *Unit) workingDirectory() string {
 	if dir := strings.TrimSpace(u.Config.Service.WorkingDirectory); dir != "" {
 		return u.expandSpecifiers(dir)
 	}
-	return filepath.Dir(u.Path)
+	// systemd defaults system services to the root directory when
+	// WorkingDirectory= is unset; mirror that instead of the unit file's dir.
+	return "/"
 }
 
 func (u *Unit) Description() string {

@@ -73,13 +73,12 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 
 	dir := filepath.Dir(socketPath)
 	if dir != "" && dir != "." {
-		perm := os.FileMode(0755)
-		if manager != nil && manager.UserMode {
-			perm = 0700
-		}
-		_ = os.MkdirAll(dir, perm)
-		if manager != nil && manager.UserMode {
-			_ = os.Chmod(dir, 0700)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			perm := os.FileMode(0755)
+			if manager != nil && manager.UserMode {
+				perm = 0700
+			}
+			_ = os.MkdirAll(dir, perm)
 		}
 	}
 	_ = os.Remove(socketPath)
@@ -267,14 +266,11 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true, Data: "disabled"}
 	case "is-failed":
-		failed, err := manager.IsFailed(req.Unit)
+		state, err := manager.UnitState(req.Unit)
 		if err != nil {
 			return Response{Success: false, Message: err.Error()}
 		}
-		if failed {
-			return Response{Success: true, Data: "failed"}
-		}
-		return Response{Success: true, Data: "active"}
+		return Response{Success: true, Data: state}
 	case "reset-failed":
 		if err := manager.ResetFailed(req.Unit); err != nil {
 			return Response{Success: false, Message: err.Error()}
