@@ -951,7 +951,7 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 	go func() {
 		for {
 			time.Sleep(500 * time.Millisecond)
-			if !unit.IsCurrentToken(token) {
+			if !unit.IsCurrentToken(token) || unit.StopRequested() {
 				return
 			}
 			unitState := unit.Snapshot().State
@@ -980,6 +980,11 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 			}
 			unit.Log(logging.LevelInfo, fmt.Sprintf("Restarting service (attempt %d).", restartCount))
 			time.Sleep(restartSec)
+			// A stop may have been requested while we were waiting; don't
+			// resurrect a service the user asked to bring down.
+			if unit.StopRequested() {
+				return
+			}
 			newToken, err := unit.Start()
 			if err != nil {
 				unit.Log(logging.LevelError, fmt.Sprintf("Restart failed: %v", err))

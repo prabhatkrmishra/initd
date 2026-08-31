@@ -51,6 +51,7 @@ type Unit struct {
 	Logs             *logging.Buffer
 	restartHistory   []time.Time
 	startToken       int
+	stopRequested    bool
 	reaper           ExitReaper
 	notifyServer     *notify.Server
 	socketFiles      []*os.File
@@ -116,6 +117,7 @@ func (u *Unit) Start() (int, error) {
 		return token, nil
 	}
 	u.startToken++
+	u.stopRequested = false
 	token := u.startToken
 	u.Runtime.State = StateActivating
 	u.Runtime.LastError = ""
@@ -399,6 +401,10 @@ func (u *Unit) waitForking(token int, envMap map[string]string, envList []string
 }
 
 func (u *Unit) Stop(timeout time.Duration) error {
+	u.mu.Lock()
+	u.stopRequested = true
+	u.mu.Unlock()
+
 	runStopPost := true
 	defer func() {
 		u.mu.Lock()
@@ -1425,6 +1431,12 @@ func (u *Unit) isCurrentToken(token int) bool {
 
 func (u *Unit) IsCurrentToken(token int) bool {
 	return u.isCurrentToken(token)
+}
+
+func (u *Unit) StopRequested() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.stopRequested
 }
 
 func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
