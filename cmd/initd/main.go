@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const initdVersion = "0.0.2"
+const initdVersion = "1.0.0"
 
 func main() {
 	socketPath, initMode, err := parseArgs(os.Args[1:])

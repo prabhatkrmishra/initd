@@ -21,7 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const systemctlVersion = "0.0.2"
+const systemctlVersion = "1.0.0"
 
 func main() {
 	if wantsHelp(os.Args[1:]) {
