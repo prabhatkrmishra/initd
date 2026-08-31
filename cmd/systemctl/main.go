@@ -10,8 +10,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -768,6 +770,15 @@ func ensureUserDaemon(socketPath string) {
 	}
 	cmd := exec.Command(bin, "--socket")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	// When root runs systemctl --user (via sudo), the spawned daemon must
+	// run as the target user so socket and lock files get the correct
+	// ownership. Without this, root-owned sockets on /tmp (sticky bit)
+	// block the target user from connecting or cleaning up stale files.
+	if os.Getuid() == 0 {
+		applyTargetUser(cmd)
+	}
+
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -781,6 +792,43 @@ func ensureUserDaemon(socketPath string) {
 			return
 		}
 	}
+}
+
+// applyTargetUser sets the child process credentials and environment to
+// match the sudo target user so the daemon creates files with correct ownership.
+func applyTargetUser(cmd *exec.Cmd) {
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser == "" {
+		return
+	}
+	u, err := user.Lookup(sudoUser)
+	if err != nil {
+		return
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	cmd.SysProcAttr.Credential = &syscall.Credential{
+		Uid: uint32(uid),
+		Gid: uint32(gid),
+	}
+	// Rebuild environment without SUDO_* vars and with the target user's HOME.
+	var cleanEnv []string
+	for _, e := range os.Environ() {
+		key, _, _ := strings.Cut(e, "=")
+		if strings.HasPrefix(key, "SUDO_") {
+			continue
+		}
+		cleanEnv = append(cleanEnv, e)
+	}
+	cleanEnv = append(cleanEnv,
+		"HOME="+u.HomeDir,
+		"USER="+u.Username,
+		"LOGNAME="+u.Username,
+	)
+	cmd.Env = cleanEnv
 }
 
 func canDial(path string) bool {
