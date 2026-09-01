@@ -25,8 +25,11 @@ build-all:
 package: build-all
 	@mkdir -p releases
 	@for ARCH in amd64 arm64; do \
-		cd "$(BUILD_DIR)/linux-$$ARCH" && zip -q "../../releases/initd_$(VERSION)_linux_$${ARCH}.zip" initd systemctl && cd - > /dev/null; \
-		echo "Created releases/initd_$(VERSION)_linux_$${ARCH}.zip"; \
+		zip -q -j "releases/initd_$(VERSION)_linux_$${ARCH}.zip" \
+			"$(BUILD_DIR)/linux-$$ARCH/initd" \
+			"$(BUILD_DIR)/linux-$$ARCH/systemctl" \
+			install.sh ; \
+		echo "Created releases/initd_$(VERSION)_linux_$${ARCH}.zip (initd, systemctl, install.sh)"; \
 	done
 	@sha256sum releases/*.zip 2>/dev/null || true
 
