@@ -256,14 +256,38 @@ func handleShow(client *ipc.Client, args []string) {
 		resp, qerr := client.Do(ipc.Request{Action: "show", Unit: resolved})
 		loaded := qerr == nil && resp.Success
 		if !loaded {
-			// Not loaded by the manager. systemd reports LoadState=not-found
-			// and exits 0 for `systemctl show <unit>`; mirror that so probes
-			// treating "not-found" as absence succeed.
-			if len(properties) == 0 || containsProp(properties, "LoadState") {
-				if valueOnly {
-					fmt.Println("not-found")
-				} else {
-					fmt.Println("LoadState=not-found")
+			// Not loaded by the manager. systemd emits ALL requested properties
+			// (with empty/default values) for a not-found unit and exits 0, so
+			// callers that parse specific properties (e.g. openclaw's
+			// readProperties("Unit", [FragmentPath, DropInPaths,
+			// NeedDaemonReload, LoadState])) get a well-formed key=value for
+			// each requested prop rather than a missing one that they'd then
+			// mis-parse as another field's value. Emit LoadState=not-found and
+			// the systemd defaults for the other standard unit properties.
+			notFoundDefaults := map[string]string{
+				"LoadState":          "not-found",
+				"ActiveState":        "inactive",
+				"SubState":           "dead",
+				"FragmentPath":       "",
+				"DropInPaths":        "",
+				"NeedDaemonReload":   "False",
+				"UnitFileState":      "disabled",
+				"Description":        "",
+			}
+			if len(properties) == 0 {
+				keys := make([]string, 0, len(notFoundDefaults))
+				for k := range notFoundDefaults {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					printProp(k, notFoundDefaults[k], valueOnly)
+				}
+			} else {
+				for _, p := range properties {
+					if v, ok := notFoundDefaults[p]; ok {
+						printProp(p, v, valueOnly)
+					}
 				}
 			}
 			exitCode = 0
