@@ -286,6 +286,12 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 			return unit, nil
 		}
 	}
+	// On-demand load from disk (mirrors systemd's LoadUnit behavior): a unit
+	// file may exist under a search path even though it was not present when
+	// the manager started up or has not yet been daemon-reload'ed.
+	if unit := m.loadUnitFromDiskLocked(name); unit != nil {
+		return unit, nil
+	}
 	return nil, fmt.Errorf("unit %s not found", name)
 }
 
@@ -306,7 +312,55 @@ func (m *Manager) findUnitLocked(name string) (*service.Unit, error) {
 			return unit, nil
 		}
 	}
+	// On-demand load from disk (mirrors systemd's LoadUnit behavior): a unit
+	// file may exist under a search path even though it was not present when
+	// the manager started up or has not yet been daemon-reload'ed.
+	if unit := m.loadUnitFromDiskLocked(name); unit != nil {
+		return unit, nil
+	}
 	return nil, fmt.Errorf("unit %s not found", name)
+}
+
+// loadUnitFromDiskLocked scans the manager's configured search paths for a unit
+// file named n, parses it (including drop-ins), registers the resulting unit in
+// memory, and returns it. Returns nil if no matching file is found on disk.
+// The caller must hold m.mu.
+func (m *Manager) loadUnitFromDiskLocked(n string) *service.Unit {
+	if unit, ok := m.Units[n]; ok {
+		return unit
+	}
+	for _, dir := range m.SearchPaths {
+		p := filepath.Join(dir, n)
+		fi, err := os.Stat(p)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		unitConfig, err := parser.ParseUnitWithDropins(p, m.SearchPaths, m.EnabledRoot)
+		if err != nil {
+			continue
+		}
+		unitConfig.Name = n
+		unit := service.NewUnit(unitConfig, p)
+		if m.reaper != nil {
+			unit.SetReaper(m.reaper)
+		}
+		unit.SetOnFailureHandler(m.onFailureCallback(unit.Config.Name))
+		m.Units[n] = unit
+		m.UnitOrder = append(m.UnitOrder, n)
+		return unit
+	}
+	return nil
+}
+
+// unitExistsOnDiskLocked reports whether a unit file named n can be located
+// under any of the manager's search paths. The caller must hold m.mu.
+func (m *Manager) unitExistsOnDiskLocked(n string) bool {
+	for _, dir := range m.SearchPaths {
+		if fi, err := os.Stat(filepath.Join(dir, n)); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) StartUnit(name string) error {
@@ -1217,7 +1271,15 @@ func (m *Manager) IsEnabled(name string) (bool, error) {
 				return ok, nil
 			}
 		}
-		return false, fmt.Errorf("unit %s not found", name)
+		// On-demand: a unit may exist on disk even if it was not loaded at
+		// startup or daemon-reload; treat it as present so its enabled state
+		// can be reported (mirrors systemd's is-enabled behavior).
+		m.mu.Lock()
+		exists := m.unitExistsOnDiskLocked(name)
+		m.mu.Unlock()
+		if !exists {
+			return false, fmt.Errorf("unit %s not found", name)
+		}
 	}
 	if m.IsMasked(name) {
 		return false, nil

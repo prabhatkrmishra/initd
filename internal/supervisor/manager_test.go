@@ -209,6 +209,53 @@ func TestMaskUnmask(t *testing.T) {
 	}
 }
 
+func TestOnDemandLoadFromDisk(t *testing.T) {
+	m, dir := newTestManager(t)
+	if err := m.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	// Write a unit AFTER startup and WITHOUT a daemon-reload: real systemd
+	// resolves it on demand via LoadUnit, as must initd.
+	writeUnit(t, dir, "on-demand.service", `
+[Unit]
+Description=On Demand
+
+[Service]
+ExecStart=/bin/sleep 60
+
+[Install]
+WantedBy=default.target
+`)
+
+	if _, err := m.FindUnit("on-demand.service"); err != nil {
+		t.Fatalf("FindUnit(on-demand) should load from disk: %v", err)
+	}
+	if data, err := m.ShowUnit("on-demand.service"); err != nil {
+		t.Fatalf("ShowUnit(on-demand) on-demand: %v", err)
+	} else if data["LoadState"] != "loaded" {
+		t.Errorf("LoadState = %q, want loaded", data["LoadState"])
+	}
+	if st := m.UnitFileState("on-demand.service"); st != "disabled" {
+		t.Errorf("UnitFileState = %q, want disabled", st)
+	}
+	if err := m.EnableUnit("on-demand.service"); err != nil {
+		t.Fatalf("EnableUnit(on-demand) on-demand: %v", err)
+	}
+	enabled, err := m.IsEnabled("on-demand.service")
+	if err != nil {
+		t.Fatalf("IsEnabled(on-demand): %v", err)
+	}
+	if !enabled {
+		t.Error("should be enabled after EnableUnit")
+	}
+	if st := m.UnitFileState("on-demand.service"); st != "enabled" {
+		t.Errorf("UnitFileState = %q, want enabled", st)
+	}
+	if err := m.DisableUnit("on-demand.service"); err != nil {
+		t.Fatalf("DisableUnit(on-demand): %v", err)
+	}
+}
+
 func TestEnableDisableIsEnabled(t *testing.T) {
 	m, dir := newTestManager(t)
 	writeUnit(t, dir, "foo.service", `
