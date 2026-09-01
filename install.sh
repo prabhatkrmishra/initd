@@ -167,7 +167,6 @@ as_root tee "$DBUS_SERVICE_FILE" >/dev/null <<EOF
 [D-BUS Service]
 Name=org.freedesktop.systemd1
 Exec=$INITD_DST --socket
-User=$RUN_USER
 EOF
 as_root chmod 0644 "$DBUS_SERVICE_FILE"
 
