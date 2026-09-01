@@ -553,6 +553,12 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		}
 	}
 
+	// Give SIGKILL a moment to take effect before judging.
+	time.Sleep(150 * time.Millisecond)
+	if pid != 0 && !processAlive(pid) {
+		u.transitionState(StateInactive, "")
+		return nil
+	}
 	u.transitionState(StateFailed, "terminated after timeout")
 	return errors.New("stop timeout")
 }
