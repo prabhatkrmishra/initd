@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"initd/internal/boot"
+	"initd/internal/dbus"
 	"initd/internal/ipc"
 	"initd/internal/logging"
 	"initd/internal/supervisor"
@@ -115,6 +117,15 @@ func main() {
 		}()
 	}
 
+	// Advertise org.freedesktop.systemd1 over D-Bus so that tools which
+	// talk to the systemd1 D-Bus interface (e.g. /usr/bin/systemctl in
+	// system scope, openclaw's ownership probe) get verifiable answers
+	// instead of "Failed to connect to bus: Permission denied". The user
+	// (session) bus is always attempted; the system bus is attempted too
+	// but is non-fatal: if initd is not root or no system dbus-daemon is
+	// reachable, we simply skip it and rely on the user bus instead.
+	go startDBusServers(systemManager, userManager)
+
 	if initMode {
 		if os.Getpid() == 1 {
 			// full init
@@ -169,7 +180,28 @@ func main() {
 
 }
 
-/* ---------------- arg parsing ---------------- */
+// startDBusServers registers org.freedesktop.systemd1 on the D-Bus session bus
+// (and the system bus when reachable) so that systemctl/system-scope probes and
+// D-Bus clients talk to initd instead of failing. It runs in goroutines and is
+// non-fatal: if a bus isn't available (no dbus-daemon, non-root for system bus),
+// it logs and moves on. The user/session bus is the important one for the VPS
+// case, since initd's own session bus already exists at $XDG_RUNTIME_DIR/bus.
+func startDBusServers(systemManager, userManager *supervisor.Manager) {
+	ctx := context.Background()
+	// User (session) bus — initd already owns org.freedesktop.DBus here, so we
+	// also own org.freedesktop.systemd1 and answer systemctl --user introspection.
+	if _, err := dbus.ServeUserBus(ctx, userManager); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"dbus user bus registration disabled: %v", err)
+	}
+	// System bus — allows /usr/bin/systemctl (system scope) to connect and get a
+	// verifiable answer. Non-fatal: fails for non-root or when no system
+	// dbus-daemon is running with a permissive systemd1 policy.
+	if _, err := dbus.ServeSystemBus(ctx, systemManager, userManager); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"dbus system bus registration unavailable: %v", err)
+	}
+}
 
 func parseArgs(args []string) (string, bool, error) {
 	socketPath := "/run/initd.sock"

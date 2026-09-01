@@ -92,7 +92,9 @@ func main() {
 	switch cmd {
 	case "enable", "disable":
 		handleEnableDisable(client, cmd, cmdArgs)
-	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "mask", "unmask", "show", "cat", "kill":
+	case "show":
+		handleShow(client, cmdArgs)
+	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "mask", "unmask", "cat", "kill":
 		if cmd == "kill" {
 			handleKillCommand(client, cmdArgs)
 			break
@@ -194,6 +196,134 @@ func handleEnableDisable(client *ipc.Client, action string, args []string) {
 	}
 }
 
+// parseShowArgs parses the argument vector of `systemctl show` into the list
+// of requested properties, whether --value was requested, and the unit names.
+// It tolerates unknown flags (e.g. --no-pager) and comma-separated property
+// lists (--property=A,B).
+func parseShowArgs(args []string) (properties []string, valueOnly bool, units []string) {
+	for _, a := range args {
+		switch {
+		case a == "--value" || strings.HasPrefix(a, "--value"):
+			valueOnly = true
+		case a == "--no-pager" || strings.HasPrefix(a, "--no-pager"):
+			// compatibility flag from callers; ignored
+		case strings.HasPrefix(a, "--property="):
+			p := strings.TrimPrefix(a, "--property=")
+			if p != "" {
+				properties = append(properties, strings.Split(p, ",")...)
+			}
+		case strings.HasPrefix(a, "--"):
+			// unknown flag; ignore for the units-only query path
+		default:
+			units = append(units, a)
+		}
+	}
+	return properties, valueOnly, units
+}
+
+// handleShow implements `systemctl show [options] [UNIT...]`. It parses the
+// common --property and --value flags and resolves each requested property
+// against the manager. Units that are not loaded are reported with
+// LoadState=not-found and a successful exit code, mirroring systemd so that
+// probes which merely want to verify absence (e.g. openclaw's ownership check)
+// do not fail on "Failed to connect to bus".
+func handleShow(client *ipc.Client, args []string) {
+	properties, valueOnly, units := parseShowArgs(args)
+
+	if len(units) == 0 {
+		// No unit given: report manager-level info so callers that probe
+		// `systemctl show` (no args) still get a successful, non-fatal reply.
+		resp, err := client.Do(ipc.Request{Action: "status"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if !resp.Success {
+			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			os.Exit(1)
+		}
+		fmt.Println("LoadState=loaded")
+		fmt.Println("ActiveState=active")
+		fmt.Println("SubState=running")
+		os.Exit(0)
+	}
+
+	exitCode := 0
+	for _, unit := range units {
+		resolved, err := resolveUnitName(client, unit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(1)
+		}
+		resp, qerr := client.Do(ipc.Request{Action: "show", Unit: resolved})
+		loaded := qerr == nil && resp.Success
+		if !loaded {
+			// Not loaded by the manager. systemd reports LoadState=not-found
+			// and exits 0 for `systemctl show <unit>`; mirror that so probes
+			// treating "not-found" as absence succeed.
+			if len(properties) == 0 || containsProp(properties, "LoadState") {
+				if valueOnly {
+					fmt.Println("not-found")
+				} else {
+					fmt.Println("LoadState=not-found")
+				}
+			}
+			exitCode = 0
+			continue
+		}
+
+		dataMap := map[string]string{}
+		raw, _ := json.Marshal(resp.Data)
+		_ = json.Unmarshal(raw, &dataMap)
+		// Guarantee LoadState is present for consistency with systemd.
+		if _, ok := dataMap["LoadState"]; !ok {
+			dataMap["LoadState"] = "loaded"
+		}
+		if active, ok := dataMap["ActiveState"]; !ok || active == "" {
+			dataMap["ActiveState"] = "active"
+		}
+		if sub, ok := dataMap["SubState"]; !ok || sub == "" {
+			dataMap["SubState"] = "running"
+		}
+
+		if len(properties) == 0 {
+			// Print all, sorted, like systemd.
+			keys := make([]string, 0, len(dataMap))
+			for k := range dataMap {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				printProp(k, dataMap[k], valueOnly)
+			}
+		} else {
+			for _, p := range properties {
+				if v, ok := dataMap[p]; ok {
+					printProp(p, v, valueOnly)
+				}
+			}
+		}
+	}
+	os.Exit(exitCode)
+}
+
+func printProp(key, value string, valueOnly bool) {
+	if valueOnly {
+		fmt.Println(value)
+	} else {
+		fmt.Printf("%s=%s\n", key, value)
+	}
+}
+
+func containsProp(props []string, name string) bool {
+	for _, p := range props {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}
+
 func handleUnitCommand(client *ipc.Client, action, unit string) {
 	resolvedUnit, err := resolveUnitName(client, unit)
 	if err != nil {
@@ -230,18 +360,6 @@ func handleUnitCommand(client *ipc.Client, action, unit string) {
 			os.Exit(0)
 		}
 		os.Exit(1)
-	case "show":
-		dataMap := map[string]string{}
-		raw, _ := json.Marshal(resp.Data)
-		_ = json.Unmarshal(raw, &dataMap)
-		keys := make([]string, 0, len(dataMap))
-		for k := range dataMap {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Printf("%s=%s\n", k, dataMap[k])
-		}
 	case "cat":
 		content := fmt.Sprintf("%v", resp.Data)
 		fmt.Print(content)
