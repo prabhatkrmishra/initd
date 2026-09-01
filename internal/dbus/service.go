@@ -114,6 +114,24 @@ func (m *systemd1Manager) GetUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
 }
 
+// LoadUnit mirrors org.freedesktop.systemd1.Manager.LoadUnit. systemd returns
+// the loaded unit's object path; for a unit that is not loaded it raises
+// org.freedesktop.systemd1.NoSuchUnit with the body "Unit %s not found.". That
+// exact body is what busctl surfaces on stderr as
+//   "Call failed: Unit <name> not found."
+// and callers such as openclaw match it verbatim to treat the unit as absent.
+// Do not change the message text or the error name without updating that
+// match.
+func (m *systemd1Manager) LoadUnit(name string) (dbus.ObjectPath, *dbus.Error) {
+	if name == "" {
+		return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"Unit  not found."}}
+	}
+	if _, ok := managerUnitProps(m.primary, name); ok {
+		return m.unitPathFor(name), nil
+	}
+	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+}
+
 func (m *systemd1Manager) GetUnitByPID(pid uint32) (dbus.ObjectPath, *dbus.Error) {
 	_ = pid
 	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"Not tracked"}}

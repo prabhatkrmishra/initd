@@ -114,6 +114,49 @@ func TestManagerGetUnitErrors(t *testing.T) {
 	}
 }
 
+func TestManagerLoadUnit(t *testing.T) {
+	mgr := newTestManager(t)
+	searchDir := mgr.SearchPaths[0]
+	writeUnitForDBus(t, searchDir, "hello.service", "[Unit]\nDescription=Hello\n[Service]\nExecStart=/bin/true\n")
+	if err := mgr.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	m := newManager(mgr)
+
+	// busctl surfaces a Manager.LoadUnit D-Bus error as stderr
+	// "Call failed: Unit <name> not found." so callers (e.g. openclaw) can
+	// distinguish "absent" from a real failure. The body must read exactly
+	// "Unit <name> not found." for that to work.
+	_, derr := m.LoadUnit("")
+	if derr == nil || !strings.Contains(derr.Name, "NoSuchUnit") {
+		t.Fatalf("expected NoSuchUnit for empty name, got %v", derr)
+	}
+	if len(derr.Body) == 0 {
+		t.Fatalf("expected non-empty error body, got %v", derr)
+	}
+	if msg, _ := derr.Body[0].(string); msg != "Unit  not found." {
+		t.Fatalf("unexpected body for empty name: %q", msg)
+	}
+
+	_, derr = m.LoadUnit("nonexistent.service")
+	if derr == nil || !strings.Contains(derr.Name, "NoSuchUnit") {
+		t.Fatalf("expected NoSuchUnit, got %v", derr)
+	}
+	msg, _ := derr.Body[0].(string)
+	if msg != "Unit nonexistent.service not found." {
+		t.Fatalf("expected exact 'Unit nonexistent.service not found.', got %q", msg)
+	}
+
+	path, derr := m.LoadUnit("hello.service")
+	if derr != nil {
+		t.Fatalf("LoadUnit(hello) error: %v", derr)
+	}
+	// '.' is escaped to '_2e' in the unit object path.
+	if path != "/org/freedesktop/systemd1/unit/hello_2eservice" {
+		t.Fatalf("bad path for loaded unit: %q", path)
+	}
+}
+
 func TestManagerGetUnitFileState(t *testing.T) {
 	mgr := newTestManager(t)
 	searchDir := mgr.SearchPaths[0]
