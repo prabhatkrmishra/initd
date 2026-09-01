@@ -11,11 +11,13 @@
 #     bash install.sh
 #
 # It will:
-#   1. locate (or build) the initd + systemctl binaries for this host's arch;
+#   1. locate (or build) the initd + systemctl + loginctl binaries for this host's arch;
 #   2. install (as root directly, or via sudo for a non-root user):
 #        /usr/bin/initd                                   (supervisor)
 #        /usr/bin/systemctl                               (wrapper)
 #        /usr/bin/systemctl.real.systemd255               (backup of real systemd systemctl)
+#        /usr/bin/loginctl                               (initd compatibility shim)
+#        /usr/bin/loginctl.real                         (backup of real loginctl, if any)
 #        /usr/share/dbus-1/services/org.freedesktop.systemd1.service
 #        /usr/share/dbus-1/system.d/org.freedesktop.systemd1.conf
 #   3. ensure a session bus at $XDG_RUNTIME_DIR/bus;
@@ -26,10 +28,6 @@
 #      re-runs automatically on every session login when the daemon is down;
 #   5. verify org.freedesktop.systemd1 is owned and that an arbitrary unit
 #      resolves (so openclaw, or any service tooling, works without real systemd).
-#
-# After this, on each session login `initd --init` starts the daemon and all
-# enabled services automatically. The openclaw gateway can then be installed by
-# the same user with:  PATH=/usr/bin:$PATH openclaw gateway install
 set -euo pipefail
 
 # --- who am I / how do I gain privileges ---------------------------------------
@@ -83,6 +81,7 @@ if command -v go >/dev/null 2>&1; then have_go=1; fi
 
 INITD_BIN="${INITD_BIN:-}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-}"
+LOGINCTL_BIN="${LOGINCTL_BIN:-}"
 
 find_binary() {
   local name="$1" arch="$2" cand
@@ -111,21 +110,31 @@ fi
 if [ -z "$SYSTEMCTL_BIN" ]; then
   SYSTEMCTL_BIN="$(find_binary systemctl "$ARCH" || true)"
 fi
+if [ -z "$LOGINCTL_BIN" ]; then
+  LOGINCTL_BIN="$(find_binary loginctl "$ARCH" || true)"
+fi
 if [ -z "$INITD_BIN" ] && [ "$have_go" -eq 1 ]; then
   INITD_BIN="$(build_binary cmd/initd)"
 fi
 if [ -z "$SYSTEMCTL_BIN" ] && [ "$have_go" -eq 1 ]; then
   SYSTEMCTL_BIN="$(build_binary cmd/systemctl)"
 fi
+if [ -z "$LOGINCTL_BIN" ] && [ "$have_go" -eq 1 ]; then
+  LOGINCTL_BIN="$(build_binary cmd/loginctl)"
+fi
 
 : "${INITD_BIN:?}"
 : "${SYSTEMCTL_BIN:?}"
+: "${LOGINCTL_BIN:?}"
 echo "Using initd binary:      $INITD_BIN"
 echo "Using systemctl binary:  $SYSTEMCTL_BIN"
+echo "Using loginctl binary:   $LOGINCTL_BIN"
 
 INITD_DST="/usr/bin/initd"
 SYSTEMCTL_DST="/usr/bin/systemctl"
+LOGINCTL_DST="/usr/bin/loginctl"
 REAL_BACKUP="/usr/bin/systemctl.real.systemd255"
+LOGINCTL_REAL_BACKUP="/usr/bin/loginctl.real"
 
 # --- install binaries ----------------------------------------------------------
 echo "Backing up real systemctl (if present and not already backed up)..."
@@ -134,10 +143,18 @@ if [ -f "$SYSTEMCTL_DST" ] && [ ! -f "$REAL_BACKUP" ]; then
     as_root cp "$SYSTEMCTL_DST" "$REAL_BACKUP"
   fi
 fi
+echo "Backing up real loginctl (if present and not already backed up)..."
+if [ -f "$LOGINCTL_DST" ] && [ ! -f "$LOGINCTL_REAL_BACKUP" ]; then
+  if file "$LOGINCTL_DST" 2>/dev/null | grep -q "dynamically linked"; then
+    as_root cp "$LOGINCTL_DST" "$LOGINCTL_REAL_BACKUP"
+  fi
+fi
 echo "Installing initd -> $INITD_DST"
 as_root install -m 0755 "$INITD_BIN" "$INITD_DST"
 echo "Installing systemctl -> $SYSTEMCTL_DST"
 as_root install -m 0755 "$SYSTEMCTL_BIN" "$SYSTEMCTL_DST"
+echo "Installing loginctl -> $LOGINCTL_DST"
+as_root install -m 0755 "$LOGINCTL_BIN" "$LOGINCTL_DST"
 
 # --- D-Bus configuration -------------------------------------------------------
 DBUS_SERVICE_FILE="/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
@@ -240,8 +257,8 @@ fi
 # running with the installed policy); verify it opportunistically.
 if pgrep -x dbus-daemon >/dev/null 2>&1 && [ -S /run/dbus/system_bus_socket ]; then
   if dbus-send --system --dest=org.freedesktop.DBus --print-reply \
-     --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
-     string:org.freedesktop.systemd1 2>/dev/null | grep -q "string"; then
+      --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
+      string:org.freedesktop.systemd1 2>/dev/null | grep -q "string"; then
     echo "OK: org.freedesktop.systemd1 is owned on the system bus."
   fi
 fi
@@ -257,11 +274,12 @@ install.sh complete.
 
   initd daemon : $INITD_DST  (running as $RUN_USER, init-lite)
   systemctl     : $SYSTEMCTL_DST
+  loginctl     : $LOGINCTL_DST
   real backup   : $REAL_BACKUP
   session bus   : $XDG_RUNTIME_DIR/bus
   autostart     : $AUTOSTART_FILE  (runs \`initd --init\` on each session login)
 
-On every session login, if the daemon is not running, initd --init starts and
+After this, on each session login, if the daemon is not running, initd --init starts and
 brings up ALL enabled units automatically.
 
 To install the openclaw gateway as a managed service owned by $RUN_USER:

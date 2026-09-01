@@ -539,7 +539,7 @@ func buildManagerProps(mgr *supervisor.Manager) map[string]map[string]*prop.Prop
 	}
 	sysState := frontend.SystemState()
 	mgrIf := map[string]*prop.Prop{
-		"Version":                     {Value: "1.0.0 (initd)", Writable: false, Emit: prop.EmitConst},
+		"Version":                     {Value: "1.0.1 (initd)", Writable: false, Emit: prop.EmitConst},
 		"Features":                    {Value: "", Writable: false, Emit: prop.EmitConst},
 		"Virtualization":              {Value: "", Writable: false, Emit: prop.EmitConst},
 		"ConfidentialVirtualization":    {Value: "", Writable: false, Emit: prop.EmitConst},
