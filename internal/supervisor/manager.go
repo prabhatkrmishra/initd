@@ -324,6 +324,22 @@ func (m *Manager) StartUnit(name string) error {
 	return m.startUnitWithDependencies(name, started, stack)
 }
 
+// expandSocketPath resolves systemd specifiers in a socket ListenStream /
+// ListenDatagram path. %t expands to the runtime directory (/run for system,
+// /run/user/<uid> for user services); %% is an escaped literal %.
+func (m *Manager) expandSocketPath(p string) string {
+	if !strings.Contains(p, "%") {
+		return p
+	}
+	p = strings.ReplaceAll(p, "%%", "\x00")
+	if m.UserMode {
+		p = strings.ReplaceAll(p, "%t", userpaths.UserRuntimeDir())
+	} else {
+		p = strings.ReplaceAll(p, "%t", "/run")
+	}
+	return strings.ReplaceAll(p, "\x00", "%")
+}
+
 func (m *Manager) startSocketUnit(name string) error {
 	m.mu.Lock()
 	cfg, ok := m.SocketUnits[name]
@@ -346,7 +362,8 @@ func (m *Manager) startSocketUnit(name string) error {
 	var paths []string
 	var firstPath string
 
-	for _, sockPath := range cfg.Socket.ListenStream {
+	for _, rawPath := range cfg.Socket.ListenStream {
+		sockPath := m.expandSocketPath(rawPath)
 		dir := filepath.Dir(sockPath)
 		_ = os.MkdirAll(dir, 0755)
 		_ = os.Remove(sockPath)
@@ -374,7 +391,8 @@ func (m *Manager) startSocketUnit(name string) error {
 			firstPath = sockPath
 		}
 	}
-	for _, sockPath := range cfg.Socket.ListenDatagram {
+	for _, rawPath := range cfg.Socket.ListenDatagram {
+		sockPath := m.expandSocketPath(rawPath)
 		dir := filepath.Dir(sockPath)
 		_ = os.MkdirAll(dir, 0755)
 		_ = os.Remove(sockPath)

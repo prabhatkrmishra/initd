@@ -10,6 +10,7 @@ import (
 
 	"initd/internal/parser"
 	"initd/internal/service"
+	"initd/internal/userpaths"
 )
 
 // newTestManager creates a manager whose search paths and enabled root point
@@ -383,6 +384,31 @@ func TestShowAndCatSocketUnit(t *testing.T) {
 	}
 	if content == "" {
 		t.Error("CatSocketUnit returned empty content")
+	}
+}
+
+// TestSocketPercentTExpansion verifies that %t in a ListenStream path is
+// expanded to the runtime directory (user mode: /run/user/<uid>), so a socket
+// like dbus.socket (ListenStream=%t/bus) is created at the real path rather
+// than a literal "%t" directory.
+func TestSocketPercentTExpansion(t *testing.T) {
+	m, dir := newTestManager(t)
+	writeUnit(t, dir, "foo.socket", "[Socket]\nListenStream=%t/test.sock\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	if err := m.StartUnit("foo.socket"); err != nil {
+		t.Fatalf("StartUnit(socket): %v", err)
+	}
+	expanded := filepath.Join(userpaths.UserRuntimeDir(), "test.sock")
+	if _, err := os.Stat(expanded); err != nil {
+		t.Errorf("socket file should exist at expanded path %s: %v", expanded, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "%t", "test.sock")); !os.IsNotExist(err) {
+		t.Errorf("socket should not be created at literal %%t path")
+	}
+	if err := m.StopUnit("foo.socket"); err != nil {
+		t.Fatalf("StopUnit(socket): %v", err)
 	}
 }
 
