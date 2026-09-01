@@ -595,6 +595,8 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		"UnitFilePreset":          {Value: "disabled", Writable: false, Emit: prop.EmitConst},
 		"Result":                  {Value: "", Writable: false, Emit: prop.EmitTrue},
 		"FragmentPath":            {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
+		"DropInPaths":          {Value: []string{}, Writable: false, Emit: prop.EmitConst},
+		"NeedDaemonReload":     {Value: false, Writable: false, Emit: prop.EmitConst},
 		"SourcePath":              {Value: "", Writable: false, Emit: prop.EmitConst},
 		"MainPID":                 {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
 		"ExecMainPID":             {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
