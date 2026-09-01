@@ -665,6 +665,11 @@ func buildServiceProps(mgr *supervisor.Manager, name string) map[string]*prop.Pr
 		"Type":             {Value: cfg.Config.Service.Type, Writable: false, Emit: prop.EmitConst},
 		"WorkingDirectory": {Value: cfg.Config.Service.WorkingDirectory, Writable: false, Emit: prop.EmitConst},
 		"ExecStart":        {Value: execStartCommands(execPath, argv), Writable: false, Emit: prop.EmitConst},
+		"Environment":      {Value: cfg.Config.Service.Environment, Writable: false, Emit: prop.EmitConst},
+		// EnvironmentFiles is a(sb): one (path, ignore-missing) struct per file.
+		"EnvironmentFiles": {Value: envFileSpecs(cfg.Config.Service.EnvironmentFile), Writable: false, Emit: prop.EmitConst},
+		// The initd unit parser does not track UnsetEnvironment; report empty.
+		"UnsetEnvironment": {Value: []string{}, Writable: false, Emit: prop.EmitConst},
 	}
 }
 
@@ -689,10 +694,34 @@ func execStartCommands(path string, argv []string) []execCommand {
 		return nil
 	}
 	return []execCommand{{
-		Binary: path,
-		Args:   argv,
+		Binary:      path,
+		Args:        argv,
 		IgnoreError: false,
 	}}
+}
+
+// envFile mirrors one element of the EnvironmentFiles property (a(sb)):
+// the file path and whether missing files are ignored (a leading '-' prefix
+// in EnvironmentFile= toggles ignore-missing, per systemd semantics).
+type envFile struct {
+	Path          string
+	IgnoreMissing bool
+}
+
+// envFileSpecs converts the parser's EnvironmentFile values into the
+// (path, ignore-missing) struct array that the D-Bus EnvironmentFiles property
+// expects.
+func envFileSpecs(files []string) []envFile {
+	out := make([]envFile, 0, len(files))
+	for _, f := range files {
+		ignore := false
+		if strings.HasPrefix(f, "-") {
+			ignore = true
+			f = strings.TrimPrefix(f, "-")
+		}
+		out = append(out, envFile{Path: f, IgnoreMissing: ignore})
+	}
+	return out
 }
 
 // shellSplitExecStart splits a systemd ExecStart= value into argv, honoring
