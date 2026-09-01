@@ -181,13 +181,40 @@ func main() {
 			}
 
 			for {
-				<-signals
+				select {
+				case sig := <-signals:
+					switch sig {
+					case syscall.SIGTERM:
+						shutdownDaemon(socketPath, userSocket, userLock, systemManager, userManager)
+					}
+				}
 			}
 		}
 	}
 	// socket-only mode
-	<-signals
+	sig := <-signals
+	if sig == syscall.SIGTERM {
+		shutdownDaemon(socketPath, userSocket, userLock, systemManager, userManager)
+	}
 
+}
+
+// shutdownDaemon performs a clean shutdown on SIGTERM: it stops managed units,
+// removes the IPC sockets and releases the user lock, then exits. This lets a
+// replacement daemon (e.g. from install.sh's restart) take over without a stale
+// socket or lock leaving a split-brain supervisor behind.
+func shutdownDaemon(socketPath, userSocket string, userLock *os.File, systemManager, userManager *supervisor.Manager) {
+	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "received SIGTERM, shutting down")
+	userManager.StopAllUnits()
+	systemManager.StopAllUnits()
+	_ = os.Remove(userSocket)
+	if socketPath != userSocket {
+		_ = os.Remove(socketPath)
+	}
+	if userLock != nil {
+		_ = userLock.Close()
+	}
+	os.Exit(0)
 }
 
 // startDBusServers registers org.freedesktop.systemd1 on the D-Bus session bus

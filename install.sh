@@ -218,9 +218,24 @@ else
 fi
 
 # --- (re)start the initd daemon as `initd --init` (starts enabled units) -------
-echo "Starting initd daemon (initd --init) as $RUN_USER ..."
+echo "Stopping any existing initd daemon for $RUN_USER ..."
 pkill -u "$RUN_USER" -x initd 2>/dev/null || true
-sleep 1
+# Wait for the old daemon to actually exit before starting a new one. A stale
+# daemon that ignores SIGTERM would otherwise keep its sockets and lock, and a
+# second daemon would then split the supervisor in two (two listeners on the
+# same socket path, two competing restart loops). Escalate to SIGKILL after a
+# short grace period.
+for _ in $(seq 1 20); do
+  if ! pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+if pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
+  echo "initd did not exit on SIGTERM; sending SIGKILL." >&2
+  pkill -9 -u "$RUN_USER" -x initd 2>/dev/null || true
+  sleep 0.5
+fi
 # clear any stale daemon sockets owned by this user
 rm -f "$XDG_RUNTIME_DIR/initd.sock" "$XDG_RUNTIME_DIR/initd.lock" \
       "$XDG_RUNTIME_DIR/initd-system.sock" 2>/dev/null || true
