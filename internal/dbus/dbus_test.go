@@ -202,3 +202,47 @@ func TestBuildManagerProps(t *testing.T) {
 		t.Fatalf("too few manager props: %d", len(mgrProps))
 	}
 }
+
+func TestBuildServicePropsExecStart(t *testing.T) {
+	mgr := newTestManager(t)
+	searchDir := mgr.SearchPaths[0]
+	writeUnitForDBus(t, searchDir, "hello.service",
+		"[Unit]\nDescription=Hello\n[Service]\n"+
+			"Type=simple\nWorkingDirectory=/tmp\n"+
+			"ExecStart=/bin/echo \"hello world\" hi\n")
+	if err := mgr.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+
+	props := buildServiceProps(mgr, "hello.service")
+	if props == nil {
+		t.Fatalf("expected service props, got nil")
+	}
+	if got := props["Type"].Value; got != "simple" {
+		t.Fatalf("Type = %q, want simple", got)
+	}
+	if got := props["WorkingDirectory"].Value; got != "/tmp" {
+		t.Fatalf("WorkingDirectory = %q, want /tmp", got)
+	}
+	cmds, ok := props["ExecStart"].Value.([]execCommand)
+	if !ok {
+		t.Fatalf("ExecStart value type = %T, want []execCommand", props["ExecStart"].Value)
+	}
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 exec command, got %d", len(cmds))
+	}
+	if cmds[0].Binary != "/bin/echo" {
+		t.Fatalf("Binary = %q, want /bin/echo", cmds[0].Binary)
+	}
+	want := []string{"/bin/echo", "hello world", "hi"}
+	if len(cmds[0].Args) != len(want) || cmds[0].Args[0] != want[0] || cmds[0].Args[1] != "hello world" {
+		t.Fatalf("Args = %v, want %v", cmds[0].Args, want)
+	}
+}
+
+func TestBuildServicePropsMissing(t *testing.T) {
+	mgr := newTestManager(t)
+	if props := buildServiceProps(mgr, "nope.service"); props != nil {
+		t.Fatalf("expected nil for missing unit, got %v", props)
+	}
+}

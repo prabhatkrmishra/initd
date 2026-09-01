@@ -17,6 +17,8 @@ const (
 	managerBusName     = "org.freedesktop.systemd1"
 	managerInterface   = "org.freedesktop.systemd1.Manager"
 	unitInterface      = "org.freedesktop.systemd1.Unit"
+	serviceInterface   = "org.freedesktop.systemd1.Service"
+	propertiesInterface = "org.freedesktop.DBus.Properties"
 	unitBasePathString = "/org/freedesktop/systemd1/unit"
 )
 
@@ -463,37 +465,61 @@ func (u *unitPropsSubtree) unitNameFromPath(msg dbus.Message) (string, *dbus.Err
 }
 
 func (u *unitPropsSubtree) Get(iface string, propName string, msg dbus.Message) (dbus.Variant, *dbus.Error) {
-	_ = iface
 	name, derr := u.unitNameFromPath(msg)
 	if derr != nil {
 		return dbus.Variant{}, derr
 	}
-	props := buildUnitProps(u.mgr, name)
-	if props == nil {
-		return dbus.Variant{}, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+	switch iface {
+	case serviceInterface:
+		props := buildServiceProps(u.mgr, name)
+		if props == nil {
+			return dbus.Variant{}, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+		}
+		p, ok := props[propName]
+		if !ok {
+			return dbus.Variant{}, &dbus.Error{Name: "org.freedesktop.DBus.Error.UnknownProperty", Body: []interface{}{fmt.Sprintf("Unknown property %s", propName)}}
+		}
+		return dbus.MakeVariant(p.Value), nil
+	default:
+		props := buildUnitProps(u.mgr, name)
+		if props == nil {
+			return dbus.Variant{}, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+		}
+		p, ok := props[propName]
+		if !ok {
+			return dbus.Variant{}, &dbus.Error{Name: "org.freedesktop.DBus.Error.UnknownProperty", Body: []interface{}{fmt.Sprintf("Unknown property %s", propName)}}
+		}
+		return dbus.MakeVariant(p.Value), nil
 	}
-	p, ok := props[propName]
-	if !ok {
-		return dbus.Variant{}, &dbus.Error{Name: "org.freedesktop.DBus.Error.UnknownProperty", Body: []interface{}{fmt.Sprintf("Unknown property %s", propName)}}
-	}
-	return dbus.MakeVariant(p.Value), nil
 }
 
 func (u *unitPropsSubtree) GetAll(iface string, msg dbus.Message) (map[string]dbus.Variant, *dbus.Error) {
-	_ = iface
 	name, derr := u.unitNameFromPath(msg)
 	if derr != nil {
 		return nil, derr
 	}
-	props := buildUnitProps(u.mgr, name)
-	if props == nil {
-		return nil, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+	switch iface {
+	case serviceInterface:
+		props := buildServiceProps(u.mgr, name)
+		if props == nil {
+			return nil, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+		}
+		out := make(map[string]dbus.Variant, len(props))
+		for k, p := range props {
+			out[k] = dbus.MakeVariant(p.Value)
+		}
+		return out, nil
+	default:
+		props := buildUnitProps(u.mgr, name)
+		if props == nil {
+			return nil, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+		}
+		out := make(map[string]dbus.Variant, len(props))
+		for k, p := range props {
+			out[k] = dbus.MakeVariant(p.Value)
+		}
+		return out, nil
 	}
-	out := make(map[string]dbus.Variant, len(props))
-	for k, p := range props {
-		out[k] = dbus.MakeVariant(p.Value)
-	}
-	return out, nil
 }
 
 func (u *unitPropsSubtree) Set(iface string, propName string, val dbus.Variant, msg dbus.Message) *dbus.Error {
@@ -612,6 +638,106 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		"CPUWeight":               {Value: uint64(100), Writable: false, Emit: prop.EmitTrue},
 		"TasksCurrent":            {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
 	}
+}
+
+// buildServiceProps returns the org.freedesktop.systemd1.Service interface
+// properties for a unit. These are served on the unit's object path so that
+// tools (e.g. openclaw's requireEffective inspection) can read ExecStart,
+// WorkingDirectory and Type via `busctl get-property`.
+//
+// ExecStart is marshaled with systemd's ExecCommand struct signature
+// (sasbttttuii): binary path, argv, ignore-errors flag, uid, gid, and a
+// handful of integer status/timestamp fields. openclaw only consumes argv
+// (the 2nd element) and structurally validates the 10-tuple, so the integer
+// fields are filled with their zero defaults.
+func buildServiceProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop {
+	cfg, err := mgr.FindUnit(name)
+	if err != nil || cfg == nil || cfg.Config == nil {
+		return nil
+	}
+	execStart := cfg.Config.Service.ExecStart
+	argv := shellSplitExecStart(execStart)
+	execPath := ""
+	if len(argv) > 0 {
+		execPath = argv[0]
+	}
+	return map[string]*prop.Prop{
+		"Type":             {Value: cfg.Config.Service.Type, Writable: false, Emit: prop.EmitConst},
+		"WorkingDirectory": {Value: cfg.Config.Service.WorkingDirectory, Writable: false, Emit: prop.EmitConst},
+		"ExecStart":        {Value: execStartCommands(execPath, argv), Writable: false, Emit: prop.EmitConst},
+	}
+}
+
+// execCommand mirrors systemd's D-Bus ExecCommand struct (sasbttttuii).
+// Field order and types MUST match the signature so godbus marshals it to
+// a(sasbttttuii) and callers that parse the tuple get a 10-element array.
+type execCommand struct {
+	Binary      string   // s  ExecPath
+	Args        []string // as ExecArguments
+	IgnoreError bool     // b  ExecIgnoreErrors
+	UID         uint64   // t
+	GID         uint64   // t
+	StartLimit  uint64   // t
+	Timeout     uint64   // t
+	ExitType    uint32   // u
+	ExitStatus  int32    // i
+	Result      int32    // i
+}
+
+func execStartCommands(path string, argv []string) []execCommand {
+	if len(argv) == 0 {
+		return nil
+	}
+	return []execCommand{{
+		Binary: path,
+		Args:   argv,
+		IgnoreError: false,
+	}}
+}
+
+// shellSplitExecStart splits a systemd ExecStart= value into argv, honoring
+// the double- and single-quoted substrings systemd supports. It is a
+// pragmatic implementation good enough for service definitions that do not
+// use the full systemd command-line specifier grammar.
+func shellSplitExecStart(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	var (
+		args []string
+		cur  strings.Builder
+		inQ  byte
+	)
+	flush := func() {
+		args = append(args, cur.String())
+		cur.Reset()
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c == '"' || c == '\'':
+			if inQ == c {
+				inQ = 0
+			} else if inQ == 0 {
+				inQ = c
+			} else {
+				cur.WriteByte(c)
+			}
+		case c == ' ' || c == '\t':
+			if inQ != 0 {
+				cur.WriteByte(c)
+			} else if cur.Len() > 0 {
+				flush()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if cur.Len() > 0 || len(args) > 0 && (value[len(value)-1] == '"' || value[len(value)-1] == '\'') {
+		flush()
+	}
+	return args
 }
 
 // ---------- public registration API ----------
