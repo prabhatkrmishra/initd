@@ -8,7 +8,7 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 
-	"initd/internal/service"
+	sservice "initd/internal/service"
 	"initd/internal/supervisor"
 )
 
@@ -22,36 +22,33 @@ const (
 
 var managerPath = dbus.ObjectPath(managerPathString)
 
+// emptyManager is a nil-safe fallback used when a bus connection has no
+// backing supervisor Manager (e.g. initd running as a non-root user has no
+// system manager). Query methods on it return "not found"/empty results so the
+// D-Bus service can still own org.freedesktop.systemd1 and answer probes
+// gracefully instead of erroring.
+var emptyManager = &supervisor.Manager{}
+
 // systemd1Manager is the exported object at /org/freedesktop/systemd1
-// implementing org.freedesktop.systemd1.Manager plus org.freedesktop.DBus.Properties.
+// implementing org.freedesktop.systemd1.Manager (and org.freedesktop.DBus.Properties).
+// Each bus connection registers its own instance bound to the primary supervisor
+// Manager for that scope (the user manager on the session bus, the system
+// manager on the system bus). A nil primary is valid: queries answer as
+// not-found rather than erroring, which is what openclaw's ownership probe needs
+// from the system bus.
 type systemd1Manager struct {
-	userMgr   *supervisor.Manager
-	systemMgr *supervisor.Manager
+	primary *supervisor.Manager
 }
 
-// newManager creates the exported manager object.
-func newManager(userMgr, systemMgr *supervisor.Manager) *systemd1Manager {
-	return &systemd1Manager{userMgr: userMgr, systemMgr: systemMgr}
+func newManager(primary *supervisor.Manager) *systemd1Manager {
+	return &systemd1Manager{primary: primary}
 }
 
-// frontend returns the primary manager for this connection: system manager for a
-// system bus registration, user manager for a user bus.
-func (m *systemd1Manager) frontend() *supervisor.Manager {
-	if m.systemMgr != nil {
-		return m.systemMgr
+func (m *systemd1Manager) primarySafe() *supervisor.Manager {
+	if m.primary != nil {
+		return m.primary
 	}
-	return m.userMgr
-}
-
-// lookupManager returns the manager that actually holds a given unit
-// (system first when both are configured, else the frontend user manager).
-func (m *systemd1Manager) lookupManager(name string) *supervisor.Manager {
-	if m.systemMgr != nil {
-		if _, ok := managerUnitProps(m.systemMgr, name); ok {
-			return m.systemMgr
-		}
-	}
-	return m.userMgr
+	return emptyManager
 }
 
 func managerUnitProps(mgr *supervisor.Manager, name string) (map[string]string, bool) {
@@ -101,26 +98,17 @@ func unitNameFromPath(path string) (string, bool) {
 	return dbusUnescape(rest), true
 }
 
-// unitPathFor returns the canonical D-Bus object path for a unit on this manager.
 func (m *systemd1Manager) unitPathFor(name string) dbus.ObjectPath {
 	return unitObjectPath(name)
 }
 
-// ---------- Manager methods ----------
-// The method set below is exported as interface "org.freedesktop.systemd1.Manager"
-// on object path /org/freedesktop/systemd1. godbus reflects method names to
-// D-Bus members and marshals the Go signatures, so they must be stable:
-//   - GetUnit(s) -> o
-//   - StartUnit(ss) -> o  (mode param omitted to keep signature simple; systemd's
-//     StartUnit has an extra "replace" flag in newer versions, but the
-//     openclaw/systemctl usage only sends the name and mode.)
+// ---------- Manager interface methods ----------
 
 func (m *systemd1Manager) GetUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 	if name == "" {
 		return "", dbus.MakeFailedError(fmt.Errorf("No unit name specified"))
 	}
-	mgr := m.lookupManager(name)
-	if _, ok := managerUnitProps(mgr, name); ok {
+	if _, ok := managerUnitProps(m.primary, name); ok {
 		return m.unitPathFor(name), nil
 	}
 	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
@@ -140,13 +128,7 @@ func (m *systemd1Manager) GetUnitFileState(file string) (string, *dbus.Error) {
 	if file == "" {
 		return "", dbus.MakeFailedError(fmt.Errorf("empty unit file name"))
 	}
-	state := m.userMgr.UnitFileState(file)
-	if m.systemMgr != nil && state == "disabled" {
-		if s := m.systemMgr.UnitFileState(file); s != "disabled" {
-			state = s
-		}
-	}
-	return state, nil
+	return m.primarySafe().UnitFileState(file), nil
 }
 
 func (m *systemd1Manager) EnableUnitFiles(files []string, runtime bool, force bool) (bool, []struct {
@@ -154,16 +136,17 @@ func (m *systemd1Manager) EnableUnitFiles(files []string, runtime bool, force bo
 }, *dbus.Error) {
 	_ = runtime
 	_ = force
+	mgr := m.primarySafe()
 	changed := false
 	infos := []struct {
 		Type, Filename, Destination string
 	}{}
 	for _, f := range files {
-		if err := m.userMgr.EnableUnit(f); err == nil {
+		if err := mgr.EnableUnit(f); err == nil {
 			changed = true
 			infos = append(infos, struct {
 				Type, Filename, Destination string
-			}{Type: "symlink", Filename: f, Destination: m.userMgr.EnabledRoot})
+			}{Type: "symlink", Filename: f, Destination: mgr.EnabledRoot})
 		}
 	}
 	return changed, infos, nil
@@ -173,23 +156,24 @@ func (m *systemd1Manager) DisableUnitFiles(files []string, runtime bool) (bool, 
 	Type, Filename, Destination string
 }, *dbus.Error) {
 	_ = runtime
+	mgr := m.primarySafe()
 	changed := false
 	infos := []struct {
 		Type, Filename, Destination string
 	}{}
 	for _, f := range files {
-		if err := m.userMgr.DisableUnit(f); err == nil {
+		if err := mgr.DisableUnit(f); err == nil {
 			changed = true
 			infos = append(infos, struct {
 				Type, Filename, Destination string
-			}{Type: "unlink", Filename: f, Destination: m.userMgr.EnabledRoot})
+			}{Type: "unlink", Filename: f, Destination: mgr.EnabledRoot})
 		}
 	}
 	return changed, infos, nil
 }
 
 func (m *systemd1Manager) RestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.lookupManager(name)
+	mgr := m.primarySafe()
 	if err := mgr.RestartUnit(name); err != nil && !isNotFoundErr(err) {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -197,7 +181,7 @@ func (m *systemd1Manager) RestartUnit(name string, mode string) (dbus.ObjectPath
 }
 
 func (m *systemd1Manager) StopUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.lookupManager(name)
+	mgr := m.primarySafe()
 	if err := mgr.StopUnit(name); err != nil && !isNotFoundErr(err) {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -205,7 +189,7 @@ func (m *systemd1Manager) StopUnit(name string, mode string) (dbus.ObjectPath, *
 }
 
 func (m *systemd1Manager) StartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.lookupManager(name)
+	mgr := m.primarySafe()
 	if err := mgr.StartUnit(name); err != nil && !isNotFoundErr(err) {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -213,7 +197,7 @@ func (m *systemd1Manager) StartUnit(name string, mode string) (dbus.ObjectPath, 
 }
 
 func (m *systemd1Manager) ReloadUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.lookupManager(name)
+	mgr := m.primarySafe()
 	if err := mgr.ReloadUnit(name); err != nil && !isNotFoundErr(err) {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -229,7 +213,7 @@ func (m *systemd1Manager) ReloadOrTryRestartUnit(name string, mode string) (dbus
 }
 
 func (m *systemd1Manager) TryRestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.lookupManager(name)
+	mgr := m.primarySafe()
 	if err := mgr.RestartUnit(name); err != nil && !isNotFoundErr(err) {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -237,7 +221,7 @@ func (m *systemd1Manager) TryRestartUnit(name string, mode string) (dbus.ObjectP
 }
 
 func (m *systemd1Manager) KillUnit(name string, whom string, signal int32) *dbus.Error {
-	mgr := m.lookupManager(name)
+	mgr := m.primarySafe()
 	if err := mgr.KillUnit(name, fmt.Sprintf("%d", signal)); err != nil && !isNotFoundErr(err) {
 		return dbus.MakeFailedError(err)
 	}
@@ -245,13 +229,14 @@ func (m *systemd1Manager) KillUnit(name string, whom string, signal int32) *dbus
 }
 
 func (m *systemd1Manager) ResetFailedUnit(name string) *dbus.Error {
-	if err := m.frontend().ResetFailed(name); err != nil && !isNotFoundErr(err) {
+	mgr := m.primarySafe()
+	if err := mgr.ResetFailed(name); err != nil && !isNotFoundErr(err) {
 		return dbus.MakeFailedError(err)
 	}
 	return nil
 }
 
-// ListUnits matches systemd's a(st) return shape for the unit listing.
+// listUnitEntry matches systemd's a(st) unit-listing return shape.
 type listUnitEntry struct {
 	Name        string
 	Description string
@@ -266,12 +251,13 @@ type listUnitEntry struct {
 }
 
 func (m *systemd1Manager) ListUnits() ([]listUnitEntry, *dbus.Error) {
-	units := m.frontend().ListUnits()
+	mgr := m.primarySafe()
+	units := mgr.ListUnits()
 	result := make([]listUnitEntry, 0, len(units))
 	for _, u := range units {
 		snap := u.Snapshot()
 		desc := u.Description()
-		data, _ := managerUnitProps(m.frontendSafe(), u.Config.Name)
+		data, _ := managerUnitProps(mgr, u.Config.Name)
 		if data != nil {
 			if d, ok := data["Description"]; ok && d != "" {
 				desc = d
@@ -314,14 +300,14 @@ func (m *systemd1Manager) ListUnitsByNames(names []string) ([]listUnitEntry, *db
 }
 
 func (m *systemd1Manager) Reload() *dbus.Error {
-	_ = m.frontend().Reload()
+	_ = m.primarySafe().Reload()
 	return nil
 }
 
 // ---------- Unit (subtree) methods ----------
-// The unit objects live at /org/freedesktop/systemd1/unit/<escaped>. We register
-// a subtree handler so that calls on any such path are routed here; the unit
-// name is recovered from the object path in the message.
+// Unit objects live at /org/freedesktop/systemd1/unit/<escaped> and are served
+// via a subtree handler so calls on any such path are routed here; the unit name
+// is recovered from the message's object path.
 
 type systemd1Unit struct {
 	mgr  *supervisor.Manager
@@ -361,11 +347,11 @@ func (u *systemd1Unit) TryRestart(mode string) (dbus.ObjectPath, *dbus.Error) {
 }
 
 func (u *systemd1Unit) ReloadOrRestart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	return u.Restart(mode)
+	return u.Reload(mode)
 }
 
 func (u *systemd1Unit) ReloadOrTryRestart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	return u.Restart(mode)
+	return u.Reload(mode)
 }
 
 func (u *systemd1Unit) Kill(whom string, signal int32) *dbus.Error {
@@ -380,21 +366,14 @@ func (u *systemd1Unit) ResetFailed() *dbus.Error {
 	return nil
 }
 
-// unitSubtreeHandler is exported at /org/freedesktop/systemd1/unit and handles
-// method calls whose object path is a unit child. It recovers the unit name
-// from the message path and dispatches to a per-unit systemd1Unit.
 type unitSubtreeHandler struct {
 	mgr *supervisor.Manager
 }
 
 func (h *unitSubtreeHandler) unitObj(msg dbus.Message) (*systemd1Unit, *dbus.Error) {
-	p, ok := msg.Headers[dbus.FieldPath]
-	if !ok {
-		return nil, dbus.MakeFailedError(fmt.Errorf("missing object path"))
-	}
-	path, ok := p.Value().(dbus.ObjectPath)
+	path, ok := msg.Headers[dbus.FieldPath].Value().(dbus.ObjectPath)
 	if !ok || !path.IsValid() {
-		return nil, dbus.MakeFailedError(fmt.Errorf("invalid object path"))
+		return nil, dbus.MakeFailedError(fmt.Errorf("missing object path"))
 	}
 	name, found := unitNameFromPath(string(path))
 	if !found {
@@ -448,19 +427,15 @@ func (h *unitSubtreeHandler) ResetFailed(msg dbus.Message) *dbus.Error {
 	return nil
 }
 
-// unitPropsSubtree handles org.freedesktop.DBus.Properties on unit subtree paths.
+// unitPropsSubtree serves org.freedesktop.DBus.Properties on unit subtree paths.
 type unitPropsSubtree struct {
 	mgr *supervisor.Manager
 }
 
 func (u *unitPropsSubtree) unitNameFromPath(msg dbus.Message) (string, *dbus.Error) {
-	p, ok := msg.Headers[dbus.FieldPath]
-	if !ok {
-		return "", dbus.MakeFailedError(fmt.Errorf("missing object path"))
-	}
-	path, ok := p.Value().(dbus.ObjectPath)
+	path, ok := msg.Headers[dbus.FieldPath].Value().(dbus.ObjectPath)
 	if !ok || !path.IsValid() {
-		return "", dbus.MakeFailedError(fmt.Errorf("invalid object path"))
+		return "", dbus.MakeFailedError(fmt.Errorf("missing object path"))
 	}
 	name, found := unitNameFromPath(string(path))
 	if !found {
@@ -511,56 +486,63 @@ func (u *unitPropsSubtree) Set(iface string, propName string, val dbus.Variant, 
 	return &dbus.Error{Name: "org.freedesktop.DBus.Error.PropertyReadOnly", Body: []interface{}{"Property is read-only"}}
 }
 
-// ---------- helpers for Properties ----------
+// ---------- property builders ----------
 
-func buildManagerProps(mgr *supervisor.Manager, systemMgr *supervisor.Manager) map[string]map[string]*prop.Prop {
+func buildManagerProps(mgr *supervisor.Manager) map[string]map[string]*prop.Prop {
 	frontend := mgr
 	if frontend == nil {
-		frontend = systemMgr
+		frontend = emptyManager
 	}
-	sysState := "running"
-	if frontend != nil {
-		sysState = frontend.SystemState()
-	}
+	sysState := frontend.SystemState()
 	mgrIf := map[string]*prop.Prop{
-		"Version":                {Value: "1.0.0 (initd)", Writable: false, Emit: prop.EmitConst},
-		"Features":               {Value: "", Writable: false, Emit: prop.EmitConst},
-		"Virtualization":         {Value: "", Writable: false, Emit: prop.EmitConst},
-		"ConfidentialVirtualization": {Value: "", Writable: false, Emit: prop.EmitConst},
-		"Architecture":           {Value: "aarch64", Writable: false, Emit: prop.EmitConst},
-		"Tainted":                {Value: "", Writable: false, Emit: prop.EmitConst},
-		"SystemState":            {Value: sysState, Writable: false, Emit: prop.EmitTrue},
-		"FirmwareTimestamp":      {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"FirmwareTimestampMonotonic": {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"InitRDTimestamp":        {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"InitRDTimestampMonotonic": {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"UserspaceTimestamp":     {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"UserspaceTimestampMonotonic": {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"FinishTimestamp":        {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"FinishTimestampMonotonic": {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"LogLevel":               {Value: "info", Writable: false, Emit: prop.EmitTrue},
-		"LogTarget":              {Value: "journal", Writable: false, Emit: prop.EmitTrue},
-		"NNames":                 {Value: func() uint32 { if frontend == nil { return 0 }; return uint32(len(frontend.ListAllUnitNames())) }(), Writable: false, Emit: prop.EmitTrue},
-		"NFailedUnits":           {Value: func() uint32 { if frontend == nil { return 0 }; c := uint32(0); for _, u := range frontend.ListUnits() { if u.Snapshot().State == service.StateFailed { c++ } }; return c }(), Writable: false, Emit: prop.EmitTrue},
-		"NJobs":                  {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"NUnique":                {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"NInstalledJobs":         {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"NFailedJobs":            {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"Progress":               {Value: float64(0), Writable: false, Emit: prop.EmitTrue},
-		"Environment":            {Value: []string{}, Writable: false, Emit: prop.EmitTrue},
-		"ConfirmSpawn":           {Value: false, Writable: false, Emit: prop.EmitTrue},
-		"ShowStatus":             {Value: false, Writable: false, Emit: prop.EmitTrue},
-		"UnitPath":               {Value: func() []string { if frontend == nil { return []string{} }; return frontend.SearchPaths }(), Writable: false, Emit: prop.EmitConst},
-		"DefaultStandardOutput":  {Value: "journal", Writable: false, Emit: prop.EmitConst},
-		"DefaultStandardError":   {Value: "inherit", Writable: false, Emit: prop.EmitConst},
-		"RuntimeWatchdogUSec":    {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"RebootWatchdogUSec":     {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"KExecWatchdogUSec":      {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"ServiceWatchdogs":       {Value: false, Writable: false, Emit: prop.EmitConst},
-		"ControlGroup":           {Value: "", Writable: false, Emit: prop.EmitConst},
-		"ExitCode":               {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
+		"Version":                     {Value: "1.0.0 (initd)", Writable: false, Emit: prop.EmitConst},
+		"Features":                    {Value: "", Writable: false, Emit: prop.EmitConst},
+		"Virtualization":              {Value: "", Writable: false, Emit: prop.EmitConst},
+		"ConfidentialVirtualization":    {Value: "", Writable: false, Emit: prop.EmitConst},
+		"Architecture":                  {Value: "aarch64", Writable: false, Emit: prop.EmitConst},
+		"Tainted":                       {Value: "", Writable: false, Emit: prop.EmitConst},
+		"SystemState":                   {Value: sysState, Writable: false, Emit: prop.EmitTrue},
+		"FirmwareTimestamp":             {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"FirmwareTimestampMonotonic":    {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"InitRDTimestamp":               {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"InitRDTimestampMonotonic":      {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"UserspaceTimestamp":            {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"UserspaceTimestampMonotonic":   {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"FinishTimestamp":               {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"FinishTimestampMonotonic":      {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"LogLevel":                      {Value: "info", Writable: false, Emit: prop.EmitTrue},
+		"LogTarget":                     {Value: "journal", Writable: false, Emit: prop.EmitTrue},
+		"NNames":                        {Value: uint32(len(frontend.ListAllUnitNames())), Writable: false, Emit: prop.EmitTrue},
+		"NFailedUnits":                  {Value: countFailed(frontend), Writable: false, Emit: prop.EmitTrue},
+		"NJobs":                         {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"NUnique":                       {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"NInstalledJobs":                {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"NFailedJobs":                   {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"Progress":                      {Value: float64(0), Writable: false, Emit: prop.EmitTrue},
+		"Environment":                   {Value: []string{}, Writable: false, Emit: prop.EmitTrue},
+		"ConfirmSpawn":                  {Value: false, Writable: false, Emit: prop.EmitTrue},
+		"ShowStatus":                    {Value: false, Writable: false, Emit: prop.EmitTrue},
+		"UnitPath":                      {Value: frontend.SearchPaths, Writable: false, Emit: prop.EmitConst},
+		"DefaultStandardOutput":         {Value: "journal", Writable: false, Emit: prop.EmitConst},
+		"DefaultStandardError":          {Value: "inherit", Writable: false, Emit: prop.EmitConst},
+		"RuntimeWatchdogUSec":           {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"RebootWatchdogUSec":            {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"KExecWatchdogUSec":             {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"ServiceWatchdogs":              {Value: false, Writable: false, Emit: prop.EmitConst},
+		"ControlGroup":                  {Value: "", Writable: false, Emit: prop.EmitConst},
+		"ExitCode":                      {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
 	}
 	return map[string]map[string]*prop.Prop{managerInterface: mgrIf}
+}
+
+func countFailed(mgr *supervisor.Manager) uint32 {
+	var c uint32
+	for _, u := range mgr.ListUnits() {
+		if u.Snapshot().State == sservice.StateFailed {
+			c++
+		}
+	}
+	return c
 }
 
 func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop {
@@ -585,30 +567,30 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 	}
 
 	return map[string]*prop.Prop{
-		"Id":                   {Value: id, Writable: false, Emit: prop.EmitConst},
-		"Names":                {Value: []string{id}, Writable: false, Emit: prop.EmitConst},
-		"Description":          {Value: desc, Writable: false, Emit: prop.EmitConst},
-		"LoadState":            {Value: loadState, Writable: false, Emit: prop.EmitTrue},
-		"ActiveState":          {Value: activeState, Writable: false, Emit: prop.EmitTrue},
-		"SubState":             {Value: subState, Writable: false, Emit: prop.EmitTrue},
-		"UnitFileState":        {Value: mgr.UnitFileState(id), Writable: false, Emit: prop.EmitConst},
-		"UnitFilePreset":       {Value: "disabled", Writable: false, Emit: prop.EmitConst},
-		"Result":               {Value: "", Writable: false, Emit: prop.EmitTrue},
-		"FragmentPath":         {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
-		"SourcePath":           {Value: "", Writable: false, Emit: prop.EmitConst},
-		"MainPID":              {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExecMainPID":          {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExecMainStatus":       {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExecMainCode":         {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExitCode":             {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
-		"ExitStatus":           {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
-		"NRestarts":            {Value: uint32(0), Writable: false, Emit: prop.EmitConst},
-		"StartLimitBurst":      {Value: uint32(5), Writable: false, Emit: prop.EmitConst},
-		"StartLimitIntervalUSec": {Value: uint64(10e6), Writable: false, Emit: prop.EmitConst},
-		"StartLimitAction":     {Value: "none", Writable: false, Emit: prop.EmitConst},
-		"MemoryCurrent":        {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
-		"CPUWeight":            {Value: uint64(100), Writable: false, Emit: prop.EmitTrue},
-		"TasksCurrent":         {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
+		"Id":                      {Value: id, Writable: false, Emit: prop.EmitConst},
+		"Names":                   {Value: []string{id}, Writable: false, Emit: prop.EmitConst},
+		"Description":             {Value: desc, Writable: false, Emit: prop.EmitConst},
+		"LoadState":               {Value: loadState, Writable: false, Emit: prop.EmitTrue},
+		"ActiveState":             {Value: activeState, Writable: false, Emit: prop.EmitTrue},
+		"SubState":                {Value: subState, Writable: false, Emit: prop.EmitTrue},
+		"UnitFileState":           {Value: mgr.UnitFileState(id), Writable: false, Emit: prop.EmitConst},
+		"UnitFilePreset":          {Value: "disabled", Writable: false, Emit: prop.EmitConst},
+		"Result":                  {Value: "", Writable: false, Emit: prop.EmitTrue},
+		"FragmentPath":            {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
+		"SourcePath":              {Value: "", Writable: false, Emit: prop.EmitConst},
+		"MainPID":                 {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"ExecMainPID":             {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"ExecMainStatus":          {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
+		"ExecMainCode":            {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
+		"ExitCode":                {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
+		"ExitStatus":              {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
+		"NRestarts":               {Value: uint32(0), Writable: false, Emit: prop.EmitConst},
+		"StartLimitBurst":         {Value: uint32(5), Writable: false, Emit: prop.EmitConst},
+		"StartLimitIntervalUSec":  {Value: uint64(10e6), Writable: false, Emit: prop.EmitConst},
+		"StartLimitAction":        {Value: "none", Writable: false, Emit: prop.EmitConst},
+		"MemoryCurrent":           {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
+		"CPUWeight":               {Value: uint64(100), Writable: false, Emit: prop.EmitTrue},
+		"TasksCurrent":            {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
 	}
 }
 
@@ -623,7 +605,7 @@ func ServeUserBus(ctx context.Context, mgr *supervisor.Manager) (*dbus.Conn, err
 		return nil, fmt.Errorf("dbus session bus: %w", err)
 	}
 	if mgr != nil {
-		if err := serveManager(ctx, conn, mgr, nil, "user"); err != nil {
+		if err := serveManager(ctx, conn, mgr); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
@@ -640,7 +622,7 @@ func ServeSystemBus(ctx context.Context, systemMgr, userMgr *supervisor.Manager)
 		return nil, fmt.Errorf("dbus system bus: %w", err)
 	}
 	if systemMgr != nil {
-		if err := serveManager(ctx, conn, systemMgr, userMgr, "system"); err != nil {
+		if err := serveManager(ctx, conn, systemMgr); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
@@ -648,31 +630,29 @@ func ServeSystemBus(ctx context.Context, systemMgr, userMgr *supervisor.Manager)
 	return conn, nil
 }
 
-func serveManager(ctx context.Context, conn *dbus.Conn, frontend *supervisor.Manager, secondary *supervisor.Manager, scope string) error {
+func serveManager(ctx context.Context, conn *dbus.Conn, primary *supervisor.Manager) error {
 	_ = ctx
 
-	mgrObj := newManager(secondary, frontend)
+	mgrObj := newManager(primary)
+	handler := &unitSubtreeHandler{mgr: primarySafe(primary)}
 
-	// Export Properties (org.freedesktop.DBus.Properties) + Manager methods on the
-	// manager object path at /org/freedesktop/systemd1. The manager interface is
-	// primary; Properties is served alongside it on the same (path, interface).
-	if _, err := prop.Export(conn, managerPath, buildManagerProps(frontend, secondary)); err != nil {
+	// Properties layer (org.freedesktop.DBus.Properties) on the manager path.
+	if _, err := prop.Export(conn, managerPath, buildManagerProps(primary)); err != nil {
 		return fmt.Errorf("export manager properties: %w", err)
 	}
 
-	// Manager methods.
+	// Manager methods on the manager interface at /org/freedesktop/systemd1.
 	if err := conn.Export(mgrObj, managerPath, managerInterface); err != nil {
 		return fmt.Errorf("export manager interface: %w", err)
 	}
 
-	// Unit subtree: any call on /.../unit/<name> goes here.
-	handler := &unitSubtreeHandler{mgr: frontend}
+	// Unit subtree: calls on /.../unit/<name> route to handler.
 	if err := conn.ExportSubtree(handler, dbus.ObjectPath(unitBasePathString), unitInterface); err != nil {
 		return fmt.Errorf("export unit subtree: %w", err)
 	}
 
-	// Properties on the unit subtree.
-	propsHandler := &unitPropsSubtree{mgr: frontend}
+	// org.freedesktop.DBus.Properties on the unit subtree (dynamic per-unit).
+	propsHandler := &unitPropsSubtree{mgr: primarySafe(primary)}
 	if err := conn.ExportSubtree(propsHandler, dbus.ObjectPath(unitBasePathString), "org.freedesktop.DBus.Properties"); err != nil {
 		return fmt.Errorf("export unit properties subtree: %w", err)
 	}
@@ -690,11 +670,9 @@ func serveManager(ctx context.Context, conn *dbus.Conn, frontend *supervisor.Man
 	return nil
 }
 
-// frontendSafe returns the frontend manager with a nil guard, used by ListUnits
-// and property builders which must not dereference a nil manager.
-func (m *systemd1Manager) frontendSafe() *supervisor.Manager {
-	if m.systemMgr != nil {
-		return m.systemMgr
+func primarySafe(primary *supervisor.Manager) *supervisor.Manager {
+	if primary != nil {
+		return primary
 	}
-	return m.userMgr
+	return emptyManager
 }

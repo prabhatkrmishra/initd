@@ -90,7 +90,7 @@ func TestManagerGetUnitErrors(t *testing.T) {
 	if err := mgr.LoadUnits(); err != nil {
 		t.Fatalf("LoadUnits: %v", err)
 	}
-	m := newManager(mgr, nil)
+	m := newManager(mgr)
 
 	_, derr := m.GetUnit("")
 	if derr == nil {
@@ -121,7 +121,7 @@ func TestManagerGetUnitFileState(t *testing.T) {
 	if err := mgr.LoadUnits(); err != nil {
 		t.Fatalf("LoadUnits: %v", err)
 	}
-	m := newManager(mgr, nil)
+	m := newManager(mgr)
 
 	state, derr := m.GetUnitFileState("hello.service")
 	if derr != nil {
@@ -143,7 +143,7 @@ func TestManagerGetUnitFileState(t *testing.T) {
 
 func TestBuildManagerProps(t *testing.T) {
 	mgr := newTestManager(t)
-	props := buildManagerProps(mgr, nil)
+	props := buildManagerProps(mgr)
 	mgrProps, ok := props[managerInterface]
 	if !ok {
 		t.Fatalf("missing interface %s", managerInterface)
