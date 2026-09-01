@@ -10,17 +10,38 @@
 # Usage (as a user with sudo):
 #   sudo bash deploy-systemd1.sh
 #
-# Prereqs: /usr/local/bin/initd (>=1.0.0, with the internal/dbus package),
-#          a running system dbus-daemon, and the initd system dbus config
-#          policy installed next to this script as
-#          org.freedesktop.systemd1.system-policy.conf.
+# Prereqs: both binaries built for the target (GOOS=linux GOARCH=arm64):
+#   /tmp/initd.arm64  (cmd/initd)
+#   /tmp/systemctl.arm64 (cmd/systemctl)
+# The script installs them into /usr/bin so that any tool on PATH (which on
+# this host lists /usr/bin before /usr/local/bin, e.g. npm/node-managed shells)
+# resolves `systemctl` -> the initd wrapper. The real systemd systemctl is
+# preserved at /usr/bin/systemctl.real.systemd255 (systemd is not PID 1 here).
 #
-set -euo pipefail
+INITD_BIN_SRC="${INITD_BIN_SRC:-/tmp/initd.arm64}"
+SYSTEMCTL_BIN_SRC="${SYSTEMCTL_BIN_SRC:-/tmp/systemctl.arm64}"
+INITD_BIN="${INITD_BIN:-/usr/bin/initd}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+REAL_SYSTEMCTL_BACKUP="${REAL_SYSTEMCTL_BACKUP:-/usr/bin/systemctl.real.systemd255}"
+RUN_USER="${RUN_USER:-pkm}"
 
 SYSTEMD1_SERVICE="/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
 SYSTEMD1_POLICY="/usr/share/dbus-1/system.d/org.freedesktop.systemd1.conf"
-INITD_BIN="${INITD_BIN:-/usr/local/bin/initd}"
-RUN_USER="${RUN_USER:-pkm}"
+
+set -euo pipefail
+
+# Install the initd + systemctl binaries into /usr/bin (canonical location).
+echo "Installing initd -> $INITD_BIN ..."
+install -D -m 0755 "$INITD_BIN_SRC" "$INITD_BIN"
+echo "Installing systemctl wrapper -> $SYSTEMCTL_BIN ..."
+# Preserve the real systemd systemctl if present (systemd is not PID 1 here,
+# so /usr/bin/systemctl is non-functional and gets shadowed by the wrapper).
+if [ -f "$SYSTEMCTL_BIN" ] && ! [ -f "$REAL_SYSTEMCTL_BACKUP" ]; then
+	if file "$SYSTEMCTL_BIN" | grep -q "dynamically linked"; then
+		cp "$SYSTEMCTL_BIN" "$REAL_SYSTEMCTL_BACKUP"
+	fi
+fi
+install -m 0755 "$SYSTEMCTL_BIN_SRC" "$SYSTEMCTL_BIN"
 
 echo "Installing org.freedesktop.systemd1 D-Bus service file..."
 cat > "$SYSTEMD1_SERVICE" <<EOF
@@ -48,7 +69,7 @@ dbus-daemon --system --fork
 sleep 1
 
 echo "Restarting initd daemon (owns org.freedesktop.systemd1 on both buses)..."
-pkill -u "$RUN_USER" -f "$INITD_BIN --socket" 2>/dev/null || true
+pkill -u "$RUN_USER" -x initd 2>/dev/null || true
 sleep 1
 rm -f "/run/user/$(id -u "$RUN_USER")/initd.lock" \
       "/run/user/$(id -u "$RUN_USER")/initd.sock" \
