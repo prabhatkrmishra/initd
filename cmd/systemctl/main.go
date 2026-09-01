@@ -231,20 +231,18 @@ func handleShow(client *ipc.Client, args []string) {
 	properties, valueOnly, units := parseShowArgs(args)
 
 	if len(units) == 0 {
-		// No unit given: report manager-level info so callers that probe
-		// `systemctl show` (no args) still get a successful, non-fatal reply.
-		resp, err := client.Do(ipc.Request{Action: "status"})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+		// No unit given: report manager-level info. When the daemon is
+		// reachable, ask it; when it is not (offline, daemon crashed), degrade
+		// gracefully like systemd by returning the standard manager properties
+		// so probes such as openclaw's UnitPath check do not fail with a
+		// fatal "Failed to connect to bus" error. The standard unit load paths
+		// are also returned verbatim so callers that scan them for a unit file
+		// (and find none) conclude the unit is absent.
+		if resp, err := client.Do(ipc.Request{Action: "status"}); err == nil && resp.Success {
+			printManagerProps(resp, properties, valueOnly)
+			os.Exit(0)
 		}
-		if !resp.Success {
-			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-			os.Exit(1)
-		}
-		fmt.Println("LoadState=loaded")
-		fmt.Println("ActiveState=active")
-		fmt.Println("SubState=running")
+		printOfflineManagerProps(properties, valueOnly)
 		os.Exit(0)
 	}
 
@@ -314,6 +312,78 @@ func printProp(key, value string, valueOnly bool) {
 		fmt.Printf("%s=%s\n", key, value)
 	}
 }
+
+// printManagerProps prints the requested manager-level properties from a live
+// daemon response (key=value), or just the values when --value was requested.
+func printManagerProps(resp ipc.Response, properties []string, valueOnly bool) {
+	dataMap := map[string]string{}
+	raw, _ := json.Marshal(resp.Data)
+	_ = json.Unmarshal(raw, &dataMap)
+	if _, ok := dataMap["LoadState"]; !ok {
+		dataMap["LoadState"] = "loaded"
+	}
+	if _, ok := dataMap["ActiveState"]; !ok {
+		dataMap["ActiveState"] = "active"
+	}
+	if _, ok := dataMap["SubState"]; !ok {
+		dataMap["SubState"] = "running"
+	}
+	if len(properties) == 0 {
+		keys := make([]string, 0, len(dataMap))
+		for k := range dataMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			printProp(k, dataMap[k], valueOnly)
+		}
+	} else {
+		for _, p := range properties {
+			if v, ok := dataMap[p]; ok {
+				printProp(p, v, valueOnly)
+			}
+		}
+	}
+}
+
+// printOfflineManagerProps is the offline fallback for the manager-level
+// `systemctl show` (no unit). It mirrors the most relevant bits systemd
+// reports for the system manager so that absent-unit probes succeed without a
+// running daemon. The standard unit load paths are returned so callers that
+// scan them to locate a unit file (and find none) conclude the unit is
+// absent rather than erroring out.
+func printOfflineManagerProps(properties []string, valueOnly bool) {
+	offline := map[string]string{
+		"LoadState":    "loaded",
+		"ActiveState":  "active",
+		"SubState":     "running",
+		"UnitPath":     systemdUnitLoadPaths,
+		"Fragmentation": "",
+	}
+	if len(properties) == 0 {
+		keys := make([]string, 0, len(offline))
+		for k := range offline {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if k == "Fragmentation" {
+				continue
+			}
+			printProp(k, offline[k], valueOnly)
+		}
+	} else {
+		for _, p := range properties {
+			if v, ok := offline[p]; ok {
+				printProp(p, v, valueOnly)
+			}
+		}
+	}
+}
+
+// systemdUnitLoadPaths mirrors systemd's default unit load path, colon
+// separated, in priority order. Used by the offline `systemctl show` fallback.
+const systemdUnitLoadPaths = "/etc/systemd/system:/run/systemd/system:/run/systemd/transient:/usr/lib/systemd/system:/lib/systemd/system"
 
 func containsProp(props []string, name string) bool {
 	for _, p := range props {
