@@ -10,16 +10,15 @@
 # Usage (as a user with sudo):
 #   sudo bash deploy-systemd1.sh
 #
-# Prereqs: both binaries built for the target (GOOS=linux GOARCH=arm64):
-#   /tmp/initd.arm64  (cmd/initd)
-#   /tmp/systemctl.arm64 (cmd/systemctl)
+# Prereqs: build both binaries for this host first, e.g.
+#   make build GOOS=linux GOARCH=arm64   (produces build/linux-arm64/{initd,systemctl})
 # The script installs them into /usr/bin so that any tool on PATH (which on
 # this host lists /usr/bin before /usr/local/bin, e.g. npm/node-managed shells)
 # resolves `systemctl` -> the initd wrapper. The real systemd systemctl is
 # preserved at /usr/bin/systemctl.real.systemd255 (systemd is not PID 1 here).
 #
-INITD_BIN_SRC="${INITD_BIN_SRC:-/tmp/initd.arm64}"
-SYSTEMCTL_BIN_SRC="${SYSTEMCTL_BIN_SRC:-/tmp/systemctl.arm64}"
+INITD_BIN_SRC="${INITD_BIN_SRC:-build/linux-arm64/initd}"
+SYSTEMCTL_BIN_SRC="${SYSTEMCTL_BIN_SRC:-build/linux-arm64/systemctl}"
 INITD_BIN="${INITD_BIN:-/usr/bin/initd}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 REAL_SYSTEMCTL_BACKUP="${REAL_SYSTEMCTL_BACKUP:-/usr/bin/systemctl.real.systemd255}"
