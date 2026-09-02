@@ -111,10 +111,14 @@ func (u *Unit) Snapshot() Runtime {
 
 func (u *Unit) Start() (int, error) {
 	u.mu.Lock()
-	if u.Runtime.State == StateActive || u.Runtime.State == StateActivating || u.Runtime.State == StateStopping {
+	if u.Runtime.State == StateActive || u.Runtime.State == StateActivating {
 		token := u.startToken
 		u.mu.Unlock()
 		return token, nil
+	}
+	if u.Runtime.State == StateStopping {
+		u.mu.Unlock()
+		return 0, fmt.Errorf("unit %s is stopping, try again", u.Config.Name)
 	}
 	u.startToken++
 	u.stopRequested = false

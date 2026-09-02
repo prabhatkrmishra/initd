@@ -105,15 +105,44 @@ func main() {
 		}
 	}
 
-	go serveManager(socketPath, systemManager)
+	// Singleton for the system manager too — two concurrent `initd --init`
+	// invocations (e.g. two logins racing) must not both bind /run/initd.sock.
+	var systemLock *os.File
+	startSystemManager := func(path string, mgr *supervisor.Manager) {
+		if lock, err := userpaths.AcquireSystemLock(); err == nil {
+			systemLock = lock
+			go serveManager(path, mgr)
+			return
+		}
+		if userpaths.IsSystemDaemonRunning() {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"system daemon already running at %s - skipping", path)
+			return
+		}
+		_ = os.Remove(path)
+		if lock, err := userpaths.AcquireSystemLock(); err == nil {
+			systemLock = lock
+			go serveManager(path, mgr)
+		} else {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"failed to acquire system lock for %s: %v", path, err)
+		}
+	}
+
+	startSystemManager(socketPath, systemManager)
 	userSocket := userpaths.UserSocketPath()
 	if userSocket != socketPath {
 		startUserManager(userSocket, userManager)
 	}
-	// Hold the lock for the lifetime of the daemon.
+	// Hold the locks for the lifetime of the daemon.
 	if userLock != nil {
 		defer func() {
 			_ = userLock.Close()
+		}()
+	}
+	if systemLock != nil {
+		defer func() {
+			_ = systemLock.Close()
 		}()
 	}
 
@@ -185,7 +214,7 @@ func main() {
 				case sig := <-signals:
 					switch sig {
 					case syscall.SIGTERM:
-						shutdownDaemon(socketPath, userSocket, userLock, systemManager, userManager)
+						shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager)
 					}
 				}
 			}
@@ -194,16 +223,16 @@ func main() {
 	// socket-only mode
 	sig := <-signals
 	if sig == syscall.SIGTERM {
-		shutdownDaemon(socketPath, userSocket, userLock, systemManager, userManager)
+		shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager)
 	}
 
 }
 
 // shutdownDaemon performs a clean shutdown on SIGTERM: it stops managed units,
-// removes the IPC sockets and releases the user lock, then exits. This lets a
+// removes the IPC sockets and releases the locks, then exits. This lets a
 // replacement daemon (e.g. from install.sh's restart) take over without a stale
 // socket or lock leaving a split-brain supervisor behind.
-func shutdownDaemon(socketPath, userSocket string, userLock *os.File, systemManager, userManager *supervisor.Manager) {
+func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File, systemManager, userManager *supervisor.Manager) {
 	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "received SIGTERM, shutting down")
 	userManager.StopAllUnits()
 	systemManager.StopAllUnits()
@@ -213,6 +242,9 @@ func shutdownDaemon(socketPath, userSocket string, userLock *os.File, systemMana
 	}
 	if userLock != nil {
 		_ = userLock.Close()
+	}
+	if systemLock != nil {
+		_ = systemLock.Close()
 	}
 	os.Exit(0)
 }

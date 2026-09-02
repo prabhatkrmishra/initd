@@ -134,6 +134,56 @@ func AcquireUserLock() (*os.File, error) {
 	return f, nil
 }
 
+func SystemLockPath() string {
+	sock := SystemSocketPath()
+	if strings.HasPrefix(sock, "@") {
+		return ""
+	}
+	return sock + ".lock"
+}
+
+func AcquireSystemLock() (*os.File, error) {
+	path := SystemLockPath()
+	if path == "" {
+		return nil, fmt.Errorf("abstract socket has no lock file")
+	}
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	_ = f.Truncate(0)
+	_, _ = f.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
+	return f, nil
+}
+
+func IsSystemDaemonRunning() bool {
+	path := SystemSocketPath()
+	if strings.HasPrefix(path, "@") {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	conn, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return false
+	}
+	defer syscall.Close(conn)
+	sa := &syscall.SockaddrUnix{Name: path}
+	if err := syscall.Connect(conn, sa); err != nil {
+		return false
+	}
+	return true
+}
+
 func IsUserDaemonRunning() bool {
 	path := UserSocketPath()
 	if strings.HasPrefix(path, "@") {
