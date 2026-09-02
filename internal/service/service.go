@@ -450,6 +450,122 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		u.mu.Unlock()
 		return nil
 	}
+	if u.Runtime.State == StateActivating {
+		// Cancel an in-flight activation. Bump the token so the
+		// runStartSequence goroutine aborts instead of later marking
+		// the unit active after we've asked it to stop.
+		u.startToken++
+		pid := u.Runtime.MainPID
+		cmd := u.Cmd
+		srv := u.notifyServer
+		u.notifyServer = nil
+		if pid == 0 && (cmd == nil || cmd.Process == nil) {
+			u.Runtime.State = StateInactive
+			u.Runtime.MainPID = 0
+			u.Runtime.LastError = ""
+			u.Runtime.FinishedAt = time.Now()
+			u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+			u.mu.Unlock()
+			if srv != nil {
+				srv.Stop()
+			}
+			return nil
+		}
+		u.Runtime.State = StateStopping
+		u.mu.Unlock()
+		if srv != nil {
+			srv.Stop()
+		}
+		// Kill the activating process and wait for it to exit, then
+		// go inactive. Don't rely on handleExit (token was bumped).
+		if pid != 0 {
+			if killProcessGroup {
+				_ = syscall.Kill(-pid, syscall.SIGTERM)
+			} else {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+			}
+		} else if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+		// timeout <=0 means infinity (systemd's "infinity"); wait
+		// without deadline in that case.
+		if timeout <= 0 {
+			for {
+				if pid != 0 && !processAlive(pid) {
+					u.mu.Lock()
+					u.Runtime.State = StateInactive
+					u.Runtime.MainPID = 0
+					u.Runtime.LastError = ""
+					u.Runtime.ExitCode = 0
+					u.Runtime.FinishedAt = time.Now()
+					u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+					u.mu.Unlock()
+					return nil
+				}
+				if pid == 0 && cmd != nil && cmd.Process != nil {
+					if !processAlive(cmd.Process.Pid) {
+						u.mu.Lock()
+						u.Runtime.State = StateInactive
+						u.Runtime.MainPID = 0
+						u.Runtime.LastError = ""
+						u.Runtime.ExitCode = 0
+						u.Runtime.FinishedAt = time.Now()
+						u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+						u.mu.Unlock()
+						return nil
+					}
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if pid != 0 && !processAlive(pid) {
+				u.mu.Lock()
+				u.Runtime.State = StateInactive
+				u.Runtime.MainPID = 0
+				u.Runtime.LastError = ""
+				u.Runtime.ExitCode = 0
+				u.Runtime.FinishedAt = time.Now()
+				u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+				u.mu.Unlock()
+				return nil
+			}
+			if pid == 0 && cmd != nil && cmd.Process != nil {
+				if !processAlive(cmd.Process.Pid) {
+					u.mu.Lock()
+					u.Runtime.State = StateInactive
+					u.Runtime.MainPID = 0
+					u.Runtime.LastError = ""
+					u.Runtime.ExitCode = 0
+					u.Runtime.FinishedAt = time.Now()
+					u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+					u.mu.Unlock()
+					return nil
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if pid != 0 {
+			if killProcessGroup {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			} else {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		} else if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		time.Sleep(150 * time.Millisecond)
+		u.mu.Lock()
+		u.Runtime.State = StateInactive
+		u.Runtime.MainPID = 0
+		u.Runtime.LastError = ""
+		u.Runtime.ExitCode = 0
+		u.Runtime.FinishedAt = time.Now()
+		u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+		u.mu.Unlock()
+		return nil
+	}
 	u.Runtime.State = StateStopping
 	pid := u.Runtime.MainPID
 	cmd := u.Cmd
