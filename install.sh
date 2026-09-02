@@ -100,7 +100,7 @@ build_binary() {
   local cmd="$1" name="${1#cmd/}"
   echo "Building $cmd for linux/$ARCH with go ..." >&2
   ( cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
-    go build -ldflags="-s -w" -o "/tmp/initd-install-$ARCH/$name" "$cmd" ) >/dev/null
+    go build -ldflags="-s -w" -o "/tmp/initd-install-$ARCH/$name" "./$cmd" ) >/dev/null
   printf '/tmp/initd-install-%s/%s' "$ARCH" "$name"
 }
 
