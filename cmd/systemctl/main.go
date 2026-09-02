@@ -83,10 +83,13 @@ func main() {
 	// Like systemd, timeouts are server-side (TimeoutStartSec/
 	// TimeoutStopSec). The client just waits for the job to finish.
 	// Use a longer deadline for restart/stop which blocks for
-	// Stop+Start (default 10s+30s=40s, custom may be larger).
+	// Stop+Start. A unit may set a large TimeoutStopSec (e.g. the
+	// openclaw gateway uses 330s), so 90s was too short and the client
+	// gave up with an i/o timeout while the server was still stopping.
+	// 600s covers a 330s stop + 30s start with margin.
 	switch cmd {
 	case "restart", "stop":
-		client.Timeout = 90 * time.Second
+		client.Timeout = 600 * time.Second
 	}
 
 	switch cmd {

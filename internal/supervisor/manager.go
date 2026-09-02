@@ -704,9 +704,10 @@ func (m *Manager) StartEnabledUnits() error {
 		m.mu.Unlock()
 	}()
 
-	m.startMu.Lock()
-	defer m.startMu.Unlock()
-
+	// Do NOT hold startMu here: boot can take a long time (units with
+	// large TimeoutStartSec) and would block every IPC StartUnit/StopUnit/
+	// RestartUnit call for the whole boot. Concurrent starts are already
+	// serialized per-unit by Unit.Start's mutex, so no duplicate spawns.
 	ordered := m.orderUnitsByAfter(units)
 	started := map[string]struct{}{}
 	for _, unit := range ordered {
