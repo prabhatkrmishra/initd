@@ -610,6 +610,14 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		desc = id
 	}
 
+	// MainPID comes from the live unit snapshot so D-Bus clients see the
+	// real main PID (e.g. openclaw's health checks).
+	mainPID := uint32(0)
+	if u, err := mgr.FindUnit(name); err == nil {
+		if snap := u.Snapshot(); snap.MainPID > 0 {
+			mainPID = uint32(snap.MainPID)
+		}
+	}
 	return map[string]*prop.Prop{
 		"Id":                      {Value: id, Writable: false, Emit: prop.EmitConst},
 		"Names":                   {Value: []string{id}, Writable: false, Emit: prop.EmitConst},
@@ -624,8 +632,8 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		"DropInPaths":          {Value: []string{}, Writable: false, Emit: prop.EmitConst},
 		"NeedDaemonReload":     {Value: false, Writable: false, Emit: prop.EmitConst},
 		"SourcePath":              {Value: "", Writable: false, Emit: prop.EmitConst},
-		"MainPID":                 {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExecMainPID":             {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"MainPID":                 {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
+		"ExecMainPID":             {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
 		"ExecMainStatus":          {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
 		"ExecMainCode":            {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
 		"ExitCode":                {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},

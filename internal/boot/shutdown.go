@@ -38,7 +38,11 @@ func stopServices(mgr *supervisor.Manager) {
 	logging.KernelPrintf(os.Stderr, "initd", 1,
 		"shutdown: stopping services")
 
-	timeout := time.After(10 * time.Second)
+	// Units may have a large TimeoutStopSec (e.g. 330s for the gateway)
+	// and StopAllUnits stops them sequentially, so the total can exceed
+	// any single unit's timeout. 10s was far too short and left services
+	// half-stopped on reboot; 400s covers a 330s gateway plus others.
+	timeout := time.After(400 * time.Second)
 
 	done := make(chan struct{})
 	go func() {
