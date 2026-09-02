@@ -259,9 +259,17 @@ func startDBusServers(systemManager, userManager *supervisor.Manager) {
 	ctx := context.Background()
 	// User (session) bus — initd already owns org.freedesktop.DBus here, so we
 	// also own org.freedesktop.systemd1 and answer systemctl --user introspection.
-	if _, err := dbus.ServeUserBus(ctx, userManager); err != nil {
-		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-			"dbus user bus registration disabled: %v", err)
+	// Retry briefly: the session bus may still be starting (install.sh or the
+	// autostart hook just forked dbus-daemon).
+	for i := 0; i < 5; i++ {
+		if _, err := dbus.ServeUserBus(ctx, userManager); err == nil {
+			break
+		} else if i == 4 {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"dbus user bus registration disabled: %v", err)
+		} else {
+			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+		}
 	}
 	// System bus — allows /usr/bin/systemctl (system scope) to connect and get a
 	// verifiable answer. Non-fatal: fails for non-root or when no system

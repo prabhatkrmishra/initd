@@ -193,7 +193,12 @@ cat > "$tmp_autostart" <<'EOSH'
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
-if [ ! -S "$XDG_RUNTIME_DIR/bus" ]; then
+if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+    if ! dbus-send --session --dest=org.freedesktop.DBus --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+        rm -f "$XDG_RUNTIME_DIR/bus"
+        dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
+    fi
+else
     dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
 fi
 if ! pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
@@ -213,7 +218,16 @@ rm -f "$tmp_autostart"
 echo "Ensuring session bus at $XDG_RUNTIME_DIR/bus ..."
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
-  echo "session bus socket already exists."
+  if dbus-send --session --dest=org.freedesktop.DBus --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    echo "session bus socket already exists and is responsive."
+  else
+    echo "session bus socket is stale, removing and restarting..."
+    rm -f "$XDG_RUNTIME_DIR/bus"
+    dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" \
+      --print-address=1 --print-pid=1 >/dev/null 2>&1 \
+      || { echo "ERROR: could not start session dbus-daemon." >&2; exit 1; }
+    sleep 1
+  fi
 else
   dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" \
     --print-address=1 --print-pid=1 >/dev/null 2>&1 \
