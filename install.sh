@@ -163,12 +163,14 @@ POLICY_SRC="$REPO_ROOT/internal/dbus/org.freedesktop.systemd1.system-policy.conf
 
 echo "Installing D-Bus activation service -> $DBUS_SERVICE_FILE"
 as_root mkdir -p "$(dirname "$DBUS_SERVICE_FILE")"
-as_root tee "$DBUS_SERVICE_FILE" >/dev/null <<EOF
+tmp_service=$(mktemp)
+cat > "$tmp_service" <<EOF
 [D-BUS Service]
 Name=org.freedesktop.systemd1
 Exec=$INITD_DST --socket
 EOF
-as_root chmod 0644 "$DBUS_SERVICE_FILE"
+as_root install -m 0644 "$tmp_service" "$DBUS_SERVICE_FILE"
+rm -f "$tmp_service"
 
 echo "Installing system bus policy -> $DBUS_POLICY_FILE"
 if [ -f "$POLICY_SRC" ]; then
@@ -183,27 +185,29 @@ fi
 AUTOSTART_FILE="/etc/profile.d/initd.sh"
 echo "Installing session-login autostart hook -> $AUTOSTART_FILE"
 as_root mkdir -p "$(dirname "$AUTOSTART_FILE")"
-as_root tee "$AUTOSTART_FILE" >/dev/null <<EOF
+tmp_autostart=$(mktemp)
+cat > "$tmp_autostart" <<'EOSH'
 # Installed by initd install.sh — expose org.freedesktop.systemd1 and start the
 # initd supervisor on session login. systemd is not PID 1 here; initd provides
 # the systemd1 D-Bus interface and unit supervision instead.
-export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
-export DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\$XDG_RUNTIME_DIR/bus}"
-mkdir -p "\$XDG_RUNTIME_DIR" 2>/dev/null || true
-if [ ! -S "\$XDG_RUNTIME_DIR/bus" ]; then
-    dbus-daemon --session --fork --address="\$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+if [ ! -S "$XDG_RUNTIME_DIR/bus" ]; then
+    dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
 fi
-if ! pgrep -x initd >/dev/null 2>&1; then
+if ! pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
     # A login spawned by sudo (or a chroot entrypoint) inherits SUDO_USER*,
     # which would make initd's RealUID() resolve to the sudo user and route
     # its user-manager at that user's units. Clear them so a root daemon is a
     # true root user-manager ($HOME=/root, /root/.config/systemd/user).
     unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND
-    nohup initd --init >>"\$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
+    nohup initd --init >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
     disown 2>/dev/null || true
 fi
-EOF
-as_root chmod 0755 "$AUTOSTART_FILE"
+EOSH
+as_root install -m 0755 "$tmp_autostart" "$AUTOSTART_FILE"
+rm -f "$tmp_autostart"
 
 # --- session bus for the daemon ------------------------------------------------
 echo "Ensuring session bus at $XDG_RUNTIME_DIR/bus ..."
