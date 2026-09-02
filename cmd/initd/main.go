@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const initdVersion = "1.0.2"
+const initdVersion = "1.0.3"
 
 func main() {
 	socketPath, initMode, err := parseArgs(os.Args[1:])
@@ -160,7 +160,11 @@ func main() {
 		// and require root to start. A non-root daemon must not attempt them:
 		// they fail with EACCES and, with Restart=always, spin in a permission
 		// denied restart storm that also blocks the user manager's startMu.
-		startSystemUnits := os.Getuid() == 0
+		// User units must be started by the per-user manager, not by the
+		// system (root) manager. When running as root, only start system
+		// units; when running as a user, only start user units. This mirrors
+		// systemd's separation of PID 1 (system) and systemd --user.
+		isRoot := os.Getuid() == 0
 
 		if os.Getpid() == 1 {
 			// full init
@@ -168,15 +172,17 @@ func main() {
 			boot.RemountRootRW()
 			boot.ApplyHostname()
 
-			if startSystemUnits {
+			if isRoot {
 				if err := systemManager.StartEnabledUnits(); err != nil {
 					logging.KernelPrintf(os.Stderr, "initd", 1,
 						"failed to start enabled system units: %v", err)
 				}
 			}
-			if err := userManager.StartEnabledUnits(); err != nil {
-				logging.KernelPrintf(os.Stderr, "initd", 1,
-					"failed to start enabled user units: %v", err)
+			if !isRoot {
+				if err := userManager.StartEnabledUnits(); err != nil {
+					logging.KernelPrintf(os.Stderr, "initd", 1,
+						"failed to start enabled user units: %v", err)
+				}
 			}
 
 			boot.SpawnVirtualTerminals()
@@ -198,15 +204,16 @@ func main() {
 			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 				"WARNING: --init requested but PID != 1, running init-lite mode")
 
-			if startSystemUnits {
+			if isRoot {
 				if err := systemManager.StartEnabledUnits(); err != nil {
 					logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 						"failed to start enabled system units: %v", err)
 				}
-			}
-			if err := userManager.StartEnabledUnits(); err != nil {
-				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-					"failed to start enabled user units: %v", err)
+			} else {
+				if err := userManager.StartEnabledUnits(); err != nil {
+					logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+						"failed to start enabled user units: %v", err)
+				}
 			}
 
 			for {

@@ -1,5 +1,5 @@
 BUILD_DIR := build
-VERSION ?= 1.0.2
+VERSION ?= 1.0.3
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

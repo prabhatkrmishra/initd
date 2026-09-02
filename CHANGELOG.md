@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-09-02
+
+### Fixed
+- `initd --init` now respects system/user separation: when running as root it only starts system units, when running as non-root it only starts user units. Previously the daemon started both, causing user services like `openclaw-gateway.service` to be started by the system manager as root and then raced with the user manager, leading to duplicate supervisors and `Active: stopping since ... 13m ago` hangs (`cmd/initd/main.go`).
+- `Stop()` for `simple`/`exec`/`oneshot`/`notify` services no longer hangs in `stopping` until `TimeoutStopSec` expires. The poll loop now also checks `processAlive(MainPID)` and transitions to `inactive` immediately when the process exits, mirroring systemd's PID liveness tracking. This fixes `systemctl --user stop/restart` blocking for 330s and makes it return in <1s for services that handle `SIGTERM` correctly (e.g. openclaw gateway shuts down in ~470ms) (`internal/service/service.go:630`).
+
+### Changed
+- Version markers `initdVersion`/`systemctlVersion`/`loginctlVersion` and D-Bus `Version` bumped to `1.0.3`.
+
+### Packaging
+- Release artifacts: `releases/initd_1.0.3_linux_arm64.zip` and `releases/initd_1.0.3_linux_amd64.zip`, each containing `initd` + `systemctl` + `loginctl` + `install.sh` with `sha256sum`.
+
 ## [1.0.2] - 2026-09-02
 
 ### Added
@@ -82,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unmodified systemd `*.service` support for `simple`, `oneshot`, `forking`, `notify`/`notify-reload`; safe fallback to `simple` for `exec`, `idle`, `dbus` and unknown types.
 - Familiar `systemctl` workflow: start/stop/restart, enable/disable, status/is-active/is-enabled, list-units, list-unit-files, daemon-reload, plus `reboot`/`poweroff`/`halt`.
 
+[1.0.3]: https://github.com/prabhatkrmishra/initd/releases/tag/v1.0.3
 [1.0.2]: https://github.com/prabhatkrmishra/initd/releases/tag/v1.0.2
 [1.0.1]: https://github.com/prabhatkrmishra/initd/releases/tag/v1.0.1
 [1.0.0]: https://github.com/prabhatkrmishra/initd/releases/tag/v1.0.0

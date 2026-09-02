@@ -634,6 +634,15 @@ func (u *Unit) Stop(timeout time.Duration) error {
 				return true
 			}
 		} else {
+			// For simple/notify/exec/oneshot, the process exiting should
+			// drive the state to inactive via handleExit. Poll both the
+			// state and the live PID so we don't hang if handleExit races
+			// or the reaper hasn't yet reaped the child. This mirrors
+			// systemd's behavior of tracking the main PID liveness.
+			if pid != 0 && !processAlive(pid) {
+				u.transitionState(StateInactive, "")
+				return true
+			}
 			state := u.Snapshot().State
 			if state == StateInactive || state == StateFailed {
 				return true
