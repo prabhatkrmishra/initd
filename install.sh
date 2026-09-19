@@ -11,13 +11,15 @@
 #     bash install.sh
 #
 # It will:
-#   1. locate (or build) the initd + systemctl + loginctl binaries for this host's arch;
+#   1. locate (or build) the initd + systemctl + loginctl + journalctl binaries for this host's arch;
 #   2. install (as root directly, or via sudo for a non-root user):
 #        /usr/bin/initd                                   (supervisor)
 #        /usr/bin/systemctl                               (wrapper)
 #        /usr/bin/systemctl.real.systemd255               (backup of real systemd systemctl)
 #        /usr/bin/loginctl                               (initd compatibility shim)
 #        /usr/bin/loginctl.real                         (backup of real loginctl, if any)
+#        /usr/bin/journalctl                             (log viewer for the in-memory ring)
+#        /usr/bin/journalctl.real                       (backup of real journalctl, if any)
 #        /usr/share/dbus-1/services/org.freedesktop.systemd1.service
 #        /usr/share/dbus-1/system.d/org.freedesktop.systemd1.conf
 #   3. ensure a session bus at $XDG_RUNTIME_DIR/bus;
@@ -113,6 +115,9 @@ fi
 if [ -z "$LOGINCTL_BIN" ]; then
   LOGINCTL_BIN="$(find_binary loginctl "$ARCH" || true)"
 fi
+if [ -z "$JOURNALCTL_BIN" ]; then
+  JOURNALCTL_BIN="$(find_binary journalctl "$ARCH" || true)"
+fi
 if [ -z "$INITD_BIN" ] && [ "$have_go" -eq 1 ]; then
   INITD_BIN="$(build_binary cmd/initd)"
 fi
@@ -122,19 +127,26 @@ fi
 if [ -z "$LOGINCTL_BIN" ] && [ "$have_go" -eq 1 ]; then
   LOGINCTL_BIN="$(build_binary cmd/loginctl)"
 fi
+if [ -z "$JOURNALCTL_BIN" ] && [ "$have_go" -eq 1 ]; then
+  JOURNALCTL_BIN="$(build_binary cmd/journalctl)"
+fi
 
 : "${INITD_BIN:?}"
 : "${SYSTEMCTL_BIN:?}"
 : "${LOGINCTL_BIN:?}"
+: "${JOURNALCTL_BIN:?}"
 echo "Using initd binary:      $INITD_BIN"
 echo "Using systemctl binary:  $SYSTEMCTL_BIN"
 echo "Using loginctl binary:   $LOGINCTL_BIN"
+echo "Using journalctl binary: $JOURNALCTL_BIN"
 
 INITD_DST="/usr/bin/initd"
 SYSTEMCTL_DST="/usr/bin/systemctl"
 LOGINCTL_DST="/usr/bin/loginctl"
+JOURNALCTL_DST="/usr/bin/journalctl"
 REAL_BACKUP="/usr/bin/systemctl.real.systemd255"
 LOGINCTL_REAL_BACKUP="/usr/bin/loginctl.real"
+JOURNALCTL_REAL_BACKUP="/usr/bin/journalctl.real"
 
 # --- install binaries ----------------------------------------------------------
 echo "Backing up real systemctl (if present and not already backed up)..."
@@ -149,12 +161,20 @@ if [ -f "$LOGINCTL_DST" ] && [ ! -f "$LOGINCTL_REAL_BACKUP" ]; then
     as_root cp "$LOGINCTL_DST" "$LOGINCTL_REAL_BACKUP"
   fi
 fi
+echo "Backing up real journalctl (if present and not already backed up)..."
+if [ -f "$JOURNALCTL_DST" ] && [ ! -f "$JOURNALCTL_REAL_BACKUP" ]; then
+  if file "$JOURNALCTL_DST" 2>/dev/null | grep -q "dynamically linked"; then
+    as_root cp "$JOURNALCTL_DST" "$JOURNALCTL_REAL_BACKUP"
+  fi
+fi
 echo "Installing initd -> $INITD_DST"
 as_root install -m 0755 "$INITD_BIN" "$INITD_DST"
 echo "Installing systemctl -> $SYSTEMCTL_DST"
 as_root install -m 0755 "$SYSTEMCTL_BIN" "$SYSTEMCTL_DST"
 echo "Installing loginctl -> $LOGINCTL_DST"
 as_root install -m 0755 "$LOGINCTL_BIN" "$LOGINCTL_DST"
+echo "Installing journalctl -> $JOURNALCTL_DST"
+as_root install -m 0755 "$JOURNALCTL_BIN" "$JOURNALCTL_DST"
 
 # --- D-Bus configuration -------------------------------------------------------
 DBUS_SERVICE_FILE="/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
@@ -307,6 +327,7 @@ install.sh complete.
   initd daemon : $INITD_DST  (running as $RUN_USER, init-lite)
   systemctl     : $SYSTEMCTL_DST
   loginctl     : $LOGINCTL_DST
+  journalctl   : $JOURNALCTL_DST
   real backup   : $REAL_BACKUP
   session bus   : $XDG_RUNTIME_DIR/bus
   autostart     : $AUTOSTART_FILE  (runs \`initd --init\` on each session login)

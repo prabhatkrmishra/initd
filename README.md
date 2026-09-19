@@ -259,6 +259,10 @@ System Commands:
 
 The interface is intentionally close to systemd’s `systemctl`.
 
+Unit logs live in an in-memory ring (newest last). Read them with
+`systemctl log UNIT [-n N]` or the compatible `journalctl -u UNIT [-n N]`
+shim; follow mode (`-f`) is not supported.
+
 ## Examples
 
 ### Starting nginx

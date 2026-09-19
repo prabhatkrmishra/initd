@@ -21,6 +21,7 @@ type Request struct {
 	Unit   string `json:"unit,omitempty"`
 	Signal string `json:"signal,omitempty"`
 	Now    bool   `json:"now,omitempty"`
+	Lines  int    `json:"lines,omitempty"`
 }
 
 type Response struct {
@@ -334,6 +335,28 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: false, Message: "no manager"}
 		}
 		return Response{Success: true, Data: manager.NeedDaemonReload()}
+	case "logs":
+		if req.Unit == "" {
+			return Response{Success: false, Message: "no unit name specified"}
+		}
+		unit, err := manager.FindUnit(req.Unit)
+		if err == nil {
+			logs := unit.Logs.Entries()
+			lines := make([]string, 0, len(logs))
+			for _, entry := range logs {
+				lines = append(lines, logging.FormatEntry(entry))
+			}
+			if req.Lines > 0 && len(lines) > req.Lines {
+				lines = lines[len(lines)-req.Lines:]
+			}
+			return Response{Success: true, Data: lines}
+		}
+		// Socket units keep no log ring; report empty rather than not-found
+		// so `journalctl -u foo.socket` degrades to no output.
+		if _, serr := manager.FindSocketUnit(req.Unit); serr == nil {
+			return Response{Success: true, Data: []string{}}
+		}
+		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "reboot", "poweroff", "halt":
 		if manager != nil && manager.UserMode {
 			return Response{Success: false, Message: "reboot/poweroff/halt not allowed for user manager"}

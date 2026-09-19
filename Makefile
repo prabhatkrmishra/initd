@@ -9,6 +9,7 @@ OUTPUT_DIR := $(BUILD_DIR)/$(GOOS)-$(GOARCH)
 INITD_BIN := $(OUTPUT_DIR)/initd
 SYSTEMCTL_BIN := $(OUTPUT_DIR)/systemctl
 LOGINCTL_BIN := $(OUTPUT_DIR)/loginctl
+JOURNALCTL_BIN := $(OUTPUT_DIR)/journalctl
 
 .PHONY: build build-all package clean
 
@@ -17,6 +18,7 @@ build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags="-s -w" -o $(INITD_BIN) ./cmd/initd
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags="-s -w" -o $(SYSTEMCTL_BIN) ./cmd/systemctl
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags="-s -w" -o $(LOGINCTL_BIN) ./cmd/loginctl
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags="-s -w" -o $(JOURNALCTL_BIN) ./cmd/journalctl
 	@echo "Build completed for $(GOOS)/$(GOARCH)."
 
 build-all:
@@ -31,8 +33,9 @@ package: build-all
 			"$(BUILD_DIR)/linux-$$ARCH/initd" \
 			"$(BUILD_DIR)/linux-$$ARCH/systemctl" \
 			"$(BUILD_DIR)/linux-$$ARCH/loginctl" \
+			"$(BUILD_DIR)/linux-$$ARCH/journalctl" \
 			install.sh ; \
-		echo "Created releases/initd_$(VERSION)_linux_$${ARCH}.zip (initd, systemctl, loginctl, install.sh)"; \
+		echo "Created releases/initd_$(VERSION)_linux_$${ARCH}.zip (initd, systemctl, loginctl, journalctl, install.sh)"; \
 	done
 	@sha256sum releases/*.zip 2>/dev/null || true
 
