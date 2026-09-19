@@ -53,7 +53,7 @@ func runOffline(opts journalOpts) int {
 		}
 	}
 	entries := fetchScopedEntries(opts, req)
-	lines := formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	lines := formatEntries(applyDisplayFilters(entries, opts), opts.output, opts.utc, opts.noHostname, opts.outputFields)
 	if opts.showCursor && len(entries) > 0 {
 		lines = append(lines, "-- cursor: "+entries[len(entries)-1].Cursor)
 	}

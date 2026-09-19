@@ -105,7 +105,7 @@ func main() {
 	}
 
 	entries := fetchEntries(client, req)
-	lines := formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	lines := formatEntries(applyDisplayFilters(entries, opts), opts.output, opts.utc, opts.noHostname, opts.outputFields)
 	if opts.showCursor && len(entries) > 0 {
 		lines = append(lines, "-- cursor: "+entries[len(entries)-1].Cursor)
 	}
@@ -113,6 +113,29 @@ func main() {
 		_ = writeCursorFile(opts.cursorFile, entries[len(entries)-1].Cursor)
 	}
 	emitPaged(lines, opts)
+}
+
+// applyDisplayFilters implements the output-only flags the daemon never
+// sees: -q drops info-and-above noise, --truncate-newline cuts embedded
+// newlines. -a/--no-full are already no-ops (all fields always print in
+// full), so they need no handling here.
+func applyDisplayFilters(entries []logging.StoredEntry, opts journalOpts) []logging.StoredEntry {
+	if !opts.quiet && !opts.truncateNewline {
+		return entries
+	}
+	out := make([]logging.StoredEntry, 0, len(entries))
+	for _, e := range entries {
+		if opts.quiet && e.Priority > 4 {
+			continue
+		}
+		if opts.truncateNewline {
+			if i := strings.IndexByte(e.Message, '\n'); i >= 0 {
+				e.Message = e.Message[:i]
+			}
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 func fetchEntries(client *ipc.Client, req ipc.Request) []logging.StoredEntry {
@@ -135,7 +158,7 @@ func fetchEntries(client *ipc.Client, req ipc.Request) []logging.StoredEntry {
 // interrupted. Polling fits our request/response IPC: no streams needed,
 // and at supervisor log rates a 250ms cadence is instant to a human.
 func runFollow(client *ipc.Client, req ipc.Request, opts journalOpts) int {
-	entries := fetchEntries(client, req)
+	entries := applyDisplayFilters(fetchEntries(client, req), opts)
 	if !opts.noTail {
 		emitPaged(formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields), opts)
 	} else {
@@ -158,7 +181,7 @@ func runFollow(client *ipc.Client, req ipc.Request, opts journalOpts) int {
 		poll.Cursor = last
 		poll.CursorAfter = true
 		poll.Lines = 0
-		next := fetchEntries(client, poll)
+		next := applyDisplayFilters(fetchEntries(client, poll), opts)
 		if len(next) == 0 {
 			continue
 		}
