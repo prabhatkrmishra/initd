@@ -1389,7 +1389,8 @@ func (m *Manager) UnitState(name string) (string, error) {
 		return "running", nil
 	}
 	if unit, err := m.FindUnit(name); err == nil {
-		return string(unit.Snapshot().State), nil
+		state, _ := unit.EffectiveState()
+		return string(state), nil
 	}
 	if _, err := m.FindSocketUnit(name); err == nil {
 		return m.SocketActiveState(name)
@@ -1428,18 +1429,19 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		return nil, err
 	}
 	snap := unit.Snapshot()
+	effState, effPID := unit.EffectiveState()
 	cfg := unit.Config
 	data := map[string]string{
 		"Id":                  cfg.Name,
 		"Names":               cfg.Name,
 		"Description":         unit.Description(),
 		"LoadState":           "loaded",
-		"ActiveState":         string(snap.State),
-		"SubState":            string(snap.State),
+		"ActiveState":         string(effState),
+		"SubState":            string(effState),
 		"FragmentPath":        unit.Path,
 		"UnitFileState":       m.UnitFileState(cfg.Name),
-		"MainPID":             fmt.Sprintf("%d", snap.MainPID),
-		"ExecMainPID":         fmt.Sprintf("%d", snap.MainPID),
+		"MainPID":             fmt.Sprintf("%d", effPID),
+		"ExecMainPID":         fmt.Sprintf("%d", effPID),
 		"ExitCode":            fmt.Sprintf("%d", snap.ExitCode),
 		"Result":              snap.LastError,
 		"Type":                cfg.Service.Type,
@@ -1454,6 +1456,14 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		"DefaultDependencies": cfg.DefaultDependencies,
 		"ExecStart":           cfg.Service.ExecStart,
 		"WantedBy":            strings.Join(cfg.Install.WantedBy, " "),
+	}
+	if effState == service.StateActive && snap.State != service.StateActive && effPID > 0 {
+		// Externally started (SysV / nohup / manual). Keep Result for
+		// compat but surface the external PID so `systemctl status`
+		// shows Main PID instead of a misleading inactive.
+		if data["Result"] == "" {
+			data["Result"] = "external-process"
+		}
 	}
 	if !snap.StartedAt.IsZero() {
 		data["ActiveEnterTimestamp"] = snap.StartedAt.Format(time.RFC3339)

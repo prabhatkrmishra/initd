@@ -803,7 +803,9 @@ func printStatus(status ipc.StatusData, enabled string) {
 	fmt.Printf("   Loaded: loaded (%s; %s)\n", status.Name, enabled)
 
 	activeLine := string(status.State)
-	if status.State == "active" {
+	if status.State == "active" && status.LastError == "external-process" {
+		activeLine = "active (external)"
+	} else if status.State == "active" {
 		activeLine = "active (running)"
 	}
 
@@ -822,9 +824,12 @@ func printStatus(status ipc.StatusData, enabled string) {
 
 	if status.MainPID > 0 {
 		fmt.Printf(" Main PID: %d\n", status.MainPID)
+		if status.LastError == "external-process" {
+			fmt.Printf("   Note: process running outside initd (SysV/manual/nohup); adopt with `systemctl restart %s` to supervise\n", status.Name)
+		}
 	}
 
-	if status.LastError != "" {
+	if status.LastError != "" && status.LastError != "external-process" {
 		fmt.Printf("   Error: %s\n", status.LastError)
 	}
 

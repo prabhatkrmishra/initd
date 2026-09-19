@@ -167,6 +167,11 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 	case "status":
 		if unit, err := manager.FindUnit(req.Unit); err == nil {
 			snapshot := unit.Snapshot()
+			effState, effPID := unit.EffectiveState()
+			lastErr := snapshot.LastError
+			if effState == service.StateActive && snapshot.State != service.StateActive && lastErr == "" {
+				lastErr = "external-process"
+			}
 			logs := unit.Logs.Entries()
 			logLines := make([]string, 0, len(logs))
 			for _, entry := range logs {
@@ -175,13 +180,13 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: true, Data: StatusData{
 				Name:                unit.Config.Name,
 				Description:         unit.Description(),
-				State:               snapshot.State,
-				MainPID:             snapshot.MainPID,
+				State:               effState,
+				MainPID:             effPID,
 				StartedAt:           snapshot.StartedAt,
 				FinishedAt:          snapshot.FinishedAt,
 				StartedAtMonotonic:  snapshot.StartedAtMonotonic,
 				FinishedAtMonotonic: snapshot.FinishedAtMonotonic,
-				LastError:           snapshot.LastError,
+				LastError:           lastErr,
 				Logs:                logLines,
 			}}
 		}
@@ -196,7 +201,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "is-active":
 		if unit, err := manager.FindUnit(req.Unit); err == nil {
-			state := unit.Snapshot().State
+			state, _ := unit.EffectiveState()
 			return Response{Success: true, Data: state}
 		}
 		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
@@ -208,8 +213,14 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		units := manager.ListUnits()
 		data := make([]UnitData, 0, len(units)+len(manager.SocketUnitNames()))
 		for _, unit := range units {
-			snapshot := unit.Snapshot()
-			data = append(data, UnitData{Name: unit.Config.Name, Description: unit.Description(), State: snapshot.State, Type: unit.Config.Type})
+			effState, _ := unit.EffectiveState()
+			// ListUnits holds *service.Unit; Config.Type is the unit type
+			// (simple/forking/...) — fall back to service type string.
+			utype := ""
+			if unit.Config != nil {
+				utype = unit.Config.Type
+			}
+			data = append(data, UnitData{Name: unit.Config.Name, Description: unit.Description(), State: effState, Type: utype})
 		}
 		for _, name := range manager.SocketUnitNames() {
 			state, _ := manager.SocketActiveState(name)
