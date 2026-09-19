@@ -34,3 +34,5 @@ releases/
 build/
 /systemctl
 /initd
+/journalctl
+/loginctl

@@ -21,11 +21,13 @@ type JournalFilter struct {
 	Cursor      string
 	CursorAfter bool
 	Lines       int
+	LinesPlus   bool
 	Reverse     bool
 }
 
 // QueryJournal filters entries in (realtime, seq) order. Lines>0 keeps the
-// last N unless Reverse flips to first-N-then-reversed like journalctl -r.
+// last N (or the first N with LinesPlus, like journalctl -n +N) unless
+// Reverse flips to first-N-then-reversed like journalctl -r.
 // Cursor/CursorAfter locate a resume point by exact token match.
 func QueryJournal(entries []StoredEntry, f JournalFilter) []StoredEntry {
 	units := map[string]struct{}{}
@@ -92,7 +94,11 @@ func QueryJournal(entries []StoredEntry, f JournalFilter) []StoredEntry {
 		}
 	}
 	if f.Lines > 0 && len(out) > f.Lines {
-		out = out[len(out)-f.Lines:]
+		if f.LinesPlus {
+			out = out[:f.Lines]
+		} else {
+			out = out[len(out)-f.Lines:]
+		}
 	}
 	if f.Reverse {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {

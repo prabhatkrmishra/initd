@@ -22,6 +22,7 @@ type Request struct {
 	Signal string `json:"signal,omitempty"`
 	Now    bool   `json:"now,omitempty"`
 	Lines  int    `json:"lines,omitempty"`
+	LinesPlus bool `json:"lines_plus,omitempty"`
 	Units  []string `json:"units,omitempty"`
 	Boot   string   `json:"boot,omitempty"`
 	Since  int64    `json:"since,omitempty"`
@@ -369,6 +370,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			Cursor:        req.Cursor,
 			CursorAfter:   req.CursorAfter,
 			Lines:         req.Lines,
+			LinesPlus:     req.LinesPlus,
 			Reverse:       req.Reverse,
 		})
 		return Response{Success: true, Data: out}

@@ -19,8 +19,12 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("opts = %+v", opts)
 	}
 
-	if _, err := parseArgs([]string{"-f"}); err == nil {
-		t.Fatal("follow mode should fail")
+	opts, err = parseArgs([]string{"-f", "--no-tail", "-u", "ssh"})
+	if err != nil {
+		t.Fatalf("follow: %v", err)
+	}
+	if !opts.follow || !opts.noTail {
+		t.Fatalf("follow opts = %+v", opts)
 	}
 	if _, err := parseArgs([]string{"--bogus"}); err == nil {
 		t.Fatal("unknown option should fail")
@@ -30,5 +34,22 @@ func TestParseArgs(t *testing.T) {
 	}
 	if _, err := parseArgs([]string{"-n", "-5"}); err == nil {
 		t.Fatal("negative lines should fail")
+	}
+	opts, err = parseArgs([]string{"-n", "+5"})
+	if err != nil || opts.lines != 5 || !opts.linesPlus {
+		t.Fatalf("+N lines = %+v, %v", opts, err)
+	}
+	opts, err = parseArgs([]string{"-S", "yesterday", "-U", "today", "-p", "err", "-g", "boom", "-b", "-1"})
+	if err != nil {
+		t.Fatalf("filters: %v", err)
+	}
+	if opts.since != "yesterday" || opts.until != "today" || !opts.prioritySet || opts.priority != 3 || opts.grep != "boom" || !opts.bootSet || opts.boot != "-1" {
+		t.Fatalf("filter opts = %+v", opts)
+	}
+	if _, err := parseArgs([]string{"--case-sensitive"}); err == nil {
+		t.Fatal("--case-sensitive without --grep should fail")
+	}
+	if _, err := parseArgs([]string{"-M", "foo"}); err == nil {
+		t.Fatal("machine scoping should fail loudly")
 	}
 }

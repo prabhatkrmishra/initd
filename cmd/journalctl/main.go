@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"initd/internal/ipc"
+	"initd/internal/logging"
 	"initd/internal/userpaths"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const journalctlVersion = "1.0.3"
@@ -29,6 +32,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if code := runAdminCommand(opts); code >= 0 {
+		os.Exit(code)
+	}
+
 	socketPath := opts.socket
 	if socketPath == "" {
 		if opts.user {
@@ -37,64 +44,241 @@ func main() {
 			socketPath = userpaths.SystemSocketPath()
 		}
 	}
-	client := &ipc.Client{SocketPath: socketPath}
 
-	units := opts.units
-	if len(units) == 0 {
-		var err error
-		units, err = allUnits(client)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
+	// Offline fallback: daemon down means read the files directly like the
+	// real journalctl does. Everything except follow works offline.
+	client := &ipc.Client{SocketPath: socketPath}
+	if _, err := client.Do(ipc.Request{Action: "is-system-running"}); err != nil {
+		if opts.follow {
+			fmt.Fprintf(os.Stderr, "daemon not running: follow mode needs a live daemon\n")
 			os.Exit(1)
 		}
+		os.Exit(runOffline(opts))
 	}
 
-	multi := len(units) > 1
-	exitCode := 0
-	for _, unit := range units {
-		resolved, err := resolveUnit(client, unit)
+	boot := resolveBoot(client, socketPath, opts)
+	if opts.bootFailed {
+		os.Exit(1)
+	}
+	req := ipc.Request{
+		Action:      "journal",
+		Units:       append(append([]string{}, opts.units...), opts.userUnits...),
+		Boot:        boot,
+		Priority:    opts.priority,
+		PrioritySet: opts.prioritySet,
+		Grep:        opts.grep,
+		CaseSensitive: opts.caseSensitive,
+		Identifier:    opts.identifier,
+		Cursor:        opts.cursor,
+		Lines:         opts.lines,
+		LinesPlus:     opts.linesPlus,
+		Reverse:       opts.reverse,
+	}
+	if opts.afterCursor != "" {
+		req.Cursor, req.CursorAfter = opts.afterCursor, true
+	}
+	if opts.since != "" || opts.until != "" {
+		now := time.Now()
+		since, err := parseSinceUntil("--since", opts.since, now)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
-			exitCode = 1
-			continue
+			os.Exit(1)
 		}
-		resp, err := client.Do(ipc.Request{Action: "logs", Unit: resolved, Lines: opts.lines})
+		until, err := parseSinceUntil("--until", opts.until, now)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			exitCode = 1
-			continue
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(1)
 		}
-		if !resp.Success {
-			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-			exitCode = 1
-			continue
-		}
-		var lines []string
-		raw, _ := json.Marshal(resp.Data)
-		_ = json.Unmarshal(raw, &lines)
-		if multi {
-			fmt.Printf("-- %s --\n", resolved)
-		}
-		for _, line := range lines {
-			fmt.Println(line)
+		req.Since = since
+		req.Until = until
+	}
+
+	if opts.cursorFile != "" {
+		if raw, err := readCursorFile(opts.cursorFile); err == nil && raw != "" {
+			req.Cursor = raw
+			req.CursorAfter = true
 		}
 	}
-	os.Exit(exitCode)
+
+	if opts.follow {
+		os.Exit(runFollow(client, req, opts))
+	}
+
+	entries := fetchEntries(client, req)
+	lines := formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	if opts.showCursor && len(entries) > 0 {
+		lines = append(lines, "-- cursor: "+entries[len(entries)-1].Cursor)
+	}
+	if opts.cursorFile != "" && len(entries) > 0 {
+		_ = writeCursorFile(opts.cursorFile, entries[len(entries)-1].Cursor)
+	}
+	emitPaged(lines, opts)
+}
+
+func fetchEntries(client *ipc.Client, req ipc.Request) []logging.StoredEntry {
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if !resp.Success {
+		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+		os.Exit(1)
+	}
+	var entries []logging.StoredEntry
+	raw, _ := json.Marshal(resp.Data)
+	_ = json.Unmarshal(raw, &entries)
+	return entries
+}
+
+// runFollow prints the current tail, then polls with after-cursor until
+// interrupted. Polling fits our request/response IPC: no streams needed,
+// and at supervisor log rates a 250ms cadence is instant to a human.
+func runFollow(client *ipc.Client, req ipc.Request, opts journalOpts) int {
+	entries := fetchEntries(client, req)
+	if !opts.noTail {
+		emitPaged(formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields), opts)
+	} else {
+		// --no-tail with -f means print everything buffered, then follow.
+		emitUnpaged(formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields))
+	}
+	last := ""
+	if len(entries) > 0 {
+		last = entries[len(entries)-1].Cursor
+	}
+	if opts.showCursor && last != "" {
+		fmt.Println("-- cursor: " + last)
+	}
+	if opts.cursorFile != "" && last != "" {
+		_ = writeCursorFile(opts.cursorFile, last)
+	}
+	for {
+		time.Sleep(250 * time.Millisecond)
+		poll := req
+		poll.Cursor = last
+		poll.CursorAfter = true
+		poll.Lines = 0
+		next := fetchEntries(client, poll)
+		if len(next) == 0 {
+			continue
+		}
+		for _, line := range formatEntries(next, opts.output, opts.utc, opts.noHostname, opts.outputFields) {
+			fmt.Println(line)
+		}
+		last = next[len(next)-1].Cursor
+		if opts.cursorFile != "" {
+			_ = writeCursorFile(opts.cursorFile, last)
+		}
+	}
+}
+
+// emitPaged pipes through $PAGER/less on a tty unless --no-pager; -e jumps
+// to the end. Non-tty output never pages, like the real tool.
+func emitPaged(lines []string, opts journalOpts) {
+	if opts.noPager || !isTerminal() {
+		for _, l := range lines {
+			fmt.Println(l)
+		}
+		return
+	}
+	pager := firstNonEmpty(os.Getenv("PAGER"), "less")
+	if opts.pagerEnd {
+		emitUnpaged(lines)
+		_ = exec.Command(pager, "+G").Run()
+		// Fall through to plain print: the +G hint above covers jump-end
+		// on pagers that support it; output itself stays in order.
+		for _, l := range lines {
+			fmt.Println(l)
+		}
+		return
+	}
+	cmd := exec.Command(pager)
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		emitUnpaged(lines)
+	}
+}
+
+func emitUnpaged(lines []string) {
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 type journalOpts struct {
-	units  []string
-	lines  int
-	user   bool
-	socket string
+	units           []string
+	userUnits       []string
+	lines           int
+	linesPlus       bool
+	user            bool
+	system          bool
+	merge           bool
+	socket          string
+	directory       string
+	file            string
+	root            string
+	since           string
+	until           string
+	cursor          string
+	afterCursor     string
+	cursorFile      string
+	showCursor      bool
+	boot            string
+	bootSet         bool
+	bootFailed      bool
+	identifier      string
+	priority        int
+	prioritySet     bool
+	priorityRaw     string
+	grep            string
+	caseSensitive   bool
+	caseSet         bool
+	output          string
+	outputFields    string
+	reverse         bool
+	utc             bool
+	noHostname      bool
+	noFull          bool
+	all             bool
+	catalog         bool
+	quiet           bool
+	noPager         bool
+	pagerEnd        bool
+	follow          bool
+	noTail          bool
+	truncateNewline bool
+	dmesg           bool
+	listBoots       bool
+	diskUsage       bool
+	vacuumSize      string
+	vacuumFiles     string
+	vacuumTime      string
+	verify          bool
+	sync            bool
+	flush           bool
+	rotate          bool
+	header          bool
+	listFields      bool
+	field           string
 }
 
-// parseArgs handles the subset of journalctl flags initd supports. Pager and
-// output-formatting flags are accepted and ignored so existing invocations
-// keep working; follow mode is rejected because the log store is an
-// in-memory ring with no stream.
+// parseArgs handles the journalctl surface initd supports. Anything outside
+// it (machines, namespaces, images, FSS) fails loudly so scripts never get
+// silently partial answers.
 func parseArgs(args []string) (journalOpts, error) {
 	var opts journalOpts
+	opts.output = "short"
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -104,20 +288,28 @@ func parseArgs(args []string) (journalOpts, error) {
 				return opts, fmt.Errorf("%s requires a unit name", a)
 			}
 			opts.units = append(opts.units, args[i])
+		case a == "--user-unit":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a unit name", a)
+			}
+			opts.userUnits = append(opts.userUnits, args[i])
 		case strings.HasPrefix(a, "-u"):
 			opts.units = append(opts.units, strings.TrimPrefix(a, "-u"))
 		case strings.HasPrefix(a, "--unit="):
 			opts.units = append(opts.units, strings.TrimPrefix(a, "--unit="))
+		case strings.HasPrefix(a, "--user-unit="):
+			opts.userUnits = append(opts.userUnits, strings.TrimPrefix(a, "--user-unit="))
 		case a == "-n" || a == "--lines":
 			i++
 			if i >= len(args) {
 				return opts, fmt.Errorf("%s requires a number", a)
 			}
-			n, err := strconv.Atoi(args[i])
-			if err != nil || n < 0 {
+			n, plus, err := parseLinesValue(args[i])
+			if err != nil {
 				return opts, fmt.Errorf("invalid line count %q", args[i])
 			}
-			opts.lines = n
+			opts.lines, opts.linesPlus = n, plus
 		case strings.HasPrefix(a, "-n"):
 			if !isCompactN(a) {
 				return opts, fmt.Errorf("unknown option %q", a)
@@ -128,35 +320,242 @@ func parseArgs(args []string) (journalOpts, error) {
 			}
 			opts.lines = n
 		case strings.HasPrefix(a, "--lines="):
-			n, err := strconv.Atoi(strings.TrimPrefix(a, "--lines="))
-			if err != nil || n < 0 {
+			n, plus, err := parseLinesValue(strings.TrimPrefix(a, "--lines="))
+			if err != nil {
 				return opts, fmt.Errorf("invalid line count %q", a)
 			}
-			opts.lines = n
-		case a == "-e" || a == "--pager-end" || a == "--no-pager" ||
-			a == "-q" || a == "--quiet" || a == "--no-hostname" ||
-			a == "-x" || a == "--catalog":
-			// Accepted and ignored: no pager, no hostname/catalog metadata.
-		case strings.HasPrefix(a, "-o") || strings.HasPrefix(a, "--output="):
-			// Accepted and ignored: single plain-text format.
-			if a == "-o" {
-				i++ // consume the format name
-				if i >= len(args) {
-					return opts, fmt.Errorf("-o requires a format name")
-				}
+			opts.lines, opts.linesPlus = n, plus
+		case a == "-S" || a == "--since":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a date", a)
 			}
+			opts.since = args[i]
+		case strings.HasPrefix(a, "--since="):
+			opts.since = strings.TrimPrefix(a, "--since=")
+		case a == "-U" || a == "--until":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a date", a)
+			}
+			opts.until = args[i]
+		case strings.HasPrefix(a, "--until="):
+			opts.until = strings.TrimPrefix(a, "--until=")
+		case a == "-c" || a == "--cursor":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a cursor", a)
+			}
+			opts.cursor = args[i]
+		case strings.HasPrefix(a, "--cursor="):
+			opts.cursor = strings.TrimPrefix(a, "--cursor=")
+		case strings.HasPrefix(a, "--after-cursor="):
+			opts.afterCursor = strings.TrimPrefix(a, "--after-cursor=")
+		case a == "--after-cursor":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a cursor", a)
+			}
+			opts.afterCursor = args[i]
+		case a == "--cursor-file":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a path", a)
+			}
+			opts.cursorFile = args[i]
+		case strings.HasPrefix(a, "--cursor-file="):
+			opts.cursorFile = strings.TrimPrefix(a, "--cursor-file=")
+		case a == "--show-cursor":
+			opts.showCursor = true
+		case a == "-b" || a == "--boot":
+			opts.bootSet = true
+			// Boot values look like flags: -1, -0, ids. Only skip when
+			// the next token is a known option, not merely dash-led.
+			if i+1 < len(args) && isBootValue(args[i+1]) {
+				i++
+				opts.boot = args[i]
+			}
+		case strings.HasPrefix(a, "--boot="):
+			opts.boot = strings.TrimPrefix(a, "--boot=")
+			opts.bootSet = true
+		case a == "-t" || a == "--identifier":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a string", a)
+			}
+			opts.identifier = args[i]
+		case strings.HasPrefix(a, "--identifier="):
+			opts.identifier = strings.TrimPrefix(a, "--identifier=")
+		case strings.HasPrefix(a, "-t"):
+			opts.identifier = strings.TrimPrefix(a, "-t")
+		case a == "-p" || a == "--priority":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a priority", a)
+			}
+			opts.priorityRaw = args[i]
+		case strings.HasPrefix(a, "--priority="):
+			opts.priorityRaw = strings.TrimPrefix(a, "--priority=")
+		case strings.HasPrefix(a, "--facility="):
+			return opts, fmt.Errorf("%s is not supported: initd records no facility field", a)
+		case a == "-g" || a == "--grep":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a pattern", a)
+			}
+			opts.grep = args[i]
+		case strings.HasPrefix(a, "--grep="):
+			opts.grep = strings.TrimPrefix(a, "--grep=")
+		case strings.HasPrefix(a, "-g"):
+			opts.grep = strings.TrimPrefix(a, "-g")
+		case a == "--case-sensitive":
+			opts.caseSensitive, opts.caseSet = true, true
+		case strings.HasPrefix(a, "--case-sensitive="):
+			v := strings.TrimPrefix(a, "--case-sensitive=")
+			on, err := strconv.ParseBool(v)
+			if err != nil {
+				return opts, fmt.Errorf("invalid --case-sensitive value %q", v)
+			}
+			opts.caseSensitive, opts.caseSet = on, true
+		case a == "-k" || a == "--dmesg":
+			opts.dmesg = true
+		case a == "-o" || a == "--output":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a format", a)
+			}
+			opts.output = strings.ToLower(args[i])
+		case strings.HasPrefix(a, "-o"):
+			opts.output = strings.ToLower(strings.TrimPrefix(a, "-o"))
+		case strings.HasPrefix(a, "--output="):
+			opts.output = strings.ToLower(strings.TrimPrefix(a, "--output="))
+		case a == "--output-fields":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a list", a)
+			}
+			opts.outputFields = args[i]
+		case strings.HasPrefix(a, "--output-fields="):
+			opts.outputFields = strings.TrimPrefix(a, "--output-fields=")
+		case a == "-r" || a == "--reverse":
+			opts.reverse = true
+		case a == "--utc":
+			opts.utc = true
+		case a == "--no-hostname":
+			opts.noHostname = true
+		case a == "--no-full":
+			opts.noFull = true
+		case a == "-a" || a == "--all":
+			opts.all = true
+		case a == "-x" || a == "--catalog":
+			opts.catalog = true
+		case a == "-q" || a == "--quiet":
+			opts.quiet = true
+		case a == "--truncate-newline":
+			opts.truncateNewline = true
 		case a == "-f" || a == "--follow":
-			return opts, fmt.Errorf("follow mode is not supported; use 'systemctl log UNIT' for a snapshot")
+			opts.follow = true
+		case a == "--no-tail":
+			opts.noTail = true
+		case a == "-e" || a == "--pager-end":
+			opts.pagerEnd = true
+		case a == "--no-pager":
+			opts.noPager = true
+		case a == "-m" || a == "--merge":
+			opts.merge = true
+		case a == "-D" || a == "--directory":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a path", a)
+			}
+			opts.directory = args[i]
+		case strings.HasPrefix(a, "--directory="):
+			opts.directory = strings.TrimPrefix(a, "--directory=")
+		case strings.HasPrefix(a, "--file="):
+			opts.file = strings.TrimPrefix(a, "--file=")
+		case a == "--file":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a path", a)
+			}
+			opts.file = args[i]
+		case strings.HasPrefix(a, "--root="):
+			opts.root = strings.TrimPrefix(a, "--root=")
+		case a == "--root":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a path", a)
+			}
+			opts.root = args[i]
+		case a == "--list-boots":
+			opts.listBoots = true
+		case a == "--disk-usage":
+			opts.diskUsage = true
+		case strings.HasPrefix(a, "--vacuum-size="):
+			opts.vacuumSize = strings.TrimPrefix(a, "--vacuum-size=")
+		case a == "--vacuum-size":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a size", a)
+			}
+			opts.vacuumSize = args[i]
+		case strings.HasPrefix(a, "--vacuum-files="):
+			opts.vacuumFiles = strings.TrimPrefix(a, "--vacuum-files=")
+		case a == "--vacuum-files":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a count", a)
+			}
+			opts.vacuumFiles = args[i]
+		case strings.HasPrefix(a, "--vacuum-time="):
+			opts.vacuumTime = strings.TrimPrefix(a, "--vacuum-time=")
+		case a == "--vacuum-time":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a duration", a)
+			}
+			opts.vacuumTime = args[i]
+		case a == "--verify":
+			opts.verify = true
+		case a == "--sync":
+			opts.sync = true
+		case a == "--flush":
+			opts.flush = true
+		case a == "--rotate":
+			opts.rotate = true
+		case a == "--header":
+			opts.header = true
+		case a == "-N" || a == "--fields":
+			opts.listFields = true
+		case a == "-F" || a == "--field":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a field", a)
+			}
+			opts.field = args[i]
+		case strings.HasPrefix(a, "--field="):
+			opts.field = strings.TrimPrefix(a, "--field=")
+		case a == "--relinquish-var" || a == "--smart-relinquish-var":
+			return opts, fmt.Errorf("%s is not supported: initd always logs to disk", a)
+		case a == "--list-catalog" || a == "--dump-catalog" || a == "--update-catalog" ||
+			a == "--setup-keys" || strings.HasPrefix(a, "--interval=") ||
+			strings.HasPrefix(a, "--verify-key=") || a == "--force":
+			return opts, fmt.Errorf("%s is not supported: no message catalog or sealed-hash chain", a)
+		case a == "-M" || a == "--machine" || strings.HasPrefix(a, "--machine=") ||
+			a == "--image" || strings.HasPrefix(a, "--image=") ||
+			a == "--image-policy" || strings.HasPrefix(a, "--image-policy=") ||
+			a == "--namespace" || strings.HasPrefix(a, "--namespace="):
+			return opts, fmt.Errorf("%s is not supported: single-host journal only", a)
 		case a == "--user":
 			opts.user = true
 		case a == "--system":
-			opts.user = false
+			opts.system = true
 		case strings.HasPrefix(a, "--socket="):
 			opts.socket = strings.TrimPrefix(a, "--socket=")
 		case a == "--socket":
 			i++
 			if i >= len(args) {
-				return opts, fmt.Errorf("--socket requires a path")
+				return opts, fmt.Errorf("%s requires a path", a)
 			}
 			opts.socket = args[i]
 		case strings.HasPrefix(a, "-"):
@@ -165,7 +564,31 @@ func parseArgs(args []string) (journalOpts, error) {
 			return opts, fmt.Errorf("unexpected argument %q (did you mean -u %s?)", a, a)
 		}
 	}
+	if opts.priorityRaw != "" {
+		p, set, err := parsePriority(opts.priorityRaw)
+		if err != nil {
+			return opts, err
+		}
+		opts.priority, opts.prioritySet = p, set
+	}
+	if opts.caseSet && opts.grep == "" {
+		return opts, fmt.Errorf("--case-sensitive needs --grep")
+	}
+	if opts.dmesg && (len(opts.units) > 0 || len(opts.userUnits) > 0 || opts.grep != "" || opts.identifier != "") {
+		return opts, fmt.Errorf("--dmesg cannot combine with unit/identifier/grep filters")
+	}
 	return opts, nil
+}
+
+// parseLinesValue accepts N and +N (head instead of tail, like real -n).
+func parseLinesValue(raw string) (int, bool, error) {
+	s := strings.TrimSpace(raw)
+	plus := strings.HasPrefix(s, "+")
+	n, err := strconv.Atoi(strings.TrimPrefix(s, "+"))
+	if err != nil || n < 0 {
+		return 0, false, fmt.Errorf("invalid line count %q", raw)
+	}
+	return n, plus, nil
 }
 
 // isCompactN reports whether a holds the compact -n<digits> form. A plain
@@ -230,26 +653,72 @@ func wantsVersion(args []string) bool {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: journalctl [OPTIONS...]")
-	fmt.Fprintln(os.Stderr, "Show logs kept by the initd manager (in-memory, newest last).")
+	fmt.Fprintln(os.Stderr, "Usage: journalctl [OPTIONS...] [MATCHES...]")
+	fmt.Fprintln(os.Stderr, "Query the journal.")
 }
 
 func printHelp() {
-	fmt.Println("journalctl [OPTIONS...]")
+	fmt.Println("journalctl [OPTIONS...] [MATCHES...]")
 	fmt.Println()
-	fmt.Println("Show logs kept by the initd manager (in-memory ring, newest last).")
+	fmt.Println("Query the journal.")
 	fmt.Println()
-	fmt.Println("Options:")
-	fmt.Println("  -u, --unit=UNIT      Show logs for UNIT (repeatable; default: all units)")
-	fmt.Println("  -n, --lines=N        Show only the last N lines")
-	fmt.Println("  -e, --pager-end      Accepted (output always ends at newest)")
-	fmt.Println("  --no-pager           Accepted (output is never paged)")
-	fmt.Println("  -o, --output=FORMAT  Accepted and ignored (plain-text output)")
-	fmt.Println("  --user               Talk to user manager")
-	fmt.Println("  --system             Talk to system manager (default)")
-	fmt.Println("  --socket=PATH        Path to initd control socket")
-	fmt.Println("  -h, --help           Show this help")
-	fmt.Println("  -V, --version        Show version")
+	fmt.Println("Source Options:")
+	fmt.Println("      --system                Show the system journal")
+	fmt.Println("      --user                  Show the user journal for the current user")
+	fmt.Println("  -m, --merge                 Show entries from all available journals")
+	fmt.Println("  -D, --directory=PATH        Show journal files from directory")
+	fmt.Println("      --file=PATH             Show journal file")
+	fmt.Println("      --root=PATH             Operate on an alternate filesystem root")
 	fmt.Println()
-	fmt.Println("Follow mode (-f) is not supported; use 'systemctl log UNIT' for a snapshot.")
+	fmt.Println("Filtering Options:")
+	fmt.Println("  -S, --since=DATE            Show entries not older than the specified date")
+	fmt.Println("  -U, --until=DATE            Show entries not newer than the specified date")
+	fmt.Println("  -c, --cursor=CURSOR         Show entries starting at the specified cursor")
+	fmt.Println("      --after-cursor=CURSOR   Show entries after the specified cursor")
+	fmt.Println("      --cursor-file=FILE      Show entries after cursor in FILE and update FILE")
+	fmt.Println("  -b, --boot[=ID]             Show current boot or the specified boot")
+	fmt.Println("  -u, --unit=UNIT             Show logs from the specified unit")
+	fmt.Println("      --user-unit=UNIT        Show logs from the specified user unit")
+	fmt.Println("  -t, --identifier=STRING     Show entries with the specified syslog identifier")
+	fmt.Println("  -p, --priority=RANGE        Show entries with the specified priority")
+	fmt.Println("  -g, --grep=PATTERN          Show entries with MESSAGE matching PATTERN")
+	fmt.Println("      --case-sensitive[=BOOL] Force case sensitive or insensitive matching")
+	fmt.Println("  -k, --dmesg                 Show kernel message log (not supported: unit logs only)")
+	fmt.Println()
+	fmt.Println("Output Control Options:")
+	fmt.Println("  -o, --output=STRING         Change output mode (short, short-precise,")
+	fmt.Println("                                short-iso, short-full, short-monotonic, short-unix,")
+	fmt.Println("                                verbose, export, json, json-pretty, json-sse,")
+	fmt.Println("                                json-seq, cat, with-unit)")
+	fmt.Println("      --output-fields=LIST    Select fields to print in verbose/export/json modes")
+	fmt.Println("  -n, --lines[=[+]INTEGER]    Number of journal entries to show")
+	fmt.Println("  -r, --reverse               Show the newest entries first")
+	fmt.Println("      --show-cursor           Print the cursor after all the entries")
+	fmt.Println("      --utc                   Express time in Coordinated Universal Time (UTC)")
+	fmt.Println("  -x, --catalog               Accepted (no catalog content to add)")
+	fmt.Println("      --no-hostname           Suppress output of hostname field")
+	fmt.Println("  -a, --all                   Accepted (all fields always shown)")
+	fmt.Println("  -f, --follow                Follow the journal")
+	fmt.Println("      --no-tail               Show all lines, even in follow mode")
+	fmt.Println("  -q, --quiet                 Do not show info messages")
+	fmt.Println()
+	fmt.Println("Pager Control Options:")
+	fmt.Println("      --no-pager              Do not pipe output into a pager")
+	fmt.Println("  -e, --pager-end             Immediately jump to the end in the pager")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  -N, --fields                List all field names currently used")
+	fmt.Println("  -F, --field=FIELD           List all values that a specified field takes")
+	fmt.Println("      --list-boots            Show terse information about recorded boots")
+	fmt.Println("      --disk-usage            Show total disk usage of all journal files")
+	fmt.Println("      --vacuum-size=BYTES     Reduce disk usage below specified size")
+	fmt.Println("      --vacuum-files=INT      Leave only the specified number of journal files")
+	fmt.Println("      --vacuum-time=TIME      Remove journal files older than specified time")
+	fmt.Println("      --verify                Verify journal file consistency")
+	fmt.Println("      --sync                  Synchronize unwritten journal messages to disk")
+	fmt.Println("      --flush                 Flush all journal data to disk")
+	fmt.Println("      --rotate                Request immediate rotation of the journal files")
+	fmt.Println("      --header                Show journal header information")
+	fmt.Println()
+	fmt.Println("See the journalctl(1) man page for details.")
 }
