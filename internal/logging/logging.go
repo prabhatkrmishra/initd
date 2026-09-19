@@ -18,16 +18,23 @@ const (
 
 type Entry struct {
 	Timestamp time.Duration
-	Unit      string
-	PID       int
-	Level     Level
-	Message   string
+	// WallTime is the wall-clock instant the line was logged. Zero for
+	// entries created before disk persistence existed; readers fall back
+	// to file order then.
+	WallTime time.Time
+	Unit     string
+	PID      int
+	Level    Level
+	Message  string
 }
 
 type Buffer struct {
 	mu      sync.Mutex
 	entries []Entry
 	max     int
+	// file, when non-nil, receives every Add as JSONL. The ring stays a
+	// bounded hot cache; the file is the durable source of truth.
+	file *FileWriter
 }
 
 func NewBuffer(maxEntries int) *Buffer {
@@ -37,10 +44,37 @@ func NewBuffer(maxEntries int) *Buffer {
 	}
 }
 
-func (b *Buffer) Add(entry Entry) {
+// AttachFile wires durable storage. Subsequent Adds go to both ring and
+// file; a disk error never drops the ring copy. Nil detaches.
+func (b *Buffer) AttachFile(w *FileWriter) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.file = w
+}
+
+// Priority maps our two levels onto syslog priorities so -p filtering
+// works: INFO->6 (info), ERROR->3 (err).
+func (e Entry) Priority() int {
+	if e.Level == LevelError {
+		return 3
+	}
+	return 6
+}
+
+// Identifier defaults to the unit basename (foo.service -> foo), the same
+// value -t matches on.
+func (e Entry) Identifier() string {
+	base := e.Unit
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	return strings.TrimSuffix(base, ".service")
+}
+
+func (b *Buffer) Add(entry Entry) {
+	b.mu.Lock()
 	if b.max <= 0 {
+		b.mu.Unlock()
 		return
 	}
 	if len(b.entries) >= b.max {
@@ -48,6 +82,25 @@ func (b *Buffer) Add(entry Entry) {
 		b.entries = b.entries[:b.max-1]
 	}
 	b.entries = append(b.entries, entry)
+	w := b.file
+	b.mu.Unlock()
+	if w != nil {
+		// Zero WallTime predates disk persistence (old tests, replayed
+		// fixtures): stamp now so readers can sort and filter by time.
+		wall := entry.WallTime
+		if wall.IsZero() {
+			wall = time.Now()
+		}
+		_ = w.Append(StoredEntry{
+			MonotonicUsec: int64(entry.Timestamp / time.Microsecond),
+			Unit:          entry.Unit,
+			PID:           entry.PID,
+			Priority:      entry.Priority(),
+			Identifier:    entry.Identifier(),
+			Message:       entry.Message,
+			RealtimeUsec:  wall.UnixMicro(),
+		})
+	}
 }
 
 func (b *Buffer) Entries() []Entry {
@@ -78,6 +131,7 @@ func (l *LineLogger) Write(p []byte) (int, error) {
 		}
 		entry := Entry{
 			Timestamp: MonotonicNow(),
+			WallTime:  time.Now(),
 			Unit:      l.Unit,
 			PID:       l.PID,
 			Level:     l.Level,

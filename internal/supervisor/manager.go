@@ -42,6 +42,15 @@ type Manager struct {
 	// (system scope only). Empty disables the SysV generator; tests
 	// override it with a temp dir.
 	SysVInitDir string
+	// journal is the durable per-boot log store. Nil until OpenJournal
+	// runs at daemon startup; tests leave it nil and keep RAM-only rings.
+	journal *logging.FileWriter
+	// JournalDir overrides the default log dir (tests use temp dirs).
+	JournalDir string
+	// journalBoot pins the boot id for the active file (tests).
+	journalBoot string
+	// journalHost pins the hostname recorded on lines (tests).
+	journalHost string
 }
 
 type socketRuntime struct {
@@ -175,6 +184,7 @@ func (m *Manager) LoadUnits() error {
 					unit.SetReaper(m.reaper)
 				}
 				unit.SetOnFailureHandler(m.onFailureCallback(unit.Config.Name))
+				m.attachJournalLocked(unit)
 				units[entry.Name()] = unit
 			}
 			order = append(order, entry.Name())
@@ -204,6 +214,7 @@ func (m *Manager) LoadUnits() error {
 		if oldUnit.Reaper() == nil && m.reaper != nil {
 			oldUnit.SetReaper(m.reaper)
 		}
+		m.attachJournalLocked(oldUnit)
 		units[name] = oldUnit
 		order = append(order, name)
 	}
@@ -298,6 +309,7 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 				unit.SetReaper(m.reaper)
 			}
 			unit.SetOnFailureHandler(m.onFailureCallback(name))
+			m.attachJournalLocked(unit)
 			m.Units[name] = unit
 			m.UnitOrder = append(m.UnitOrder, name)
 			return unit, nil
@@ -324,6 +336,7 @@ func (m *Manager) findUnitLocked(name string) (*service.Unit, error) {
 			if m.reaper != nil {
 				unit.SetReaper(m.reaper)
 			}
+			m.attachJournalLocked(unit)
 			m.Units[name] = unit
 			m.UnitOrder = append(m.UnitOrder, name)
 			return unit, nil
@@ -362,6 +375,7 @@ func (m *Manager) loadUnitFromDiskLocked(n string) *service.Unit {
 			unit.SetReaper(m.reaper)
 		}
 		unit.SetOnFailureHandler(m.onFailureCallback(unit.Config.Name))
+		m.attachJournalLocked(unit)
 		m.Units[n] = unit
 		m.UnitOrder = append(m.UnitOrder, n)
 		return unit
@@ -1018,7 +1032,21 @@ func (m *Manager) SystemState() string {
 }
 
 func (m *Manager) Reload() error {
-	return m.LoadUnits()
+	if err := m.LoadUnits(); err != nil {
+		return err
+	}
+	// daemon-reload rebuilds unit objects: rewire every ring to the open
+	// store, since fresh units start detached. New files keep working, old
+	// file handles stay valid (open fd), so no log line is lost.
+	m.mu.Lock()
+	w := m.journal
+	if w != nil {
+		for _, u := range m.Units {
+			u.Logs.AttachFile(w)
+		}
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {

@@ -1066,6 +1066,7 @@ func (u *Unit) Log(level logging.Level, message string) {
 	u.mu.Unlock()
 	u.Logs.Add(logging.Entry{
 		Timestamp: logging.MonotonicNow(),
+		WallTime:  time.Now(),
 		Unit:      u.Config.Name,
 		PID:       pid,
 		Level:     level,

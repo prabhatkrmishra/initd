@@ -161,6 +161,7 @@ func (m *Manager) loadSysVUnits(units map[string]*service.Unit, order *[]string)
 			u.SetReaper(m.reaper)
 		}
 		u.SetOnFailureHandler(m.onFailureCallback(name))
+		m.attachJournalLocked(u)
 		units[name] = u
 		*order = append(*order, name)
 	}

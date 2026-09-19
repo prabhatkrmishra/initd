@@ -115,6 +115,34 @@ func UserLockPath() string {
 	return fmt.Sprintf("/tmp/initd-%d.lock", uid)
 }
 
+// SystemJournalDir is the durable log dir for the system manager. Root gets
+// /var/log/initd/journal; non-root falls back to the per-user state dir so
+// the daemon never fails to start for want of a writable /var/log.
+func SystemJournalDir() string {
+	if os.Getuid() == 0 {
+		return "/var/log/initd/journal"
+	}
+	return filepath.Join(UserStateDir(), "journal")
+}
+
+// UserJournalDir is the durable log dir for the user manager.
+func UserJournalDir() string {
+	return filepath.Join(UserStateDir(), "journal")
+}
+
+// UserStateDir follows XDG ($XDG_STATE_HOME or ~/.local/state), falling back
+// to the runtime dir when HOME is unavailable (minimal chroots).
+func UserStateDir() string {
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "initd")
+	}
+	home := RealHome()
+	if home != "" && home != "/tmp" {
+		return filepath.Join(home, ".local", "state", "initd")
+	}
+	return filepath.Join(UserRuntimeDir(), "state")
+}
+
 func AcquireUserLock() (*os.File, error) {
 	path := UserLockPath()
 	dir := filepath.Dir(path)

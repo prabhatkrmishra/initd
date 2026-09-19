@@ -77,6 +77,14 @@ func main() {
 	if err := userManager.LoadUnits(); err != nil {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "failed to load user units: %v", err)
 	}
+	// Durable logs are best-effort: a read-only /var/log must not stop
+	// supervision, the rings just stay RAM-only.
+	if err := systemManager.OpenJournal(); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "system journal unavailable: %v", err)
+	}
+	if err := userManager.OpenJournal(); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "user journal unavailable: %v", err)
+	}
 
 	// Fallback for non-root: /run/initd.sock not writable
 	if socketPath == "/run/initd.sock" && os.Getuid() != 0 {
@@ -271,6 +279,8 @@ func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File
 	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "received SIGTERM, shutting down")
 	userManager.StopAllUnits()
 	systemManager.StopAllUnits()
+	systemManager.CloseJournal()
+	userManager.CloseJournal()
 	_ = os.Remove(userSocket)
 	if socketPath != userSocket {
 		_ = os.Remove(socketPath)
