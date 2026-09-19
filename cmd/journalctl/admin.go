@@ -226,8 +226,6 @@ func runVacuum(opts journalOpts) int {
 		}
 		maxDays = d
 	}
-	sockets, _ := journalScope(opts)
-	_ = sockets
 	// Vacuum runs through the daemon so the open file is never removed.
 	// Offline dirs vacuum directly with the same never-newest rule.
 	sockList, dirList := journalScope(opts)
@@ -236,8 +234,8 @@ func runVacuum(opts journalOpts) int {
 		if sock != "" {
 			client := &ipc.Client{SocketPath: sock}
 			resp, err := client.Do(ipc.Request{
-				Action: "journal-vacuum", Since: maxBytes,
-				Until: int64(maxFiles), Lines: maxDays,
+				Action: "journal-vacuum", MaxBytes: maxBytes,
+				MaxFiles: maxFiles, MaxDays: maxDays,
 			})
 			if err == nil && resp.Success {
 				continue

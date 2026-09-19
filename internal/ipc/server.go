@@ -35,6 +35,9 @@ type Request struct {
 	Cursor string   `json:"cursor,omitempty"`
 	CursorAfter bool `json:"cursor_after,omitempty"`
 	Reverse bool    `json:"reverse,omitempty"`
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+	MaxFiles int   `json:"max_files,omitempty"`
+	MaxDays  int   `json:"max_days,omitempty"`
 }
 
 type Response struct {
@@ -383,9 +386,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 	case "journal-usage":
 		return Response{Success: true, Data: manager.JournalUsage()}
 	case "journal-vacuum":
-		// Vacuum bounds come from the request in a later phase; for now
-		// apply manager defaults so disk-usage work lands with the store.
-		if err := manager.VacuumJournal(0, 0, 0); err != nil {
+		if err := manager.VacuumJournal(req.MaxBytes, req.MaxFiles, req.MaxDays); err != nil {
 			return Response{Success: false, Message: err.Error()}
 		}
 		return Response{Success: true}
