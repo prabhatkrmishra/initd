@@ -41,6 +41,7 @@ type StatusData struct {
 	StartedAtMonotonic  time.Duration `json:"started_at_monotonic"`
 	FinishedAtMonotonic time.Duration `json:"finished_at_monotonic"`
 	LastError           string        `json:"last_error"`
+	Warnings            []string      `json:"warnings,omitempty"`
 	Logs                []string      `json:"logs"`
 }
 
@@ -190,6 +191,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 				StartedAtMonotonic:  snapshot.StartedAtMonotonic,
 				FinishedAtMonotonic: snapshot.FinishedAtMonotonic,
 				LastError:           lastErr,
+				Warnings:            unit.IgnoredSecurityNotes(),
 				Logs:                logLines,
 			}}
 		}

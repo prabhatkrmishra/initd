@@ -1475,6 +1475,9 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		"StartLimitIntervalSec": cfg.StartLimitIntervalSec,
 		"StartLimitBurst":       cfg.StartLimitBurst,
 	}
+	if notes := unit.IgnoredSecurityNotes(); len(notes) > 0 {
+		data["IgnoredDirectives"] = strings.Join(notes, "; ")
+	}
 	if effState == service.StateActive && snap.State != service.StateActive && effPID > 0 {
 		// Externally started (SysV / nohup / manual). Keep Result for
 		// compat but surface the external PID so `systemctl status`

@@ -270,6 +270,13 @@ so `systemctl start foo` runs `foo start` and leaves the unit
 unit file always wins over the generated one, and the script's LSB
 header supplies the description when present.
 
+Hardening directives initd doesn't enforce (`PrivateTmp`, `ProtectSystem`,
+`NoNewPrivileges`, syscall/capability filters and friends) are no longer
+silent: starting a unit logs one warning per directive, `systemctl status`
+shows them, and `systemctl show` exposes them as `IgnoredDirectives`.
+Plain resource knobs (`MemoryMax`, `CPUQuota`, …) stay quiet since they
+promise no isolation.
+
 ## Examples
 
 ### Starting nginx

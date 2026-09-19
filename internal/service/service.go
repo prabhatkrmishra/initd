@@ -116,10 +116,17 @@ func (u *Unit) Start() (int, error) {
 		u.mu.Unlock()
 		return token, nil
 	}
-	if u.Runtime.State == StateStopping {
-		u.mu.Unlock()
+	state := u.Runtime.State
+	ignored := u.Config.Ignored
+	u.mu.Unlock()
+	if state == StateStopping {
 		return 0, fmt.Errorf("unit %s is stopping, try again", u.Config.Name)
 	}
+	// Surface silently-dropped hardening directives before supervising.
+	// The Ignored snapshot above is read without the log lock held (Log
+	// takes it per entry), so no mutex is carried across the writes.
+	u.warnIgnoredDirectives(ignored)
+	u.mu.Lock()
 	u.startToken++
 	u.stopRequested = false
 	token := u.startToken
@@ -1661,6 +1668,79 @@ func (u *Unit) remainAfterExit() bool {
 func (u *Unit) RemainActive() bool {
 	snap := u.Snapshot()
 	return snap.State == StateActive && snap.MainPID == 0 && u.remainAfterExit()
+}
+
+// securityNotes maps silently-dropped sandbox/hardening directives to a
+// one-line plain-language explanation. Only directives the parser actually
+// records in Ignored are listed; anything else is a code bug, not a warn.
+var securityNotes = map[string]string{
+	"PrivateTmp":              "runs with the shared /tmp (no private mount namespace)",
+	"PrivateDevices":          "runs with host /dev visible (no device namespace)",
+	"PrivateUsers":            "runs without a user namespace remap",
+	"ProtectSystem":           "runs without read-only /usr//etc remounts",
+	"ProtectHome":             "runs with home directories fully visible",
+	"ProtectKernelTunables":   "runs without /sys//proc hardening",
+	"ProtectKernelModules":    "runs without kernel module load blocking",
+	"ProtectKernelLogs":       "runs without kernel log access blocking",
+	"ProtectClock":            "runs without clock write blocking",
+	"ProtectHostname":         "runs without hostname change blocking",
+	"ProtectControlGroups":    "runs without cgroup write blocking",
+	"RestrictNamespaces":      "runs without namespace creation blocking",
+	"RestrictAddressFamilies": "runs without socket family filtering",
+	"RestrictRealtime":        "runs without realtime scheduling blocking",
+	"RestrictSUIDSGID":        "runs without setuid/setgid blocking",
+	"SystemCallFilter":        "runs without syscall filtering",
+	"SystemCallArchitectures": "runs without syscall arch filtering",
+	"CapabilityBoundingSet":   "runs without capability bounding",
+	"AmbientCapabilities":     "ambient capabilities are not granted",
+	"NoNewPrivileges":         "runs without the no-new-privileges flag",
+	"MemoryDenyWriteExecute":  "runs without W^X memory enforcement",
+	"LockPersonality":         "runs without personality lock",
+	"RemoveIPC":               "IPC objects are not cleaned up on stop",
+	"DeviceAllow":             "runs without device allowlisting",
+	"DeviceDeny":              "runs without device denylisting",
+}
+
+// IgnoredSecurityNotes returns sorted human-readable warnings for the
+// sandbox/hardening directives a unit requested but initd does not enforce.
+// Resource-control directives (MemoryMax, CPUQuota, ...) are intentionally
+// left out: they are inert accounting knobs, not promises of isolation.
+func (u *Unit) IgnoredSecurityNotes() []string {
+	return IgnoredSecurityNotes(u.Config.Ignored)
+}
+
+// IgnoredSecurityNotes renders warnings for a raw Ignored map without
+// needing a live unit, so manager layers can warn before supervision.
+func IgnoredSecurityNotes(ignored map[string]string) []string {
+	notes := []string{}
+	for key := range ignored {
+		short := key
+		if i := strings.LastIndexByte(key, '.'); i >= 0 {
+			short = key[i+1:]
+		}
+		if explain, ok := securityNotes[short]; ok {
+			notes = append(notes, fmt.Sprintf("%s is not enforced (%s)", short, explain))
+		}
+	}
+	if len(notes) > 1 {
+		for i := 0; i < len(notes)-1; i++ {
+			for j := i + 1; j < len(notes); j++ {
+				if notes[j] < notes[i] {
+					notes[i], notes[j] = notes[j], notes[i]
+				}
+			}
+		}
+	}
+	return notes
+}
+
+// warnIgnoredDirectives logs one line per unenforced hardening directive.
+// The caller passes the Ignored snapshot taken before locking so the mutex
+// is never held while writing to the log buffer.
+func (u *Unit) warnIgnoredDirectives(ignored map[string]string) {
+	for _, note := range IgnoredSecurityNotes(ignored) {
+		u.Log(logging.LevelInfo, "Warning: "+note)
+	}
 }
 
 // SubState refines Active for display: oneshot units kept alive by

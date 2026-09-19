@@ -389,6 +389,7 @@ func handleShow(client *ipc.Client, args []string) {
 				"RestartSec":           "",
 				"StartLimitIntervalSec": "",
 				"StartLimitBurst":       "",
+				"IgnoredDirectives":     "",
 			}
 			if len(properties) == 0 {
 				keys := make([]string, 0, len(notFoundDefaults))
@@ -954,6 +955,12 @@ func printStatus(status ipc.StatusData, enabled string) {
 
 	if status.LastError != "" && status.LastError != "external-process" {
 		fmt.Printf("   Error: %s\n", status.LastError)
+	}
+
+	if len(status.Warnings) > 0 {
+		for _, w := range status.Warnings {
+			fmt.Printf("   Warning: %s\n", w)
+		}
 	}
 
 	if len(status.Logs) > 0 {
