@@ -22,6 +22,18 @@ type Request struct {
 	Signal string `json:"signal,omitempty"`
 	Now    bool   `json:"now,omitempty"`
 	Lines  int    `json:"lines,omitempty"`
+	Units  []string `json:"units,omitempty"`
+	Boot   string   `json:"boot,omitempty"`
+	Since  int64    `json:"since,omitempty"`
+	Until  int64    `json:"until,omitempty"`
+	Priority int  `json:"priority,omitempty"`
+	PrioritySet bool `json:"priority_set,omitempty"`
+	Grep   string   `json:"grep,omitempty"`
+	CaseSensitive bool `json:"case_sensitive,omitempty"`
+	Identifier string `json:"identifier,omitempty"`
+	Cursor string   `json:"cursor,omitempty"`
+	CursorAfter bool `json:"cursor_after,omitempty"`
+	Reverse bool    `json:"reverse,omitempty"`
 }
 
 type Response struct {
@@ -339,6 +351,52 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: false, Message: "no manager"}
 		}
 		return Response{Success: true, Data: manager.NeedDaemonReload()}
+	case "journal":
+		entries, err := logging.ReadAll(manager.JournalFiles())
+		if err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		out := logging.QueryJournal(entries, logging.JournalFilter{
+			Units:         req.Units,
+			BootID:        req.Boot,
+			SinceUsec:     req.Since,
+			UntilUsec:     req.Until,
+			PriorityMax:   req.Priority,
+			PrioritySet:   req.PrioritySet,
+			Grep:          req.Grep,
+			CaseSensitive: req.CaseSensitive,
+			Identifier:    req.Identifier,
+			Cursor:        req.Cursor,
+			CursorAfter:   req.CursorAfter,
+			Lines:         req.Lines,
+			Reverse:       req.Reverse,
+		})
+		return Response{Success: true, Data: out}
+	case "journal-boots":
+		entries, err := logging.ReadAll(manager.JournalFiles())
+		if err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true, Data: logging.BootList(entries)}
+	case "journal-usage":
+		return Response{Success: true, Data: manager.JournalUsage()}
+	case "journal-vacuum":
+		// Vacuum bounds come from the request in a later phase; for now
+		// apply manager defaults so disk-usage work lands with the store.
+		if err := manager.VacuumJournal(0, 0, 0); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
+	case "journal-sync":
+		if err := manager.SyncJournal(); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
+	case "journal-rotate":
+		if err := manager.RotateJournal(); err != nil {
+			return Response{Success: false, Message: err.Error()}
+		}
+		return Response{Success: true}
 	case "logs":
 		if req.Unit == "" {
 			return Response{Success: false, Message: "no unit name specified"}

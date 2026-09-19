@@ -259,9 +259,10 @@ System Commands:
 
 The interface is intentionally close to systemd’s `systemctl`.
 
-Unit logs live in an in-memory ring (newest last). Read them with
-`systemctl log UNIT [-n N]` or the compatible `journalctl -u UNIT [-n N]`
-shim; follow mode (`-f`) is not supported.
+Unit logs are kept per boot in `journal/` under `/var/log/initd` (system)
+or `~/.local/state/initd` (user) and read with `journalctl -u UNIT [-n N]`
+(filtering, output modes and follow work as usual). `systemctl status`
+still shows the recent lines inline.
 
 Init scripts without a native unit (`/etc/init.d/*`, system scope only)
 are wrapped automatically as oneshot services with `RemainAfterExit=yes`,

@@ -126,9 +126,6 @@ func main() {
 	case "is-system-running":
 		handleIsSystemRunning(client)
 
-	case "log":
-		handleLog(client, cmdArgs)
-
 	default:
 		usage()
 		os.Exit(1)
@@ -159,89 +156,6 @@ func warnIfReloadNeeded(client *ipc.Client) {
 	if need, ok := resp.Data.(bool); ok && need {
 		fmt.Fprintf(os.Stderr, "Warning: unit files changed on disk, run 'systemctl daemon-reload'\n")
 	}
-}
-
-// isCompactNFlag reports whether a holds the compact -n<digits> form (e.g.
-// -n50). A plain prefix check would misread flags like -nonexistent, so the
-// digits are validated here.
-func isCompactNFlag(a string) bool {
-	if !strings.HasPrefix(a, "-n") || len(a) <= 2 {
-		return false
-	}
-	for _, r := range a[2:] {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func handleLog(client *ipc.Client, args []string) {
-	lines := 0
-	var units []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "-n" || a == "--lines":
-			i++
-			if i >= len(args) {
-				fmt.Fprintf(os.Stderr, "log: %s requires a number\n", a)
-				os.Exit(1)
-			}
-			n, err := strconv.Atoi(args[i])
-			if err != nil || n < 0 {
-				fmt.Fprintf(os.Stderr, "log: invalid line count %q\n", args[i])
-				os.Exit(1)
-			}
-			lines = n
-		case isCompactNFlag(a):
-			n, _ := strconv.Atoi(strings.TrimPrefix(a, "-n"))
-			if n < 0 {
-				fmt.Fprintf(os.Stderr, "log: invalid line count %q\n", a)
-				os.Exit(1)
-			}
-			lines = n
-		case strings.HasPrefix(a, "--lines="):
-			n, err := strconv.Atoi(strings.TrimPrefix(a, "--lines="))
-			if err != nil || n < 0 {
-				fmt.Fprintf(os.Stderr, "log: invalid line count %q\n", a)
-				os.Exit(1)
-			}
-			lines = n
-		case a == "--user" || a == "--system":
-			// Accepted for systemd muscle memory; scope was fixed at startup.
-		case strings.HasPrefix(a, "-"):
-			fmt.Fprintf(os.Stderr, "log: unknown option %q\n", a)
-			os.Exit(1)
-		default:
-			units = append(units, a)
-		}
-	}
-	if len(units) != 1 {
-		fmt.Fprintf(os.Stderr, "log requires exactly one unit name\n")
-		os.Exit(1)
-	}
-	resolved, err := resolveUnitName(client, units[0])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
-		os.Exit(1)
-	}
-	resp, err := client.Do(ipc.Request{Action: "logs", Unit: resolved, Lines: lines})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-		os.Exit(1)
-	}
-	var out []string
-	raw, _ := json.Marshal(resp.Data)
-	_ = json.Unmarshal(raw, &out)
-	for _, line := range out {
-		fmt.Println(line)
-	}
-	warnIfReloadNeeded(client)
 }
 
 func handleIsSystemRunning(client *ipc.Client) {
@@ -1096,7 +1010,6 @@ func printHelp() {
 	fmt.Println("  show UNIT...         Show properties of one or more units")
 	fmt.Println("  cat UNIT...          Show unit file contents")
 	fmt.Println("  kill UNIT...         Send signal to unit main process")
-	fmt.Println("  log UNIT [-n N]      Show recent log lines for a unit")
 	fmt.Println("  reset-failed [UNIT...] Reset failed state")
 	fmt.Println("  list-units [OPTIONS] List loaded units (--all, --state=, --type=)")
 	fmt.Println("  list-unit-files      List installed unit files")

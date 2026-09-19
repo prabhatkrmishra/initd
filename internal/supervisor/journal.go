@@ -2,11 +2,13 @@ package supervisor
 
 import (
 	"os"
+	"time"
 
 	"initd/internal/logging"
 	"initd/internal/service"
 	"initd/internal/userpaths"
 )
+
 
 // defaultJournalDir resolves the durable log dir for this manager scope.
 func (m *Manager) defaultJournalDir() string {
@@ -106,4 +108,102 @@ func (m *Manager) RotateJournal() error {
 		return nil
 	}
 	return w.Rotate()
+}
+
+// JournalUsage totals durable files: bytes and file count, like
+// journalctl --disk-usage in terse form.
+func (m *Manager) JournalUsage() map[string]int64 {
+	var bytes int64
+	var files int64
+	for _, path := range m.JournalFiles() {
+		if st, err := os.Stat(path); err == nil {
+			bytes += st.Size()
+			files++
+		}
+	}
+	return map[string]int64{"bytes": bytes, "files": files}
+}
+
+// VacuumJournal drops old generations until bytes/files/age fit. Zero means
+// no bound on that axis. Defaults mirror the plan: 100M system, 20M user,
+// 10 files, 14 days — enough to matter on small disks, quiet otherwise.
+func (m *Manager) VacuumJournal(maxBytes int64, maxFiles int, maxAgeDays int) error {
+	if maxBytes <= 0 {
+		if m.UserMode {
+			maxBytes = 20 << 20
+		} else {
+			maxBytes = 100 << 20
+		}
+	}
+	if maxFiles <= 0 {
+		maxFiles = 10
+	}
+	if maxAgeDays <= 0 {
+		maxAgeDays = 14
+	}
+	files := m.JournalFiles()
+	if len(files) == 0 {
+		return nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -maxAgeDays)
+	// Never delete the newest file: the writer may hold it open.
+	keepNewest := files[len(files)-1]
+	var victims []string
+	for _, path := range files {
+		if path == keepNewest {
+			continue
+		}
+		if st, err := os.Stat(path); err == nil && st.ModTime().Before(cutoff) {
+			victims = append(victims, path)
+		}
+	}
+	remove := func(path string) {
+		_ = os.Remove(path)
+	}
+	for _, v := range victims {
+		remove(v)
+	}
+	files = m.JournalFiles()
+	for len(files) > maxFiles {
+		oldest := ""
+		for _, path := range files {
+			if path == keepNewest {
+				continue
+			}
+			oldest = path
+			break
+		}
+		if oldest == "" {
+			break
+		}
+		remove(oldest)
+		files = m.JournalFiles()
+	}
+	var total int64
+	for _, path := range m.JournalFiles() {
+		if st, err := os.Stat(path); err == nil {
+			total += st.Size()
+		}
+	}
+	for total > maxBytes {
+		oldest := ""
+		for _, path := range m.JournalFiles() {
+			if path == keepNewest {
+				continue
+			}
+			oldest = path
+			break
+		}
+		if oldest == "" {
+			break
+		}
+		remove(oldest)
+		total = 0
+		for _, path := range m.JournalFiles() {
+			if st, err := os.Stat(path); err == nil {
+				total += st.Size()
+			}
+		}
+	}
+	return nil
 }
