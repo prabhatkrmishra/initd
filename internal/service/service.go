@@ -1616,6 +1616,108 @@ func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
 	return parseExitStatusSet(u.Config.Service.RestartPreventExitStatus)
 }
 
+// StartLimit reads the unit's StartLimitIntervalSec/StartLimitBurst,
+// defaulting to systemd's 10s window with a burst of 5. An interval <= 0
+// disables rate limiting; a burst <= 0 means no cap inside the window.
+func (u *Unit) StartLimit() (time.Duration, int) {
+	interval := parseSystemdDuration(u.Config.StartLimitIntervalSec, 10*time.Second)
+	if interval <= 0 {
+		return 0, 0
+	}
+	burst := 5
+	if raw := strings.TrimSpace(u.Config.StartLimitBurst); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			burst = n
+		}
+	}
+	return interval, burst
+}
+
+// StartLimitBurstValue exposes the burst for D-Bus/systemd property
+// consumers, falling back to the default when unset or unparsable.
+func (u *Unit) StartLimitBurstValue() uint32 {
+	_, burst := u.StartLimit()
+	if burst <= 0 {
+		return 5
+	}
+	return uint32(burst)
+}
+
+// StartLimitIntervalUsec exposes the window in microseconds for D-Bus
+// consumers, falling back to the 10s default.
+func (u *Unit) StartLimitIntervalUsec() uint64 {
+	interval, _ := u.StartLimit()
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	return uint64(interval.Microseconds())
+}
+
+// restartBaseDelay is the RestartSec delay before any backoff growth.
+func (u *Unit) restartBaseDelay() time.Duration {
+	return parseSystemdDuration(u.Config.Service.RestartSec, 0)
+}
+
+// restartDelay returns the delay before restart attempt n (1-based): the
+// base RestartSec doubled per attempt while RestartSteps allows, capped at
+// RestartMaxDelaySec (which defaults to the base, i.e. a fixed delay).
+func (u *Unit) RestartDelay(attempt int) time.Duration {
+	base := u.restartBaseDelay()
+	if base <= 0 || attempt <= 1 {
+		return base
+	}
+	steps := 0
+	if raw := strings.TrimSpace(u.Config.Service.RestartSteps); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			steps = n
+		}
+	}
+	maxDelay := parseSystemdDuration(u.Config.Service.RestartMaxDelaySec, base)
+	if maxDelay <= 0 {
+		maxDelay = base
+	}
+	delay := base
+	for i := 1; i < attempt && (steps <= 0 || i <= steps); i++ {
+		if delay >= maxDelay {
+			return maxDelay
+		}
+		delay *= 2
+		if delay >= maxDelay {
+			return maxDelay
+		}
+	}
+	return delay
+}
+
+// exitedCleanly reports whether an exit code counts as success: 0 or an
+// explicitly listed SuccessExitStatus. Signal deaths surface as 128+signo
+// via commandExitStatus, so they never count as clean.
+func (u *Unit) exitedCleanly(exitCode int) bool {
+	if exitCode == 0 {
+		return true
+	}
+	_, ok := u.SuccessExitStatus()[exitCode]
+	return ok
+}
+
+// shouldRestart maps Restart= modes onto an exit code. on-abnormal is
+// approximated as death by signal (codes above 128); watchdog/abort modes
+// have no trigger source here and never restart.
+func (u *Unit) ShouldRestart(mode string, exitCode int) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "always":
+		return true
+	case "on-failure":
+		return !u.exitedCleanly(exitCode)
+	case "on-success":
+		return u.exitedCleanly(exitCode)
+	case "on-abnormal":
+		return exitCode > 128
+	default:
+		return false
+	}
+}
+
 func (u *Unit) StopTimeout() time.Duration {
 	raw := strings.TrimSpace(u.Config.Service.TimeoutStopSec)
 	if raw == "" {

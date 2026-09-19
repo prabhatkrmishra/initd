@@ -589,6 +589,23 @@ func countFailed(mgr *supervisor.Manager) uint32 {
 	return c
 }
 
+// startLimitBurstOf / startLimitIntervalOf report the unit's configured
+// storm guard, defaulting to systemd's 5-in-10s when the unit is unknown
+// or the values don't parse.
+func startLimitBurstOf(mgr *supervisor.Manager, name string) uint32 {
+	if u, err := mgr.FindUnit(name); err == nil {
+		return u.StartLimitBurstValue()
+	}
+	return 5
+}
+
+func startLimitIntervalOf(mgr *supervisor.Manager, name string) uint64 {
+	if u, err := mgr.FindUnit(name); err == nil {
+		return u.StartLimitIntervalUsec()
+	}
+	return uint64(10e6)
+}
+
 func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop {
 	data, ok := managerUnitProps(mgr, name)
 	if !ok {
@@ -639,8 +656,8 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		"ExitCode":                {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
 		"ExitStatus":              {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
 		"NRestarts":               {Value: uint32(0), Writable: false, Emit: prop.EmitConst},
-		"StartLimitBurst":         {Value: uint32(5), Writable: false, Emit: prop.EmitConst},
-		"StartLimitIntervalUSec":  {Value: uint64(10e6), Writable: false, Emit: prop.EmitConst},
+		"StartLimitBurst":         {Value: startLimitBurstOf(mgr, name), Writable: false, Emit: prop.EmitTrue},
+		"StartLimitIntervalUSec":  {Value: startLimitIntervalOf(mgr, name), Writable: false, Emit: prop.EmitTrue},
 		"StartLimitAction":        {Value: "none", Writable: false, Emit: prop.EmitConst},
 		"MemoryCurrent":           {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
 		"CPUWeight":               {Value: uint64(100), Writable: false, Emit: prop.EmitTrue},

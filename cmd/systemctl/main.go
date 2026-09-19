@@ -385,6 +385,10 @@ func handleShow(client *ipc.Client, args []string) {
 				"NeedDaemonReload":   needReload,
 				"UnitFileState":      "disabled",
 				"Description":        "",
+				"Restart":              "",
+				"RestartSec":           "",
+				"StartLimitIntervalSec": "",
+				"StartLimitBurst":       "",
 			}
 			if len(properties) == 0 {
 				keys := make([]string, 0, len(notFoundDefaults))

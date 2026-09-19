@@ -1015,22 +1015,12 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 		return
 	}
 
-	restartSec := 0 * time.Second
-	if unit.Config.Service.RestartSec != "" {
-		if parsed, err := time.ParseDuration(unit.Config.Service.RestartSec); err == nil {
-			restartSec = parsed
-		} else if seconds, err := time.ParseDuration(unit.Config.Service.RestartSec + "s"); err == nil {
-			restartSec = seconds
-		}
-	}
-
-	// systemd uses StartLimit* to avoid restart storms; we hardcode a small window.
-	startLimitInterval := 10 * time.Second
-	startLimitBurst := 5
-
 	preventStatuses := unit.RestartPreventExitStatus()
+	startLimitInterval, startLimitBurst := unit.StartLimit()
+	limited := startLimitInterval > 0 && startLimitBurst > 0
 
 	go func() {
+		backoffAttempt := 0
 		for {
 			time.Sleep(500 * time.Millisecond)
 			if !unit.IsCurrentToken(token) || unit.StopRequested() {
@@ -1038,30 +1028,35 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 			}
 			unitState := unit.Snapshot().State
 			if unitState == service.StateActive || unitState == service.StateActivating || unitState == service.StateStopping {
+				// Healthy (or deliberately stopping): a later crash starts
+				// backoff over instead of inheriting old failures.
+				backoffAttempt = 0
 				continue
 			}
 			exitCode := unit.Snapshot().ExitCode
 			if _, blocked := preventStatuses[exitCode]; blocked {
 				return
 			}
-			shouldRestart := false
-			switch restart {
-			case "always":
-				shouldRestart = true
-			case "on-failure":
-				shouldRestart = exitCode != 0
-			}
-			if !shouldRestart {
+			if !unit.ShouldRestart(restart, exitCode) {
 				return
 			}
-			restartCount := unit.RecordRestart(time.Now(), startLimitInterval)
-			if restartCount > startLimitBurst {
-				unit.MarkFailed("Start request repeated too quickly")
-				unit.Log(logging.LevelError, "Start request repeated too quickly.")
-				return
+			backoffAttempt++
+			restartCount := backoffAttempt
+			if limited {
+				restartCount = unit.RecordRestart(time.Now(), startLimitInterval)
+				if restartCount > startLimitBurst {
+					unit.MarkFailed("Start request repeated too quickly")
+					unit.Log(logging.LevelError, "Start request repeated too quickly.")
+					return
+				}
 			}
-			unit.Log(logging.LevelInfo, fmt.Sprintf("Restarting service (attempt %d).", restartCount))
-			time.Sleep(restartSec)
+			delay := unit.RestartDelay(backoffAttempt)
+			if delay > 0 {
+				unit.Log(logging.LevelInfo, fmt.Sprintf("Restarting service in %s (attempt %d).", delay, restartCount))
+				time.Sleep(delay)
+			} else {
+				unit.Log(logging.LevelInfo, fmt.Sprintf("Restarting service (attempt %d).", restartCount))
+			}
 			// A stop may have been requested while we were waiting; don't
 			// resurrect a service the user asked to bring down.
 			if unit.StopRequested() {
@@ -1461,6 +1456,10 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		"DefaultDependencies": cfg.DefaultDependencies,
 		"ExecStart":           cfg.Service.ExecStart,
 		"WantedBy":            strings.Join(cfg.Install.WantedBy, " "),
+		"Restart":             cfg.Service.Restart,
+		"RestartSec":          cfg.Service.RestartSec,
+		"StartLimitIntervalSec": cfg.StartLimitIntervalSec,
+		"StartLimitBurst":       cfg.StartLimitBurst,
 	}
 	if effState == service.StateActive && snap.State != service.StateActive && effPID > 0 {
 		// Externally started (SysV / nohup / manual). Keep Result for

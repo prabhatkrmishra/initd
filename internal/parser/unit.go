@@ -22,6 +22,8 @@ type Unit struct {
 	BindsTo             []string
 	DefaultDependencies string
 	ConditionPathExists []string
+	StartLimitIntervalSec string
+	StartLimitBurst       string
 	Service             ServiceSection
 	Socket              SocketSection
 	Install             InstallSection
@@ -41,6 +43,8 @@ type ServiceSection struct {
 	ExecReload               []string
 	Restart                  string
 	RestartSec               string
+	RestartSteps             string
+	RestartMaxDelaySec       string
 	RestartPreventExitStatus string
 	SuccessExitStatus        string
 	PIDFile                  string
@@ -320,6 +324,10 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				} else {
 					unit.ConditionPathExists = append(unit.ConditionPathExists, value)
 				}
+			case "StartLimitIntervalSec":
+				unit.StartLimitIntervalSec = value
+			case "StartLimitBurst":
+				unit.StartLimitBurst = value
 			default:
 				unit.Ignored["Unit."+key] = value
 			}
@@ -368,6 +376,10 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				unit.Service.Restart = value
 			case "RestartSec":
 				unit.Service.RestartSec = value
+			case "RestartSteps":
+				unit.Service.RestartSteps = value
+			case "RestartMaxDelaySec":
+				unit.Service.RestartMaxDelaySec = value
 			case "RestartPreventExitStatus":
 				unit.Service.RestartPreventExitStatus = value
 			case "SuccessExitStatus":
@@ -542,6 +554,12 @@ func mergeUnit(base, overlay *Unit) {
 	if len(overlay.ConditionPathExists) > 0 {
 		base.ConditionPathExists = append(base.ConditionPathExists, overlay.ConditionPathExists...)
 	}
+	if overlay.StartLimitIntervalSec != "" {
+		base.StartLimitIntervalSec = overlay.StartLimitIntervalSec
+	}
+	if overlay.StartLimitBurst != "" {
+		base.StartLimitBurst = overlay.StartLimitBurst
+	}
 	// Service
 	if overlay.Service.Type != "" {
 		base.Service.Type = overlay.Service.Type
@@ -573,6 +591,12 @@ func mergeUnit(base, overlay *Unit) {
 	}
 	if overlay.Service.RestartSec != "" {
 		base.Service.RestartSec = overlay.Service.RestartSec
+	}
+	if overlay.Service.RestartSteps != "" {
+		base.Service.RestartSteps = overlay.Service.RestartSteps
+	}
+	if overlay.Service.RestartMaxDelaySec != "" {
+		base.Service.RestartMaxDelaySec = overlay.Service.RestartMaxDelaySec
 	}
 	if overlay.Service.RestartPreventExitStatus != "" {
 		base.Service.RestartPreventExitStatus = overlay.Service.RestartPreventExitStatus
