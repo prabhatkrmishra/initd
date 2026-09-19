@@ -470,6 +470,47 @@ systemctl --user status myapp
 
 ------
 
+#### Detaching and surviving the terminal
+
+A bare `initd --init` stays attached to the launching terminal and dies with
+it. For anything beyond a quick test, detach:
+
+```
+initd --init --daemonize
+```
+
+This forks into a new session, appends daemon output to
+`$XDG_RUNTIME_DIR/initd-daemon.log`, records
+`$XDG_RUNTIME_DIR/initd.pid`, and exits 0 once the child is up. Hooks and
+boot scripts can wait on the pid file instead of `pgrep`:
+
+```
+for _ in $(seq 1 40); do
+  [ -f "$XDG_RUNTIME_DIR/initd.pid" ] && kill -0 "$(cat "$XDG_RUNTIME_DIR/initd.pid")" 2>/dev/null && break
+  sleep 0.25
+done
+```
+
+`--pid-file` / `--log-file` override the defaults. The pid file is removed
+on clean shutdown only when it still points at the exiting daemon, so a
+restart race never deletes its successor's file.
+
+#### Starting at boot without login
+
+`install.sh` covers session login via `/etc/profile.d/initd.sh`. Where no
+login happens at boot (headless chroot, Termux, containers), hook the host's
+boot event to the same one-liner, e.g. a Termux:Boot script at
+`~/.termux/boot/initd.sh`:
+
+```
+#!/data/data/com.termux/files/usr/bin/sh
+# Enter the chroot however you normally do, then:
+chroot /path/to/rootfs /usr/bin/initd --init --daemonize
+```
+
+The flock singleton plus stale-socket cleanup means a second invocation is a
+safe no-op: if the daemon is already up it exits quietly.
+
 ## Notes
 
 - `initd` automatically detects whether it is running as PID 1

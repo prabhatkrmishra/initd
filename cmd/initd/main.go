@@ -10,7 +10,10 @@ import (
 	"initd/internal/supervisor"
 	"initd/internal/userpaths"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,10 +22,35 @@ import (
 const initdVersion = "1.0.3"
 
 func main() {
-	socketPath, initMode, err := parseArgs(os.Args[1:])
+	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "%v", err)
 		os.Exit(1)
+	}
+	socketPath := cfg.socketPath
+	initMode := cfg.initMode
+
+	// A supervisor must not die with its launching terminal. Ignore hangup
+	// in every mode; --daemonize additionally leaves the session entirely.
+	signal.Ignore(syscall.SIGHUP)
+
+	if cfg.daemonize && os.Getpid() == 1 {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+		 "--daemonize refused under PID 1: the initial parent exit would panic the kernel; run without --daemonize as init")
+		os.Exit(1)
+	}
+	if cfg.daemonize && os.Getenv("INITD_DAEMONIZED") != "1" {
+		if err := spawnDetached(cfg); err != nil {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "daemonize: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if cfg.pidFile != "" {
+		if err := writePidFile(cfg.pidFile); err != nil {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "pid file %s: %v", cfg.pidFile, err)
+			os.Exit(1)
+		}
 	}
 
 	signals := make(chan os.Signal, 16)
@@ -221,7 +249,7 @@ func main() {
 				case sig := <-signals:
 					switch sig {
 					case syscall.SIGTERM:
-						shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager)
+						shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
 					}
 				}
 			}
@@ -230,16 +258,16 @@ func main() {
 	// socket-only mode
 	sig := <-signals
 	if sig == syscall.SIGTERM {
-		shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager)
+		shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
 	}
 
 }
 
 // shutdownDaemon performs a clean shutdown on SIGTERM: it stops managed units,
-// removes the IPC sockets and releases the locks, then exits. This lets a
-// replacement daemon (e.g. from install.sh's restart) take over without a stale
-// socket or lock leaving a split-brain supervisor behind.
-func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File, systemManager, userManager *supervisor.Manager) {
+// removes the IPC sockets, pid file and releases the locks, then exits. This
+// lets a replacement daemon (e.g. from install.sh's restart) take over without
+// a stale socket or lock leaving a split-brain supervisor behind.
+func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File, systemManager, userManager *supervisor.Manager, pidFile string) {
 	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "received SIGTERM, shutting down")
 	userManager.StopAllUnits()
 	systemManager.StopAllUnits()
@@ -247,6 +275,7 @@ func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File
 	if socketPath != userSocket {
 		_ = os.Remove(socketPath)
 	}
+	removeOwnPidFile(pidFile)
 	if userLock != nil {
 		_ = userLock.Close()
 	}
@@ -254,6 +283,21 @@ func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File
 		_ = systemLock.Close()
 	}
 	os.Exit(0)
+}
+
+// removeOwnPidFile deletes the pid file only when it still points at this
+// process, so shutdown never removes a successor's file after a restart race.
+func removeOwnPidFile(path string) {
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid == os.Getpid() {
+		_ = os.Remove(path)
+	}
 }
 
 // startDBusServers registers org.freedesktop.systemd1 on the D-Bus session bus
@@ -287,9 +331,116 @@ func startDBusServers(systemManager, userManager *supervisor.Manager) {
 	}
 }
 
-func parseArgs(args []string) (string, bool, error) {
-	socketPath := "/run/initd.sock"
-	initMode := true
+// daemonConfig carries the process-level options: where to listen, which
+// mode to run, and (for --daemonize) where to record the detached PID.
+type daemonConfig struct {
+	socketPath string
+	initMode   bool
+	daemonize  bool
+	pidFile    string
+	logFile    string
+}
+
+// runtimeDir returns a writable per-uid directory for pid/log files,
+// mirroring the XDG_RUNTIME_DIR convention install.sh establishes.
+func runtimeDir() string {
+	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
+		return d
+	}
+	uid := os.Getuid()
+	if uid == 0 {
+		return "/run"
+	}
+	return fmt.Sprintf("/run/user/%d", uid)
+}
+
+func defaultPidFile() string { return filepath.Join(runtimeDir(), "initd.pid") }
+func defaultLogFile() string { return filepath.Join(runtimeDir(), "initd-daemon.log") }
+
+// spawnDetached re-executes this binary without --daemonize in a new session
+// (setsid) with stdio wired to the log file, then waits for the child to
+// record its pid file. The parent exits 0 once the child is up; startup
+// failures surface through a missing pid file instead of a lost terminal.
+func spawnDetached(cfg daemonConfig) error {
+	logPath := cfg.logFile
+	if logPath == "" {
+		logPath = defaultLogFile()
+	}
+	if dir := filepath.Dir(logPath); dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	logF, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open log file %s: %w", logPath, err)
+	}
+	defer logF.Close()
+
+	null, err := os.OpenFile("/dev/null", os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/null: %w", err)
+	}
+	defer null.Close()
+
+	childArgs := []string{}
+	for _, a := range os.Args[1:] {
+		if a == "--daemonize" {
+			continue
+		}
+		childArgs = append(childArgs, a)
+	}
+	cmd := exec.Command(os.Args[0], childArgs...)
+	cmd.Env = append(os.Environ(), "INITD_DAEMONIZED=1")
+	cmd.Dir = "/"
+	cmd.Stdin = null
+	cmd.Stdout = logF
+	cmd.Stderr = logF
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start detached child: %w", err)
+	}
+	// Detached: do not wait (that would reattach fate to the child).
+	// Confirm it stays alive and records its pid file.
+	pidPath := cfg.pidFile
+	if pidPath == "" {
+		pidPath = defaultPidFile()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(pidPath); err == nil {
+			return nil
+		}
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			return fmt.Errorf("child exited before writing %s", pidPath)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for %s", pidPath)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// writePidFile records the daemon PID so hooks and boot scripts can wait on
+// a file instead of pgrep. Stale files from a dead owner are replaced.
+func writePidFile(path string) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	if raw, err := os.ReadFile(path); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 1 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				if err := proc.Signal(syscall.Signal(0)); err == nil {
+					return fmt.Errorf("pid file %s already owned by live PID %d", path, pid)
+				}
+			}
+		}
+	}
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644)
+}
+
+func parseArgs(args []string) (daemonConfig, error) {
+	cfg := daemonConfig{socketPath: "/run/initd.sock", initMode: true}
 	socketProvided := false
 
 	for i := 0; i < len(args); i++ {
@@ -302,31 +453,52 @@ func parseArgs(args []string) (string, bool, error) {
 			printVersion()
 			os.Exit(0)
 		case arg == "--init":
-			initMode = true
+			cfg.initMode = true
+		case arg == "--daemonize":
+			cfg.daemonize = true
+		case arg == "--pid-file":
+			i++
+			if i >= len(args) {
+				return cfg, fmt.Errorf("--pid-file requires a path")
+			}
+			cfg.pidFile = args[i]
+		case strings.HasPrefix(arg, "--pid-file="):
+			cfg.pidFile = strings.TrimPrefix(arg, "--pid-file=")
+		case arg == "--log-file":
+			i++
+			if i >= len(args) {
+				return cfg, fmt.Errorf("--log-file requires a path")
+			}
+			cfg.logFile = args[i]
+		case strings.HasPrefix(arg, "--log-file="):
+			cfg.logFile = strings.TrimPrefix(arg, "--log-file=")
 		case arg == "--socket":
 			socketProvided = true
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				socketPath = args[i+1]
+				cfg.socketPath = args[i+1]
 				i++
 			}
 		case strings.HasPrefix(arg, "--socket="):
 			socketProvided = true
 			value := strings.TrimPrefix(arg, "--socket=")
 			if value != "" {
-				socketPath = value
+				cfg.socketPath = value
 			}
 		case arg == "":
 			continue
 		default:
-			return "", false, fmt.Errorf("unknown argument: %s", arg)
+			return cfg, fmt.Errorf("unknown argument: %s", arg)
 		}
 	}
 
 	if socketProvided {
-		initMode = false
+		cfg.initMode = false
+	}
+	if cfg.daemonize && cfg.pidFile == "" {
+		cfg.pidFile = defaultPidFile()
 	}
 
-	return socketPath, initMode, nil
+	return cfg, nil
 }
 
 func printHelp() {
@@ -339,6 +511,13 @@ Options:
   --init               Run as init/supervisor (autostart enabled units).
   --socket[=PATH]      Run as a pure daemon/service manager without init/PID1 behaviors.
                        If PATH omitted, defaults to /run/initd.sock.
+  --daemonize          Detach into a new session (setsid), wire stdio to the
+                       log file and record a pid file, then exit 0. Combine
+                       with --init for boot/login hooks.
+  --pid-file[=PATH]    Write the daemon PID here (default $XDG_RUNTIME_DIR/initd.pid).
+                       Implied by --daemonize.
+  --log-file[=PATH]    Append daemon output here when detaching
+                       (default $XDG_RUNTIME_DIR/initd-daemon.log).
   -h, --help           Show this help.
   -V, --version        Show version.
 

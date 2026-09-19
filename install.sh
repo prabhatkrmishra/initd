@@ -221,14 +221,24 @@ if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
 else
     dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
 fi
-if ! pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
+PIDFILE="$XDG_RUNTIME_DIR/initd.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    : # daemon already running
+else
     # A login spawned by sudo (or a chroot entrypoint) inherits SUDO_USER*,
     # which would make initd's RealUID() resolve to the sudo user and route
     # its user-manager at that user's units. Clear them so a root daemon is a
     # true root user-manager ($HOME=/root, /root/.config/systemd/user).
     unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND
-    nohup initd --init >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
-    disown 2>/dev/null || true
+    rm -f "$PIDFILE"
+    # Self-detaching start: pid file + log handled by the daemon itself.
+    # Fall back to the old nohup path for binaries predating --daemonize.
+    if ! initd --init --daemonize --pid-file "$PIDFILE" >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1; then
+      if ! pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
+        nohup initd --init >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
+        disown 2>/dev/null || true
+      fi
+    fi
 fi
 EOSH
 as_root install -m 0755 "$tmp_autostart" "$AUTOSTART_FILE"
@@ -283,13 +293,32 @@ rm -f "$XDG_RUNTIME_DIR/initd.sock" "$XDG_RUNTIME_DIR/initd.lock" \
 # the installer's invocation so the daemon's RealUID()/user-manager is the real
 # invoking user (root here), not the sudo'ing user.
 unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND
-nohup "$INITD_DST" --init >"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
-disown 2>/dev/null || true
-sleep 3
-if ! pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
-  echo "ERROR: initd daemon failed to start. Log:" >&2
-  tail -20 "$XDG_RUNTIME_DIR/initd-daemon.log" >&2 || true
-  exit 1
+DAEMON_PIDFILE="$XDG_RUNTIME_DIR/initd.pid"
+rm -f "$DAEMON_PIDFILE"
+if ! "$INITD_DST" --init --daemonize --pid-file "$DAEMON_PIDFILE" >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1; then
+  echo "daemonize failed, falling back to nohup start." >&2
+  nohup "$INITD_DST" --init >"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
+  disown 2>/dev/null || true
+  sleep 3
+  # No pid file on this path: fall back to process-name readiness.
+  if ! pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
+    echo "ERROR: initd daemon failed to start. Log:" >&2
+    tail -20 "$XDG_RUNTIME_DIR/initd-daemon.log" >&2 || true
+    exit 1
+  fi
+else
+  # Wait for the pid file (not just any matching process name) as readiness.
+  for _ in $(seq 1 40); do
+    if [ -f "$DAEMON_PIDFILE" ] && kill -0 "$(cat "$DAEMON_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if ! [ -f "$DAEMON_PIDFILE" ] || ! kill -0 "$(cat "$DAEMON_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "ERROR: initd daemon failed to start. Log:" >&2
+    tail -20 "$XDG_RUNTIME_DIR/initd-daemon.log" >&2 || true
+    exit 1
+  fi
 fi
 
 # --- verify --------------------------------------------------------------------
