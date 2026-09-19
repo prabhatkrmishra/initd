@@ -181,9 +181,47 @@ func runListBoots(opts journalOpts) int {
 }
 
 func runDiskUsage(opts journalOpts) int {
-	_, dirs := journalScope(opts)
+	sockets, dirs := journalScope(opts)
 	var bytes, files int64
+	var daemonDirs []string
+	for _, sock := range sockets {
+		if sock == "" {
+			continue
+		}
+		client := &ipc.Client{SocketPath: sock}
+		resp, err := client.Do(ipc.Request{Action: "journal-usage"})
+		if err != nil || !resp.Success {
+			continue
+		}
+		var data struct {
+			Bytes int64  `json:"bytes"`
+			Files int64  `json:"files"`
+			Dir   string `json:"dir"`
+		}
+		raw, _ := json.Marshal(resp.Data)
+		if err := json.Unmarshal(raw, &data); err != nil {
+			continue
+		}
+		bytes += data.Bytes
+		files += data.Files
+		if data.Dir != "" {
+			daemonDirs = append(daemonDirs, data.Dir)
+		}
+	}
+	// Any scope the daemon didn't answer (down, --directory, --file) falls
+	// back to local files. Daemon-covered dirs are skipped so nothing is
+	// counted twice when client and daemon envs disagree.
 	for _, d := range dirs {
+		skip := false
+		for _, covered := range daemonDirs {
+			if d == covered {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
 		if strings.HasPrefix(d, "file:") {
 			if st, err := os.Stat(strings.TrimPrefix(d, "file:")); err == nil {
 				bytes += st.Size()

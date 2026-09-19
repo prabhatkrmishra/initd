@@ -51,12 +51,15 @@ func TestDispatchJournalFilters(t *testing.T) {
 	if !resp.Success {
 		t.Fatalf("journal-usage: %v", resp.Message)
 	}
-	usage, ok := resp.Data.(map[string]int64)
+	usage, ok := resp.Data.(map[string]any)
 	if !ok {
 		t.Fatalf("usage Data = %T", resp.Data)
 	}
 	if _, ok := usage["bytes"]; !ok {
 		t.Fatalf("usage missing bytes: %+v", usage)
+	}
+	if dir, ok := usage["dir"].(string); !ok || dir == "" {
+		t.Fatalf("usage missing daemon dir: %+v", usage)
 	}
 	for _, act := range []string{"journal-sync", "journal-rotate", "journal-vacuum"} {
 		if resp := dispatch(Request{Action: act}, m); !resp.Success {

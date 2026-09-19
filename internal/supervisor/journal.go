@@ -112,6 +112,10 @@ func (m *Manager) RotateJournal() error {
 
 // JournalUsage totals durable files: bytes and file count, like
 // journalctl --disk-usage in terse form.
+//
+// The dir is included because the client's environment (HOME, XDG_STATE_HOME)
+// can resolve to a different path than the daemon's — the daemon's answer
+// is the one that matters.
 func (m *Manager) JournalUsage() map[string]int64 {
 	var bytes int64
 	var files int64
@@ -122,6 +126,12 @@ func (m *Manager) JournalUsage() map[string]int64 {
 		}
 	}
 	return map[string]int64{"bytes": bytes, "files": files}
+}
+
+// ActiveJournalDir reports the durable dir this manager actually writes to.
+// The client prefers it over recomputing from its own environment.
+func (m *Manager) ActiveJournalDir() string {
+	return m.defaultJournalDir()
 }
 
 // VacuumJournal drops old generations until bytes/files/age fit. Zero means

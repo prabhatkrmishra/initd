@@ -384,7 +384,12 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true, Data: logging.BootList(entries)}
 	case "journal-usage":
-		return Response{Success: true, Data: manager.JournalUsage()}
+		usage := manager.JournalUsage()
+		return Response{Success: true, Data: map[string]any{
+			"bytes": usage["bytes"],
+			"files": usage["files"],
+			"dir":   manager.ActiveJournalDir(),
+		}}
 	case "journal-vacuum":
 		if err := manager.VacuumJournal(req.MaxBytes, req.MaxFiles, req.MaxDays); err != nil {
 			return Response{Success: false, Message: err.Error()}
