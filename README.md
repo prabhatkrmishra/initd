@@ -126,7 +126,7 @@ Shutdown is performed in a controlled manner:
 - No systemd
 - No D-Bus
 - No cgroups
-- No journald
+- No journald (initd keeps its own JSONL journal instead)
 
 Communication uses a simple Unix domain socket.
 Access control relies on filesystem permissions.

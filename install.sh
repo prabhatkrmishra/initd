@@ -18,7 +18,7 @@
 #        /usr/bin/systemctl.real.systemd255               (backup of real systemd systemctl)
 #        /usr/bin/loginctl                               (initd compatibility shim)
 #        /usr/bin/loginctl.real                         (backup of real loginctl, if any)
-#        /usr/bin/journalctl                             (log viewer for the in-memory ring)
+#        /usr/bin/journalctl                             (query the on-disk journal)
 #        /usr/bin/journalctl.real                       (backup of real journalctl, if any)
 #        /usr/share/dbus-1/services/org.freedesktop.systemd1.service
 #        /usr/share/dbus-1/system.d/org.freedesktop.systemd1.conf

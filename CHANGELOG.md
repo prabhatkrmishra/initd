@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-19
+
+### Added
+- Disk-backed journal: every log line now goes to a per-boot JSONL file
+  (`/var/log/initd/journal` for system, `~/.local/state/initd/journal` for
+  user) with journal-style fields, wall-clock time, priorities and cursors.
+  Files rotate at 10M, sequence numbers continue across restarts, torn lines
+  from a crash are skipped on read, and the RAM ring stays as a hot cache.
+- `journalctl` now behaves like the real one: time/priority/grep/identifier/
+  boot/cursor filters, all output modes (`short*`, `cat`, `verbose`,
+  `export`, `json*`, `with-unit`), pager support, `-r`/`--utc`, cursors with
+  cursor files, `-D`/`--file`/`--root`, admin verbs (`--list-boots`,
+  `--disk-usage`, `--vacuum-*`, `--verify`, `--sync`, `--flush`,
+  `--rotate`, `--header`, `-N`/`-F`), offline reads when the daemon is down,
+  and poll-based `-f` follow.
+- Daemon query endpoints for the above: `journal` with full filter support
+  plus `journal-boots`, `journal-usage`, `journal-sync`, `journal-rotate`
+  and `journal-vacuum`.
+- SysV adopt: `/etc/init.d` scripts without a native unit become generated
+  oneshot wrappers (`active (exited)`, native units win, LSB descriptions).
+- `RemainAfterExit`/`SubState` support so oneshot units display honestly.
+- Self-detaching daemon: `initd --init --daemonize` with pid/log files,
+  SIGHUP-proof in all modes, refused under PID 1.
+- Hardening honesty: unenforced sandbox directives warn at start, in
+  `status`, and via `show` as `IgnoredDirectives`.
+- External process detection: units started outside initd report
+  `active (external)` with the real PID instead of a lying `inactive`.
+- Stale-unit detection: live `NeedDaemonReload` over D-Bus plus a stderr
+  nudge on status/show/list when files changed on disk.
+- Real restart policy: `StartLimit*`, exponential `RestartSteps`/
+  `RestartMaxDelaySec` backoff, on-success/on-abnormal modes, and
+  `SuccessExitStatus`-aware on-failure.
+
+### Changed
+- `systemctl log` removed (never released; `journalctl -u` owns log viewing,
+  `systemctl status` keeps its inline tail).
+- `--disk-usage` counts the daemon's actual journal dir instead of
+  recomputing from client env.
+- Version markers bumped to `1.1.0` across binaries and D-Bus.
+
+### Packaging
+- Release artifacts: `releases/initd_1.1.0_linux_arm64.zip` and
+  `releases/initd_1.1.0_linux_amd64.zip`, each containing `initd` +
+  `systemctl` + `loginctl` + `journalctl` + `install.sh` with `sha256sum`.
+
 ## [1.0.3] - 2026-09-02
 
 ### Fixed

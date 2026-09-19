@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const initdVersion = "1.0.3"
+const initdVersion = "1.1.0"
 
 func main() {
 	cfg, err := parseArgs(os.Args[1:])
