@@ -923,6 +923,8 @@ func printStatus(status ipc.StatusData, enabled string) {
 	activeLine := string(status.State)
 	if status.State == "active" && status.LastError == "external-process" {
 		activeLine = "active (external)"
+	} else if status.State == "active" && status.SubState == "exited" {
+		activeLine = "active (exited)"
 	} else if status.State == "active" {
 		activeLine = "active (running)"
 	}
@@ -945,6 +947,9 @@ func printStatus(status ipc.StatusData, enabled string) {
 		if status.LastError == "external-process" {
 			fmt.Printf("   Note: process running outside initd (SysV/manual/nohup); adopt with `systemctl restart %s` to supervise\n", status.Name)
 		}
+	} else if status.State == "active" && status.SubState == "exited" {
+		// Oneshot with RemainAfterExit: no process to show, like systemd.
+		fmt.Printf("    Tasks: 0\n")
 	}
 
 	if status.LastError != "" && status.LastError != "external-process" {

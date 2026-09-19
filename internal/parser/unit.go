@@ -9,25 +9,28 @@ import (
 )
 
 type Unit struct {
-	Name                string
-	Type                string
-	Description         string
-	After               []string
-	Before              []string
-	Requires            []string
-	Wants               []string
-	Conflicts           []string
-	OnFailure           []string
-	PartOf              []string
-	BindsTo             []string
-	DefaultDependencies string
-	ConditionPathExists []string
+	Name                  string
+	Type                  string
+	Description           string
+	After                 []string
+	Before                []string
+	Requires              []string
+	Wants                 []string
+	Conflicts             []string
+	OnFailure             []string
+	PartOf                []string
+	BindsTo               []string
+	DefaultDependencies   string
+	ConditionPathExists   []string
 	StartLimitIntervalSec string
 	StartLimitBurst       string
-	Service             ServiceSection
-	Socket              SocketSection
-	Install             InstallSection
-	Ignored             map[string]string
+	// GeneratedFrom records the non-unit source a unit was synthesized
+	// from (e.g. a SysV init script path). Empty for file-backed units.
+	GeneratedFrom string
+	Service       ServiceSection
+	Socket        SocketSection
+	Install       InstallSection
+	Ignored       map[string]string
 }
 
 type ServiceSection struct {
@@ -45,6 +48,7 @@ type ServiceSection struct {
 	RestartSec               string
 	RestartSteps             string
 	RestartMaxDelaySec       string
+	RemainAfterExit          string
 	RestartPreventExitStatus string
 	SuccessExitStatus        string
 	PIDFile                  string
@@ -380,6 +384,8 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				unit.Service.RestartSteps = value
 			case "RestartMaxDelaySec":
 				unit.Service.RestartMaxDelaySec = value
+			case "RemainAfterExit":
+				unit.Service.RemainAfterExit = value
 			case "RestartPreventExitStatus":
 				unit.Service.RestartPreventExitStatus = value
 			case "SuccessExitStatus":
@@ -597,6 +603,9 @@ func mergeUnit(base, overlay *Unit) {
 	}
 	if overlay.Service.RestartMaxDelaySec != "" {
 		base.Service.RestartMaxDelaySec = overlay.Service.RestartMaxDelaySec
+	}
+	if overlay.Service.RemainAfterExit != "" {
+		base.Service.RemainAfterExit = overlay.Service.RemainAfterExit
 	}
 	if overlay.Service.RestartPreventExitStatus != "" {
 		base.Service.RestartPreventExitStatus = overlay.Service.RestartPreventExitStatus

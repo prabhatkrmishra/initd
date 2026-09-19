@@ -38,6 +38,10 @@ type Manager struct {
 	// LoadUnits. Compared by NeedDaemonReload to detect added/removed
 	// units, edits and drop-in changes.
 	unitFilesFP map[string]string
+	// SysVInitDir is scanned for LSB init scripts lacking a native unit
+	// (system scope only). Empty disables the SysV generator; tests
+	// override it with a temp dir.
+	SysVInitDir string
 }
 
 type socketRuntime struct {
@@ -68,6 +72,7 @@ func NewSystemManager() *Manager {
 		},
 		EnabledRoot: "/etc/systemd/system",
 		UserMode:    false,
+		SysVInitDir: "/etc/init.d",
 	}
 }
 
@@ -205,6 +210,13 @@ func (m *Manager) LoadUnits() error {
 
 	m.Units = units
 	m.UnitOrder = order
+	// SysV fallback after native units: /etc/init.d scripts without a
+	// matching unit file become generated oneshot wrappers. Appends to the
+	// same maps so LoadUnits stays the single source of truth.
+	// User managers never scan the host init dir; system managers always
+	// do so they pick up SysV-only services. Generated units drive their
+	// own reaping through runCommandStatus, so no reaper is needed.
+	m.loadSysVUnits(m.Units, &m.UnitOrder)
 	m.SocketUnits = newSocketUnits
 	m.SocketPaths = newSocketPaths
 	// Clean up runtimes for removed socket units
@@ -1432,32 +1444,34 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 	effState, effPID := unit.EffectiveState()
 	cfg := unit.Config
 	data := map[string]string{
-		"Id":                  cfg.Name,
-		"Names":               cfg.Name,
-		"Description":         unit.Description(),
-		"LoadState":           "loaded",
-		"ActiveState":         string(effState),
-		"SubState":            string(effState),
-		"FragmentPath":        unit.Path,
-		"UnitFileState":       m.UnitFileState(cfg.Name),
-		"MainPID":             fmt.Sprintf("%d", effPID),
-		"ExecMainPID":         fmt.Sprintf("%d", effPID),
-		"ExitCode":            fmt.Sprintf("%d", snap.ExitCode),
-		"Result":              snap.LastError,
-		"Type":                cfg.Service.Type,
-		"After":               strings.Join(cfg.After, " "),
-		"Before":              strings.Join(cfg.Before, " "),
-		"Requires":            strings.Join(cfg.Requires, " "),
-		"Wants":               strings.Join(cfg.Wants, " "),
-		"Conflicts":           strings.Join(cfg.Conflicts, " "),
-		"OnFailure":           strings.Join(cfg.OnFailure, " "),
-		"PartOf":              strings.Join(cfg.PartOf, " "),
-		"BindsTo":             strings.Join(cfg.BindsTo, " "),
-		"DefaultDependencies": cfg.DefaultDependencies,
-		"ExecStart":           cfg.Service.ExecStart,
-		"WantedBy":            strings.Join(cfg.Install.WantedBy, " "),
-		"Restart":             cfg.Service.Restart,
-		"RestartSec":          cfg.Service.RestartSec,
+		"Id":                    cfg.Name,
+		"Names":                 cfg.Name,
+		"Description":           unit.Description(),
+		"LoadState":             "loaded",
+		"ActiveState":           string(effState),
+		"SubState":              string(effState),
+		"FragmentPath":          unit.Path,
+		"UnitFileState":         m.UnitFileState(cfg.Name),
+		"MainPID":               fmt.Sprintf("%d", effPID),
+		"ExecMainPID":           fmt.Sprintf("%d", effPID),
+		"ExitCode":              fmt.Sprintf("%d", snap.ExitCode),
+		"Result":                snap.LastError,
+		"Type":                  cfg.Service.Type,
+		"RemainAfterExit":       cfg.Service.RemainAfterExit,
+		"SourcePath":            cfg.GeneratedFrom,
+		"After":                 strings.Join(cfg.After, " "),
+		"Before":                strings.Join(cfg.Before, " "),
+		"Requires":              strings.Join(cfg.Requires, " "),
+		"Wants":                 strings.Join(cfg.Wants, " "),
+		"Conflicts":             strings.Join(cfg.Conflicts, " "),
+		"OnFailure":             strings.Join(cfg.OnFailure, " "),
+		"PartOf":                strings.Join(cfg.PartOf, " "),
+		"BindsTo":               strings.Join(cfg.BindsTo, " "),
+		"DefaultDependencies":   cfg.DefaultDependencies,
+		"ExecStart":             cfg.Service.ExecStart,
+		"WantedBy":              strings.Join(cfg.Install.WantedBy, " "),
+		"Restart":               cfg.Service.Restart,
+		"RestartSec":            cfg.Service.RestartSec,
 		"StartLimitIntervalSec": cfg.StartLimitIntervalSec,
 		"StartLimitBurst":       cfg.StartLimitBurst,
 	}
@@ -1468,6 +1482,11 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		if data["Result"] == "" {
 			data["Result"] = "external-process"
 		}
+	}
+	if unit.RemainActive() {
+		// Oneshot with RemainAfterExit: systemd reports SubState=exited
+		// to distinguish "active (exited)" from a running process.
+		data["SubState"] = string(unit.SubState())
 	}
 	if !snap.StartedAt.IsZero() {
 		data["ActiveEnterTimestamp"] = snap.StartedAt.Format(time.RFC3339)

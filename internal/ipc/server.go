@@ -34,6 +34,7 @@ type StatusData struct {
 	Name                string        `json:"name"`
 	Description         string        `json:"description"`
 	State               service.State `json:"state"`
+	SubState            string        `json:"sub_state,omitempty"`
 	MainPID             int           `json:"main_pid"`
 	StartedAt           time.Time     `json:"started_at"`
 	FinishedAt          time.Time     `json:"finished_at"`
@@ -182,6 +183,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 				Name:                unit.Config.Name,
 				Description:         unit.Description(),
 				State:               effState,
+				SubState:            string(unit.SubState()),
 				MainPID:             effPID,
 				StartedAt:           snapshot.StartedAt,
 				FinishedAt:          snapshot.FinishedAt,

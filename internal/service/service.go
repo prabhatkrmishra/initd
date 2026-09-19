@@ -441,6 +441,22 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		}
 	}
 
+	// Oneshot units kept Active by RemainAfterExit have no process to reap:
+	// a successful ExecStop means the stop is done.
+	u.mu.Lock()
+	remainDone := u.Runtime.State == StateActive && u.Runtime.MainPID == 0
+	u.mu.Unlock()
+	if remainDone && u.remainAfterExit() {
+		u.mu.Lock()
+		u.Runtime.State = StateInactive
+		u.Runtime.LastError = ""
+		u.Runtime.ExitCode = 0
+		u.Runtime.FinishedAt = time.Now()
+		u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+		u.mu.Unlock()
+		return nil
+	}
+
 	serviceType := u.canonicalServiceType()
 	killProcessGroup := !u.killModeProcess()
 
@@ -1012,7 +1028,13 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		}
 		u.Runtime.ExitCode = exitCode
 	} else {
-		if u.Runtime.State != StateActive {
+		if u.remainAfterExit() {
+			// Clean oneshot exit with RemainAfterExit=yes: stay Active
+			// with no main PID (systemd's "active (exited)").
+			u.Runtime.State = StateActive
+			u.Runtime.MainPID = 0
+			u.Runtime.LastError = ""
+		} else if u.Runtime.State != StateActive {
 			u.Runtime.State = StateInactive
 		}
 		u.Runtime.ExitCode = exitCode
@@ -1616,6 +1638,41 @@ func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
 	return parseExitStatusSet(u.Config.Service.RestartPreventExitStatus)
 }
 
+// remainAfterExit reports whether a clean oneshot exit should leave the unit
+// Active (systemd's RemainAfterExit=yes). Only meaningful for oneshot; other
+// types ignore the setting just like systemd does. The type is read raw
+// (not via canonicalServiceType) so probing never emits duplicate
+// "unsupported type" log lines on the exit path.
+func (u *Unit) remainAfterExit() bool {
+	if strings.ToLower(strings.TrimSpace(u.Config.Service.Type)) != "oneshot" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(u.Config.Service.RemainAfterExit)) {
+	case "yes", "true", "1", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// RemainActive reports whether the unit is kept Active after its process
+// exited cleanly (oneshot + RemainAfterExit=yes). Display layers use it for
+// the "active (exited)" state.
+func (u *Unit) RemainActive() bool {
+	snap := u.Snapshot()
+	return snap.State == StateActive && snap.MainPID == 0 && u.remainAfterExit()
+}
+
+// SubState refines Active for display: oneshot units kept alive by
+// RemainAfterExit report "exited" (systemd's active (exited)), everything
+// else mirrors the raw state.
+func (u *Unit) SubState() State {
+	if u.RemainActive() {
+		return State("exited")
+	}
+	return u.Snapshot().State
+}
+
 // StartLimit reads the unit's StartLimitIntervalSec/StartLimitBurst,
 // defaulting to systemd's 10s window with a burst of 5. An interval <= 0
 // disables rate limiting; a burst <= 0 means no cap inside the window.
@@ -2026,8 +2083,10 @@ func (u *Unit) workingDirectory() string {
 }
 
 func (u *Unit) Description() string {
+	// Descriptions are literal (LSB headers may contain % or $). No
+	// specifier/env expansion here — that belongs to command lines only.
 	if u.Config.Description != "" {
-		return u.expandSpecifiers(u.Config.Description)
+		return u.Config.Description
 	}
 	return u.Config.Name
 }

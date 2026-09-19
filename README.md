@@ -263,6 +263,13 @@ Unit logs live in an in-memory ring (newest last). Read them with
 `systemctl log UNIT [-n N]` or the compatible `journalctl -u UNIT [-n N]`
 shim; follow mode (`-f`) is not supported.
 
+Init scripts without a native unit (`/etc/init.d/*`, system scope only)
+are wrapped automatically as oneshot services with `RemainAfterExit=yes`,
+so `systemctl start foo` runs `foo start` and leaves the unit
+`active (exited)` until `systemctl stop foo` runs `foo stop`. A same-named
+unit file always wins over the generated one, and the script's LSB
+header supplies the description when present.
+
 ## Examples
 
 ### Starting nginx
