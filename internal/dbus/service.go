@@ -630,7 +630,7 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		"Result":                  {Value: "", Writable: false, Emit: prop.EmitTrue},
 		"FragmentPath":            {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
 		"DropInPaths":          {Value: []string{}, Writable: false, Emit: prop.EmitConst},
-		"NeedDaemonReload":     {Value: false, Writable: false, Emit: prop.EmitConst},
+		"NeedDaemonReload":     {Value: mgr.NeedDaemonReload(), Writable: false, Emit: prop.EmitTrue},
 		"SourcePath":              {Value: "", Writable: false, Emit: prop.EmitConst},
 		"MainPID":                 {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
 		"ExecMainPID":             {Value: mainPID, Writable: false, Emit: prop.EmitTrue},

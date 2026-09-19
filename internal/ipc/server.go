@@ -329,6 +329,11 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			return Response{Success: false, Message: err.Error()}
 		}
 		return Response{Success: true}
+	case "need-daemon-reload":
+		if manager == nil {
+			return Response{Success: false, Message: "no manager"}
+		}
+		return Response{Success: true, Data: manager.NeedDaemonReload()}
 	case "reboot", "poweroff", "halt":
 		if manager != nil && manager.UserMode {
 			return Response{Success: false, Message: "reboot/poweroff/halt not allowed for user manager"}

@@ -34,6 +34,10 @@ type Manager struct {
 	bootDone       bool
 	UserMode       bool
 	EnabledRoot    string
+	// unitFilesFP is the fingerprint of unit files as of the last
+	// LoadUnits. Compared by NeedDaemonReload to detect added/removed
+	// units, edits and drop-in changes.
+	unitFilesFP map[string]string
 }
 
 type socketRuntime struct {
@@ -221,6 +225,7 @@ func (m *Manager) LoadUnits() error {
 			delete(m.SocketRuntimes, name)
 		}
 	}
+	m.unitFilesFP = m.currentUnitFilesFingerprint()
 	return nil
 }
 

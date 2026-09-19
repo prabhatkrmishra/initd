@@ -144,6 +144,20 @@ func handleSimple(client *ipc.Client, action string) {
 	}
 }
 
+// warnIfReloadNeeded best-effort checks whether unit files changed on disk
+// since the daemon last loaded them (apt install/purge, edits, drop-ins).
+// Offline or failed checks are silently ignored so degraded-mode output
+// stays clean.
+func warnIfReloadNeeded(client *ipc.Client) {
+	resp, err := client.Do(ipc.Request{Action: "need-daemon-reload"})
+	if err != nil || !resp.Success {
+		return
+	}
+	if need, ok := resp.Data.(bool); ok && need {
+		fmt.Fprintf(os.Stderr, "Warning: unit files changed on disk, run 'systemctl daemon-reload'\n")
+	}
+}
+
 func handleIsSystemRunning(client *ipc.Client) {
 	resp, err := client.Do(ipc.Request{Action: "is-system-running"})
 	if err != nil {
@@ -243,6 +257,7 @@ func handleShow(client *ipc.Client, args []string) {
 		// (and find none) conclude the unit is absent.
 		if resp, err := client.Do(ipc.Request{Action: "status"}); err == nil && resp.Success {
 			printManagerProps(resp, properties, valueOnly)
+			warnIfReloadNeeded(client)
 			os.Exit(0)
 		}
 		printOfflineManagerProps(properties, valueOnly)
@@ -267,13 +282,21 @@ func handleShow(client *ipc.Client, args []string) {
 			// each requested prop rather than a missing one that they'd then
 			// mis-parse as another field's value. Emit LoadState=not-found and
 			// the systemd defaults for the other standard unit properties.
+			// NeedDaemonReload is filled live when the daemon is reachable
+			// so absence probes don't mask a stale unit set.
+			needReload := "False"
+			if r, err := client.Do(ipc.Request{Action: "need-daemon-reload"}); err == nil && r.Success {
+				if need, ok := r.Data.(bool); ok && need {
+					needReload = "True"
+				}
+			}
 			notFoundDefaults := map[string]string{
 				"LoadState":          "not-found",
 				"ActiveState":        "inactive",
 				"SubState":           "dead",
 				"FragmentPath":       "",
 				"DropInPaths":        "",
-				"NeedDaemonReload":   "False",
+				"NeedDaemonReload":   needReload,
 				"UnitFileState":      "disabled",
 				"Description":        "",
 			}
@@ -329,6 +352,7 @@ func handleShow(client *ipc.Client, args []string) {
 			}
 		}
 	}
+	warnIfReloadNeeded(client)
 	os.Exit(exitCode)
 }
 
@@ -442,10 +466,12 @@ func handleUnitCommand(client *ipc.Client, action, unit string) {
 		status := decodeStatus(resp)
 		enabled := fetchEnabledState(client, resolvedUnit)
 		printStatus(status, enabled)
+		warnIfReloadNeeded(client)
 		exitForState(string(status.State))
 	case "is-active":
 		state := fmt.Sprintf("%v", resp.Data)
 		fmt.Println(state)
+		warnIfReloadNeeded(client)
 		if state == "active" {
 			os.Exit(0)
 		}
@@ -733,6 +759,7 @@ func handleListUnits(client *ipc.Client, args []string) {
 		fmt.Printf(rowFmt, name, "loaded", active, desc)
 	}
 	fmt.Printf("\n%d units listed.\n", len(units))
+	warnIfReloadNeeded(client)
 }
 
 func handleListUnitFiles(client *ipc.Client) {
@@ -787,6 +814,7 @@ func handleListUnitFiles(client *ipc.Client) {
 		fmt.Printf(headerFmt, name, unit.State)
 	}
 	fmt.Printf("\n%d unit files listed.\n", len(units))
+	warnIfReloadNeeded(client)
 }
 
 func decodeStatus(resp ipc.Response) ipc.StatusData {
