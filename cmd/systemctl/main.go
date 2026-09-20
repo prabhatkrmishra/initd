@@ -126,6 +126,10 @@ func main() {
 	case "is-system-running":
 		handleIsSystemRunning(client)
 
+	case "log":
+		fmt.Fprintf(os.Stderr, "systemctl log has been removed, use journalctl -u UNIT [-n N]\n")
+		os.Exit(1)
+
 	default:
 		usage()
 		os.Exit(1)

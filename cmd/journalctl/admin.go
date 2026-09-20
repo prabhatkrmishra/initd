@@ -188,6 +188,14 @@ func runListBoots(opts journalOpts) int {
 }
 
 func runDiskUsage(opts journalOpts) int {
+	bytes, files := diskUsageTotals(opts)
+	fmt.Printf("Journals take up %s in %d files.\n", humanBytes(bytes), files)
+	return 0
+}
+
+// diskUsageTotals shares the counting between --disk-usage output and the
+// --vacuum confirmation so both agree.
+func diskUsageTotals(opts journalOpts) (int64, int64) {
 	sockets, dirs := journalScope(opts)
 	var bytes, files int64
 	var daemonDirs []string
@@ -252,8 +260,7 @@ func runDiskUsage(opts journalOpts) int {
 			}
 		}
 	}
-	fmt.Printf("Journals take up %s in %d files.\n", humanBytes(bytes), files)
-	return 0
+	return bytes, files
 }
 
 func runVacuum(opts journalOpts) int {
@@ -283,6 +290,7 @@ func runVacuum(opts journalOpts) int {
 	// Vacuum runs through the daemon so the open file is never removed.
 	// Offline dirs vacuum directly with the same never-newest rule.
 	sockList, dirList := journalScope(opts)
+	beforeBytes, _ := diskUsageTotals(opts)
 	code := 0
 	for i, sock := range sockList {
 		if sock != "" {
@@ -301,6 +309,14 @@ func runVacuum(opts journalOpts) int {
 				code = 1
 			}
 		}
+	}
+	if code == 0 {
+		afterBytes, afterFiles := diskUsageTotals(opts)
+		freed := beforeBytes - afterBytes
+		if freed < 0 {
+			freed = 0
+		}
+		fmt.Printf("Vacuuming done, freed %s (now %s in %d files).\n", humanBytes(freed), humanBytes(afterBytes), afterFiles)
 	}
 	return code
 }
@@ -515,13 +531,24 @@ func humanBytes(n int64) string {
 func runSyncFlush(opts journalOpts) int {
 	sockets, _ := journalScope(opts)
 	code := 0
+	did := false
 	for _, sock := range sockets {
 		if sock == "" {
 			continue
 		}
 		client := &ipc.Client{SocketPath: sock}
-		if resp, err := client.Do(ipc.Request{Action: "journal-sync"}); err != nil || !resp.Success {
+		resp, err := client.Do(ipc.Request{Action: "journal-sync"})
+		if err != nil || !resp.Success {
 			code = 1
+		} else {
+			did = true
+		}
+	}
+	if code == 0 && did {
+		if opts.flush {
+			fmt.Println("Flushed journal.")
+		} else {
+			fmt.Println("Synced journal.")
 		}
 	}
 	return code
@@ -530,14 +557,21 @@ func runSyncFlush(opts journalOpts) int {
 func runRotate(opts journalOpts) int {
 	sockets, _ := journalScope(opts)
 	code := 0
+	did := false
 	for _, sock := range sockets {
 		if sock == "" {
 			continue
 		}
 		client := &ipc.Client{SocketPath: sock}
-		if resp, err := client.Do(ipc.Request{Action: "journal-rotate"}); err != nil || !resp.Success {
+		resp, err := client.Do(ipc.Request{Action: "journal-rotate"})
+		if err != nil || !resp.Success {
 			code = 1
+		} else {
+			did = true
 		}
+	}
+	if code == 0 && did {
+		fmt.Println("Rotated journal.")
 	}
 	return code
 }
