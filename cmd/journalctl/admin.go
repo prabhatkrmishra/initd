@@ -305,9 +305,24 @@ func vacuumDir(dir string, maxBytes int64, maxFiles, maxDays int) error {
 		maxDays = 14
 	}
 	keepNewest := files[len(files)-1]
+	// Mirror Manager.VacuumJournal: after a rotate the newest file is
+	// empty while the previous holds history. Keep the newest non-empty
+	// file too so a small --vacuum-size leaves data instead of 0B.
+	kept := map[string]bool{keepNewest: true}
+	if st, err := os.Stat(keepNewest); err == nil && st.Size() < 4096 && len(files) >= 2 {
+		for i := len(files) - 2; i >= 0; i-- {
+			if st, err := os.Stat(files[i]); err == nil && st.Size() >= 4096 {
+				kept[files[i]] = true
+				break
+			}
+		}
+		if len(kept) == 1 {
+			kept[files[len(files)-2]] = true
+		}
+	}
 	cutoffNow := nowFunc().AddDate(0, 0, -maxDays)
 	for _, path := range files {
-		if path == keepNewest {
+		if kept[path] {
 			continue
 		}
 		if st, err := os.Stat(path); err == nil && st.ModTime().Before(cutoffNow) {
@@ -321,7 +336,7 @@ func vacuumDir(dir string, maxBytes int64, maxFiles, maxDays int) error {
 		}
 		oldest := ""
 		for _, path := range files {
-			if path != keepNewest {
+			if !kept[path] {
 				oldest = path
 				break
 			}
@@ -343,7 +358,7 @@ func vacuumDir(dir string, maxBytes int64, maxFiles, maxDays int) error {
 		}
 		oldest := ""
 		for _, path := range logging.ListFiles(dir) {
-			if path != keepNewest {
+			if !kept[path] {
 				oldest = path
 				break
 			}

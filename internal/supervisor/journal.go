@@ -158,9 +158,29 @@ func (m *Manager) VacuumJournal(maxBytes int64, maxFiles int, maxAgeDays int) er
 	cutoff := time.Now().AddDate(0, 0, -maxAgeDays)
 	// Never delete the newest file: the writer may hold it open.
 	keepNewest := files[len(files)-1]
+	// After a rotate the newest file is empty while the previous one
+	// holds all history. Deleting that previous file to satisfy a small
+	// --vacuum-size would wipe everything and leave 0B. Keep the newest
+	// non-empty file as well so size/file-count vacuums leave data
+	// behind instead of an empty active file. Age expiry still only
+	// protects the open file; old history expiring by age is intended.
+	kept := map[string]bool{keepNewest: true}
+	if st, err := os.Stat(keepNewest); err == nil && st.Size() < 4096 && len(files) >= 2 {
+		for i := len(files) - 2; i >= 0; i-- {
+			if st, err := os.Stat(files[i]); err == nil && st.Size() >= 4096 {
+				kept[files[i]] = true
+				break
+			}
+		}
+		// No non-empty predecessor (all tiny): keep the immediate
+		// predecessor so a fresh rotate never collapses to one empty file.
+		if len(kept) == 1 {
+			kept[files[len(files)-2]] = true
+		}
+	}
 	var victims []string
 	for _, path := range files {
-		if path == keepNewest {
+		if kept[path] {
 			continue
 		}
 		if st, err := os.Stat(path); err == nil && st.ModTime().Before(cutoff) {
@@ -177,7 +197,7 @@ func (m *Manager) VacuumJournal(maxBytes int64, maxFiles int, maxAgeDays int) er
 	for len(files) > maxFiles {
 		oldest := ""
 		for _, path := range files {
-			if path == keepNewest {
+			if kept[path] {
 				continue
 			}
 			oldest = path
@@ -198,7 +218,7 @@ func (m *Manager) VacuumJournal(maxBytes int64, maxFiles int, maxAgeDays int) er
 	for total > maxBytes {
 		oldest := ""
 		for _, path := range m.JournalFiles() {
-			if path == keepNewest {
+			if kept[path] {
 				continue
 			}
 			oldest = path
