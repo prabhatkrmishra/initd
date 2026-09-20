@@ -420,7 +420,14 @@ func parseArgs(args []string) (journalOpts, error) {
 		case strings.HasPrefix(a, "--priority="):
 			opts.priorityRaw = strings.TrimPrefix(a, "--priority=")
 		case strings.HasPrefix(a, "--facility="):
-			return opts, fmt.Errorf("%s is not supported: initd records no facility field", a)
+			// No facility field stored; accept and ignore so scripts
+			// passing --facility don't break (unfiltered results).
+		case a == "--facility":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a facility", a)
+			}
+			// Ignored (see above).
 		case a == "-g" || a == "--grep":
 			i++
 			if i >= len(args) {
@@ -607,6 +614,11 @@ func parseArgs(args []string) (journalOpts, error) {
 func parseLinesValue(raw string) (int, bool, error) {
 	s := strings.TrimSpace(raw)
 	plus := strings.HasPrefix(s, "+")
+	// Real journalctl takes -n all for everything; Lines==0 already
+	// means unlimited downstream, so map it there.
+	if strings.EqualFold(strings.TrimPrefix(s, "+"), "all") {
+		return 0, plus, nil
+	}
 	n, err := strconv.Atoi(strings.TrimPrefix(s, "+"))
 	if err != nil || n < 0 {
 		return 0, false, fmt.Errorf("invalid line count %q", raw)
