@@ -241,6 +241,7 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 
 	scanner := bufio.NewScanner(file)
 	section := ""
+	seenEntries := 0
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -257,6 +258,7 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 		}
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		seenEntries++
 
 		if _, ok := ignoredKeys[key]; ok {
 			unit.Ignored[key] = value
@@ -515,6 +517,12 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 
 	if err := scanner.Err(); err != nil {
 		return nil, err
+	}
+
+	// An empty file (or comments only) is not a unit. Without this it
+	// loads as `loaded/inactive` and confuses status and stale checks.
+	if seenEntries == 0 {
+		return nil, fmt.Errorf("empty unit file %s: no entries", path)
 	}
 
 	if unit.Type == "socket" {
