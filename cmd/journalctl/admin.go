@@ -76,6 +76,13 @@ func journalScope(opts journalOpts) (sockets []string, dirs []string) {
 	case opts.system:
 		return []string{sysSock}, []string{sysDir}
 	default:
+		// Non-root system and user journals resolve to the same state
+		// dir, and both sockets are served with identical data. Querying
+		// both would double every count, header and listing.
+		if sysDir == userDir {
+			// Prefer the user socket; either answers the same.
+			return []string{userSock}, []string{userDir}
+		}
 		return []string{sysSock, userSock}, []string{sysDir, userDir}
 	}
 }
@@ -184,6 +191,7 @@ func runDiskUsage(opts journalOpts) int {
 	sockets, dirs := journalScope(opts)
 	var bytes, files int64
 	var daemonDirs []string
+	seenDaemonDirs := map[string]bool{}
 	for _, sock := range sockets {
 		if sock == "" {
 			continue
@@ -201,6 +209,14 @@ func runDiskUsage(opts journalOpts) int {
 		raw, _ := json.Marshal(resp.Data)
 		if err := json.Unmarshal(raw, &data); err != nil {
 			continue
+		}
+		// Both sockets can report the same dir (non-root system ==
+		// user). Count each unique dir once.
+		if data.Dir != "" {
+			if seenDaemonDirs[data.Dir] {
+				continue
+			}
+			seenDaemonDirs[data.Dir] = true
 		}
 		bytes += data.Bytes
 		files += data.Files
