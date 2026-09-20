@@ -48,6 +48,18 @@ func main() {
 		handleShowUser(opts, rest)
 	case "status":
 		handleStatus(rest)
+	case "user-status":
+		// Alias used by some helpers; same as status.
+		handleStatus(rest)
+	case "list-seats":
+		// No seats owned in chroot; empty success so listings don't abort.
+		if !opts.noLegend {
+			fmt.Println("SEAT")
+		}
+		fmt.Println("0 seats")
+	case "activate":
+		// No session activation under initd; success so post-install
+		// session hooks don't fail the whole install.
 	case "show-seat", "show-session", "attach", "lock-session", "unlock-session",
 		"terminate-seat", "terminate-session", "terminate-user", "kill-session",
 		"kill-user":
