@@ -84,6 +84,7 @@ if command -v go >/dev/null 2>&1; then have_go=1; fi
 INITD_BIN="${INITD_BIN:-}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-}"
 LOGINCTL_BIN="${LOGINCTL_BIN:-}"
+JOURNALCTL_BIN="${JOURNALCTL_BIN:-}"
 
 find_binary() {
   local name="$1" arch="$2" cand
