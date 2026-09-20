@@ -222,11 +222,45 @@ func handleEnableDisable(client *ipc.Client, action string, args []string) {
 // It tolerates unknown flags (e.g. --no-pager) and comma-separated property
 // lists (--property=A,B).
 func parseShowArgs(args []string) (properties []string, valueOnly bool, units []string) {
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
 		case a == "--value" || strings.HasPrefix(a, "--value"):
 			valueOnly = true
-		case a == "--no-pager" || strings.HasPrefix(a, "--no-pager"):
+		case a == "-P":
+			// -P NAME is --value --property=NAME in real systemctl.
+			valueOnly = true
+			if i+1 < len(args) {
+				i++
+				if args[i] != "" {
+					properties = append(properties, strings.Split(args[i], ",")...)
+				}
+			}
+		case strings.HasPrefix(a, "-P") && len(a) > 2:
+			// Compact -P<prop>? Rare; treat remainder as property.
+			valueOnly = true
+			p := strings.TrimPrefix(a, "-P")
+			p = strings.TrimPrefix(p, "=")
+			if p != "" {
+				properties = append(properties, strings.Split(p, ",")...)
+			}
+		case a == "-p" || a == "--property" || a == "--properties":
+			if i+1 < len(args) {
+				i++
+				if args[i] != "" {
+					properties = append(properties, strings.Split(args[i], ",")...)
+				}
+			}
+		case strings.HasPrefix(a, "-p") && len(a) > 2 && !strings.HasPrefix(a, "--"):
+			// Compact -p<prop>.
+			p := strings.TrimPrefix(a, "-p")
+			p = strings.TrimPrefix(p, "=")
+			if p != "" {
+				properties = append(properties, strings.Split(p, ",")...)
+			}
+		case a == "--no-pager" || strings.HasPrefix(a, "--no-pager") ||
+			a == "--no-legend" || strings.HasPrefix(a, "--no-legend") ||
+			a == "-l" || a == "--full" || a == "-a" || a == "--all":
 			// compatibility flag from callers; ignored
 		case strings.HasPrefix(a, "--property="):
 			p := strings.TrimPrefix(a, "--property=")
@@ -671,6 +705,16 @@ func handleListUnits(client *ipc.Client, args []string) {
 				if t != "" {
 					typeFilter[t] = struct{}{}
 				}
+			}
+		case a == "--no-legend" || strings.HasPrefix(a, "--no-legend") ||
+			a == "--no-pager" || strings.HasPrefix(a, "--no-pager") ||
+			a == "-l" || a == "--full" || strings.HasPrefix(a, "--legend") ||
+			a == "-q" || a == "--quiet" || strings.HasPrefix(a, "--quiet") ||
+			a == "--failed":
+			// Output formatting only; accepted and ignored so parsing
+			// pipelines (list-units --no-legend --no-pager) keep working.
+			if a == "--failed" {
+				stateFilter["failed"] = struct{}{}
 			}
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
