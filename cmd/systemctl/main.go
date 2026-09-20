@@ -44,7 +44,23 @@ func main() {
 			userFlag = true
 		case "--system":
 			systemFlag = true
+		case "--root", "--image":
+			fmt.Fprintf(os.Stderr, "%s is not supported: operating on an alternate root would silently touch the live system instead\n", a)
+			os.Exit(1)
+		case "-H", "--host":
+			fmt.Fprintf(os.Stderr, "remote hosts are not supported: no -H/--host in chroot\n")
+			os.Exit(1)
+		case "-M", "--machine":
+			fmt.Fprintf(os.Stderr, "containers are not supported: no -M/--machine (single-host only)\n")
+			os.Exit(1)
 		default:
+			if strings.HasPrefix(a, "--root=") || strings.HasPrefix(a, "--image=") ||
+				strings.HasPrefix(a, "--image-policy=") || strings.HasPrefix(a, "-H") ||
+				strings.HasPrefix(a, "--host=") || strings.HasPrefix(a, "-M") ||
+				strings.HasPrefix(a, "--machine=") {
+				fmt.Fprintf(os.Stderr, "%s is not supported in this chroot build (single-host only)\n", a)
+				os.Exit(1)
+			}
 			filtered = append(filtered, a)
 		}
 	}
@@ -165,7 +181,7 @@ func main() {
 		handleListUnits(client, cmdArgs)
 
 	case "list-unit-files":
-		handleListUnitFiles(client)
+		handleListUnitFiles(client, cmdArgs)
 
 	case "daemon-reload", "daemon-reexec", "reboot", "poweroff", "halt":
 		if cmd == "daemon-reexec" {
@@ -177,11 +193,24 @@ func main() {
 	case "is-system-running":
 		handleIsSystemRunning(client)
 
+	case "help":
+		// Real help shows unit manuals; without man pages the unit
+		// file itself is the useful reference, so map to cat.
+		units := stripUnitFlags(cmdArgs)
+		if len(units) < 1 {
+			printHelp()
+			break
+		}
+		for _, u := range units {
+			handleUnitCommand(client, "cat", u)
+		}
+
 	case "log":
 		fmt.Fprintf(os.Stderr, "systemctl log has been removed, use journalctl -u UNIT [-n N]\n")
 		os.Exit(1)
 
 	default:
+		fmt.Fprintf(os.Stderr, "Unknown command verb %s\n", cmd)
 		usage()
 		os.Exit(1)
 	}
@@ -991,7 +1020,17 @@ func handleListUnits(client *ipc.Client, args []string) {
 	warnIfReloadNeeded(client)
 }
 
-func handleListUnitFiles(client *ipc.Client) {
+func handleListUnitFiles(client *ipc.Client, args []string) {
+	// Real list-unit-files takes optional glob patterns; installers use
+	// them for existence checks, so filter instead of listing everything.
+	var patterns []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
+			os.Exit(1)
+		}
+		patterns = append(patterns, a)
+	}
 	resp, err := client.Do(ipc.Request{Action: "list-unit-files"})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -1006,8 +1045,30 @@ func handleListUnitFiles(client *ipc.Client) {
 	data, _ := json.Marshal(resp.Data)
 	_ = json.Unmarshal(data, &units)
 
+	if len(patterns) > 0 {
+		filtered := units[:0]
+		for _, u := range units {
+			for _, pat := range patterns {
+				if ok, _ := filepath.Match(pat, u.Name); ok {
+					filtered = append(filtered, u)
+					break
+				}
+				// Bare names match the unit directly.
+				if pat == u.Name {
+					filtered = append(filtered, u)
+					break
+				}
+			}
+		}
+		units = filtered
+	}
+
 	if len(units) == 0 {
-		fmt.Println("No unit files found.")
+		if len(patterns) > 0 {
+			fmt.Println("No unit files matching pattern.")
+		} else {
+			fmt.Println("No unit files found.")
+		}
 		return
 	}
 
@@ -1181,7 +1242,7 @@ func exitForState(state string) {
 }
 
 func usage() {
-	fmt.Println("Usage: systemctl [OPTIONS...] {COMMAND} [UNIT...]")
+	fmt.Fprintln(os.Stderr, "Usage: systemctl [OPTIONS...] {COMMAND} [UNIT...]")
 }
 
 func wantsHelp(args []string) bool {
@@ -1189,9 +1250,6 @@ func wantsHelp(args []string) bool {
 		if arg == "-h" || arg == "--help" {
 			return true
 		}
-	}
-	if len(args) > 0 && args[0] == "help" {
-		return true
 	}
 	return false
 }
