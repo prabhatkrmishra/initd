@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const journalctlVersion = "1.0.3"
+const journalctlVersion = "1.1.0"
 
 func main() {
 	if wantsHelp(os.Args[1:]) {

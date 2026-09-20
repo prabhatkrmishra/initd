@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const loginctlVersion = "1.0.3"
+const loginctlVersion = "1.1.0"
 
 func main() {
 	args := os.Args[1:]
