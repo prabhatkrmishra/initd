@@ -662,6 +662,13 @@ func (u *Unit) Stop(timeout time.Duration) error {
 			// state and the live PID so we don't hang if handleExit races
 			// or the reaper hasn't yet reaped the child. This mirrors
 			// systemd's behavior of tracking the main PID liveness.
+			// If there is no PID at all (lost track, external gone,
+			// oneshot with no process), nothing is running: a stopping
+			// unit must go inactive instead of sleeping until timeout.
+			if pid == 0 && (cmd == nil || cmd.Process == nil || !processAlive(cmd.Process.Pid)) {
+				u.transitionState(StateInactive, "")
+				return true
+			}
 			if pid != 0 && !processAlive(pid) {
 				u.transitionState(StateInactive, "")
 				return true
@@ -1259,7 +1266,10 @@ func (u *Unit) canonicalServiceType() string {
 func (u *Unit) transitionState(next State, reason string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.Runtime.State == StateActive && next == StateInactive {
+	// Any path to inactive releases the PID. Previously only Active→Inactive
+	// cleared it, so a stop that raced the reaper could leave MainPID set
+	// on an inactive unit (or a stopping unit reporting a stale PID).
+	if next == StateInactive {
 		u.Runtime.MainPID = 0
 	}
 	u.Runtime.State = next

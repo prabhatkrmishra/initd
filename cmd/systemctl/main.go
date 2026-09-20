@@ -550,6 +550,16 @@ func containsProp(props []string, name string) bool {
 }
 
 func handleUnitCommand(client *ipc.Client, action, unit string) {
+	// Real status accepts PIDs as well as unit names. Resolve a bare
+	// number to the unit owning it so `status <pid>` works for debuggers.
+	if action == "status" && isPID(unit) {
+		resolved, err := resolvePIDToUnit(client, unit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(1)
+		}
+		unit = resolved
+	}
 	resolvedUnit, err := resolveUnitName(client, unit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
@@ -791,6 +801,46 @@ func unitActiveState(client *ipc.Client, unit string) string {
 		return ""
 	}
 	return fmt.Sprintf("%v", resp.Data)
+}
+
+// isPID reports whether s is a bare process id.
+func isPID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolvePIDToUnit finds the loaded unit whose MainPID matches pid.
+func resolvePIDToUnit(client *ipc.Client, pid string) (string, error) {
+	resp, err := client.Do(ipc.Request{Action: "list-units"})
+	if err != nil {
+		return "", fmt.Errorf("PID %s not found as a unit process", pid)
+	}
+	if !resp.Success {
+		return "", fmt.Errorf("PID %s not found as a unit process", pid)
+	}
+	var units []ipc.UnitData
+	raw, _ := json.Marshal(resp.Data)
+	_ = json.Unmarshal(raw, &units)
+	for _, u := range units {
+		sresp, err := client.Do(ipc.Request{Action: "show", Unit: u.Name})
+		if err != nil || !sresp.Success {
+			continue
+		}
+		dataMap := map[string]string{}
+		raw, _ := json.Marshal(sresp.Data)
+		_ = json.Unmarshal(raw, &dataMap)
+		if dataMap["MainPID"] == pid {
+			return u.Name, nil
+		}
+	}
+	return "", fmt.Errorf("PID %s not found as a unit process", pid)
 }
 
 func handleListUnits(client *ipc.Client, args []string) {
