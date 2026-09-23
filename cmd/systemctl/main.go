@@ -53,11 +53,15 @@ func main() {
 		case "-M", "--machine":
 			fmt.Fprintf(os.Stderr, "containers are not supported: no -M/--machine (single-host only)\n")
 			os.Exit(1)
+		case "-C", "--capsule":
+			fmt.Fprintf(os.Stderr, "capsules are not supported: no -C/--capsule in chroot\n")
+			os.Exit(1)
 		default:
 			if strings.HasPrefix(a, "--root=") || strings.HasPrefix(a, "--image=") ||
 				strings.HasPrefix(a, "--image-policy=") || strings.HasPrefix(a, "-H") ||
 				strings.HasPrefix(a, "--host=") || strings.HasPrefix(a, "-M") ||
-				strings.HasPrefix(a, "--machine=") {
+				strings.HasPrefix(a, "--machine=") || strings.HasPrefix(a, "-C") ||
+				strings.HasPrefix(a, "--capsule=") {
 				fmt.Fprintf(os.Stderr, "%s is not supported in this chroot build (single-host only)\n", a)
 				os.Exit(1)
 			}
@@ -67,6 +71,16 @@ func main() {
 	if userFlag && systemFlag {
 		fmt.Fprintln(os.Stderr, "Cannot combine --user and --system")
 		os.Exit(1)
+	}
+
+	// Systemd accepts global flags on either side of the verb. The flag
+	// package stops at the first positional word, so recognized compat
+	// flags placed before the verb are moved into the verb args, where
+	// each verb parser already handles them. Unknown flags stay put so
+	// they still fail loudly in flag.Parse.
+	var forwardedGlobal []string
+	if idx := commandIndex(filtered); idx > 0 {
+		forwardedGlobal, filtered = splitForwardedFlags(filtered, idx)
 	}
 
 	flags := flag.NewFlagSet("systemctl", flag.ContinueOnError)
@@ -93,7 +107,7 @@ func main() {
 	}
 
 	cmd := flags.Arg(0)
-	cmdArgs := flags.Args()[1:]
+	cmdArgs := append(forwardedGlobal, flags.Args()[1:]...)
 
 	client := &ipc.Client{SocketPath: resolvedSocket}
 	// Like systemd, timeouts are server-side (TimeoutStartSec/
@@ -110,7 +124,7 @@ func main() {
 
 	switch cmd {
 	case "enable", "disable":
-		handleEnableDisable(client, cmd, cmdArgs)
+		os.Exit(handleEnableDisable(client, cmd, cmdArgs))
 	case "show":
 		handleShow(client, cmdArgs)
 	case "reenable":
@@ -119,10 +133,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "reenable requires a unit name\n")
 			os.Exit(1)
 		}
+		code := 0
 		for _, u := range stripUnitFlags(cmdArgs) {
-			handleEnableDisable(client, "disable", []string{u})
-			handleEnableDisable(client, "enable", []string{u})
+			if c := handleEnableDisable(client, "disable", []string{u}); c != 0 && code == 0 {
+				code = c
+			}
+			if c := handleEnableDisable(client, "enable", []string{u}); c != 0 && code == 0 {
+				code = c
+			}
 		}
+		os.Exit(code)
 	case "preset", "preset-all":
 		// No preset files shipped; preset UNIT behaves as enable so
 		// packaging scripts don't fail. preset-all is a no-op success.
@@ -134,15 +154,20 @@ func main() {
 			fmt.Fprintf(os.Stderr, "preset requires a unit name\n")
 			os.Exit(1)
 		}
+		code := 0
 		for _, u := range units {
-			handleEnableDisable(client, "enable", []string{u})
+			if c := handleEnableDisable(client, "enable", []string{u}); c != 0 && code == 0 {
+				code = c
+			}
 		}
+		os.Exit(code)
 	case "try-restart", "reload-or-restart", "try-reload-or-restart":
 		units := stripUnitFlags(cmdArgs)
 		if len(units) < 1 {
 			fmt.Fprintf(os.Stderr, "%s requires a unit name\n", cmd)
 			os.Exit(1)
 		}
+		code := 0
 		for _, u := range units {
 			if cmd == "try-restart" || cmd == "try-reload-or-restart" {
 				// Only act when active; otherwise no-op success.
@@ -150,26 +175,31 @@ func main() {
 					continue
 				}
 			}
-			handleUnitCommand(client, "restart", u)
+			if c := doUnitCommand(client, "restart", u, 0, false); c != 0 && code == 0 {
+				code = c
+			}
 		}
+		os.Exit(code)
 	case "start", "stop", "restart", "reload", "status", "is-active", "is-enabled", "mask", "unmask", "cat", "kill":
 		if cmd == "kill" {
-			handleKillCommand(client, stripKillFlags(cmdArgs))
-			break
+			os.Exit(handleKillCommand(client, stripKillFlags(cmdArgs)))
 		}
-		units := stripUnitFlags(cmdArgs)
+		logArgs, statusLines := cmdArgs, 10
+		if cmd == "status" {
+			logArgs, statusLines = splitStatusLogOpts(cmdArgs)
+		}
+		quiet := false
+		if cmd == "is-active" || cmd == "is-enabled" {
+			logArgs, quiet = splitQuietFlag(logArgs)
+		}
+		units := stripUnitFlags(logArgs)
 		if len(units) < 1 {
 			fmt.Fprintf(os.Stderr, "%s requires a unit name\n", cmd)
 			os.Exit(1)
 		}
-		// status/is-active accept several units like real systemctl.
-		if cmd == "status" || cmd == "is-active" || cmd == "is-enabled" || cmd == "cat" {
-			for _, u := range units {
-				handleUnitCommand(client, cmd, u)
-			}
-			break
-		}
-		handleUnitCommand(client, cmd, units[0])
+		// Like real systemctl every unit is acted on; the exit code
+		// combines the per-unit results (see runUnits).
+		os.Exit(runUnits(client, cmd, units, statusLines, quiet))
 
 	case "is-failed":
 		handleIsFailed(client, cmdArgs)
@@ -201,9 +231,13 @@ func main() {
 			printHelp()
 			break
 		}
+		code := 0
 		for _, u := range units {
-			handleUnitCommand(client, "cat", u)
+			if c := doUnitCommand(client, "cat", u, 0, false); c != 0 && code == 0 {
+				code = c
+			}
 		}
+		os.Exit(code)
 
 	case "log":
 		fmt.Fprintf(os.Stderr, "systemctl log has been removed, use journalctl -u UNIT [-n N]\n")
@@ -266,7 +300,75 @@ func handleIsSystemRunning(client *ipc.Client) {
 	}
 }
 
-func handleEnableDisable(client *ipc.Client, action string, args []string) {
+// runUnits runs one verb over every unit instead of stopping after the
+// first, like real systemctl. Exit codes follow the LSB table systemd
+// documents: status reports failed (1) over not-active (3); is-active is 0
+// when at least one unit is active; is-enabled is 0 when at least one unit
+// file is enabled.
+func runUnits(client *ipc.Client, action string, units []string, statusLines int, quiet bool) int {
+	code := 0
+	sawActive := false
+	sawEnabled := false
+	sawUnknown := false
+	for _, u := range units {
+		c := doUnitCommand(client, action, u, statusLines, quiet)
+		switch action {
+		case "is-active":
+			if c == 0 {
+				sawActive = true
+			} else if c == 4 {
+				sawUnknown = true
+			} else if code == 0 {
+				code = c
+			}
+		case "is-enabled":
+			if c == 0 {
+				sawEnabled = true
+			} else if c == 4 {
+				sawUnknown = true
+			} else if code == 0 {
+				code = c
+			}
+		case "status":
+			if c == 1 {
+				code = 1
+			} else if c != 0 && code == 0 {
+				code = c
+			}
+		default:
+			if c != 0 && code == 0 {
+				code = c
+			}
+		}
+	}
+	switch action {
+	case "is-active":
+		if sawActive {
+			return 0
+		}
+		if sawUnknown && code == 0 {
+			return 4
+		}
+		if code == 0 {
+			return 3
+		}
+		return code
+	case "is-enabled":
+		if sawEnabled {
+			return 0
+		}
+		if sawUnknown && code == 0 {
+			return 4
+		}
+		if code == 0 {
+			return 1
+		}
+		return code
+	}
+	return code
+}
+
+func handleEnableDisable(client *ipc.Client, action string, args []string) int {
 	now := false
 	units := []string{}
 	for _, a := range args {
@@ -282,29 +384,34 @@ func handleEnableDisable(client *ipc.Client, action string, args []string) {
 			fmt.Fprintf(os.Stderr, "warning: --global treated as current user (no system preset)\n")
 		case a == "--no-reload" || a == "-q" || a == "--quiet":
 			// Accepted and ignored for script compat.
+		case isIgnoredGlobalFlag(a):
+			// Output/async plumbing from before the verb; irrelevant here.
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
-			os.Exit(1)
+			return 1
 		default:
 			units = append(units, a)
 		}
 	}
 	if len(units) == 0 {
 		fmt.Fprintf(os.Stderr, "%s requires a unit name\n", action)
-		os.Exit(1)
+		return 1
 	}
+	code := 0
 	for _, unit := range units {
 		resolved, _ := resolveUnitName(client, unit)
 		resp, err := client.Do(ipc.Request{Action: action, Unit: resolved, Now: now})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+			code = 1
+			continue
 		}
 		if !resp.Success {
 			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-			os.Exit(1)
+			code = 1
 		}
 	}
+	return code
 }
 
 // parseShowArgs parses the argument vector of `systemctl show` into the list
@@ -578,65 +685,108 @@ func containsProp(props []string, name string) bool {
 	return false
 }
 
-func handleUnitCommand(client *ipc.Client, action, unit string) {
+// doUnitCommand runs one action for one unit and returns the process exit
+// code for it instead of exiting, so multi-unit verbs keep going past the
+// first failure like real systemctl. Unknown units map to LSB exit 4.
+func doUnitCommand(client *ipc.Client, action, unit string, statusLines int, quiet bool) int {
 	// Real status accepts PIDs as well as unit names. Resolve a bare
 	// number to the unit owning it so `status <pid>` works for debuggers.
 	if action == "status" && isPID(unit) {
 		resolved, err := resolvePIDToUnit(client, unit)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
-			os.Exit(1)
+			return 4
 		}
 		unit = resolved
 	}
 	resolvedUnit, err := resolveUnitName(client, unit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
-		os.Exit(1)
+		return 1
 	}
 	resp, err := client.Do(ipc.Request{Action: action, Unit: resolvedUnit})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if !resp.Success {
+		if isNotFoundMessage(resp.Message) {
+			switch action {
+			case "is-active":
+				fmt.Println("unknown")
+				return 4
+			case "is-enabled":
+				fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+				return 4
+			case "status":
+				fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+				return 4
+			}
+		}
 		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-		os.Exit(1)
+		return 1
 	}
 
 	switch action {
 	case "status":
 		status := decodeStatus(resp)
 		enabled := fetchEnabledState(client, resolvedUnit)
-		printStatus(status, enabled)
+		printStatus(status, enabled, statusLines)
 		warnIfReloadNeeded(client)
-		exitForState(string(status.State))
+		return exitForState(string(status.State))
 	case "is-active":
 		state := fmt.Sprintf("%v", resp.Data)
-		fmt.Println(state)
+		if !quiet {
+			fmt.Println(state)
+		}
 		warnIfReloadNeeded(client)
 		if state == "active" {
-			os.Exit(0)
+			return 0
 		}
-		os.Exit(3)
+		return 3
 	case "is-enabled":
 		state := fmt.Sprintf("%v", resp.Data)
-		fmt.Println(state)
-		if state == "enabled" {
-			os.Exit(0)
+		if !quiet {
+			fmt.Println(state)
 		}
-		os.Exit(1)
+		if state == "enabled" {
+			return 0
+		}
+		return 1
 	case "cat":
 		content := fmt.Sprintf("%v", resp.Data)
 		fmt.Print(content)
 		if !strings.HasSuffix(content, "\n") {
 			fmt.Println()
 		}
+		return 0
 	}
+	return 0
 }
 
 func handleIsFailed(client *ipc.Client, args []string) {
-	if len(args) == 0 {
+	quiet := false
+	units := make([]string, 0, len(args))
+	for _, a := range args {
+		switch {
+		case a == "-q" || a == "--quiet" || isIgnoredGlobalFlag(a):
+			if a == "-q" || a == "--quiet" {
+				quiet = true
+			}
+			// Accepted and ignored (quiet suppresses the print below).
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
+			os.Exit(1)
+		default:
+			units = append(units, a)
+		}
+	}
+	printState := func(state string) {
+		if !quiet {
+			fmt.Println(state)
+		}
+	}
+	if len(units) == 0 {
 		resp, err := client.Do(ipc.Request{Action: "is-failed"})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -647,14 +797,14 @@ func handleIsFailed(client *ipc.Client, args []string) {
 			os.Exit(1)
 		}
 		state := fmt.Sprintf("%v", resp.Data)
-		fmt.Println(state)
+		printState(state)
 		if state == "failed" {
 			os.Exit(0)
 		}
 		os.Exit(1)
 	}
 	anyFailed := false
-	for _, unit := range args {
+	for _, unit := range units {
 		resolved, _ := resolveUnitName(client, unit)
 		resp, err := client.Do(ipc.Request{Action: "is-failed", Unit: resolved})
 		if err != nil {
@@ -666,7 +816,7 @@ func handleIsFailed(client *ipc.Client, args []string) {
 			os.Exit(1)
 		}
 		state := fmt.Sprintf("%v", resp.Data)
-		fmt.Println(state)
+		printState(state)
 		if state == "failed" {
 			anyFailed = true
 		}
@@ -678,6 +828,18 @@ func handleIsFailed(client *ipc.Client, args []string) {
 }
 
 func handleResetFailed(client *ipc.Client, args []string) {
+	filtered := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "-q" || strings.HasPrefix(a, "--quiet") || isIgnoredGlobalFlag(a) {
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
+			os.Exit(1)
+		}
+		filtered = append(filtered, a)
+	}
+	args = filtered
 	if len(args) == 0 {
 		resp, err := client.Do(ipc.Request{Action: "reset-failed"})
 		if err != nil {
@@ -704,7 +866,7 @@ func handleResetFailed(client *ipc.Client, args []string) {
 	}
 }
 
-func handleKillCommand(client *ipc.Client, args []string) {
+func handleKillCommand(client *ipc.Client, args []string) int {
 	signal := ""
 	units := []string{}
 	for i := 0; i < len(args); i++ {
@@ -712,7 +874,7 @@ func handleKillCommand(client *ipc.Client, args []string) {
 		if a == "--signal" || a == "-s" {
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "kill: --signal requires an argument")
-				os.Exit(1)
+				return 1
 			}
 			signal = args[i+1]
 			i++
@@ -721,34 +883,40 @@ func handleKillCommand(client *ipc.Client, args []string) {
 		} else if strings.HasPrefix(a, "-s=") {
 			signal = strings.TrimPrefix(a, "-s=")
 		} else if a == "--kill-whom" || strings.HasPrefix(a, "--kill-whom=") ||
-			a == "--kill-value" || strings.HasPrefix(a, "--kill-value=") {
+			a == "--kill-value" || strings.HasPrefix(a, "--kill-value=") ||
+			a == "--kill-subgroup" || strings.HasPrefix(a, "--kill-subgroup=") {
 			// Accepted for compat; initd kills the main process.
-			if (a == "--kill-whom" || a == "--kill-value") && i+1 < len(args) {
+			if (a == "--kill-whom" || a == "--kill-value" || a == "--kill-subgroup") && i+1 < len(args) {
 				i++
 			}
+		} else if isIgnoredGlobalFlag(a) {
+			// Output/async plumbing from before the verb; irrelevant here.
 		} else if strings.HasPrefix(a, "-") {
 			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
-			os.Exit(1)
+			return 1
 		} else {
 			units = append(units, a)
 		}
 	}
 	if len(units) == 0 {
 		fmt.Fprintln(os.Stderr, "kill requires a unit name")
-		os.Exit(1)
+		return 1
 	}
+	code := 0
 	for _, unit := range units {
 		resolved, _ := resolveUnitName(client, unit)
 		resp, err := client.Do(ipc.Request{Action: "kill", Unit: resolved, Signal: signal})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+			code = 1
+			continue
 		}
 		if !resp.Success {
 			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-			os.Exit(1)
+			code = 1
 		}
 	}
+	return code
 }
 
 func resolveUnitName(_ *ipc.Client, unit string) (string, error) {
@@ -785,15 +953,32 @@ func stripUnitFlags(args []string) []string {
 			a == "-q" || strings.HasPrefix(a, "--quiet") ||
 			a == "-l" || a == "--full" || a == "-a" || a == "--all" ||
 			a == "--no-pager" || strings.HasPrefix(a, "--no-pager") ||
-			a == "--with-dependencies" || a == "--reverse":
+			a == "--with-dependencies" || a == "--reverse" ||
+			isIgnoredGlobalFlag(a):
 			// Accepted and ignored.
 		case a == "-n" || a == "--lines" || a == "-o" || a == "--output":
 			// Value flag for status; drop value too.
 			if i+1 < len(args) {
 				i++
 			}
+		case a == "--state" || a == "--type" || a == "-s" || a == "--signal" ||
+			a == "--kill-whom" || a == "--kill-value" || a == "--kill-subgroup" ||
+			a == "--what" || a == "--job-mode" || a == "--timestamp" ||
+			a == "--message" || a == "--preset-mode" || a == "--when" ||
+			a == "-p" || a == "--property" || a == "--properties" || a == "-P":
+			// Value flags that are irrelevant to these verbs; drop value too.
+			if i+1 < len(args) {
+				i++
+			}
 		case strings.HasPrefix(a, "--lines=") || strings.HasPrefix(a, "--output=") ||
-			strings.HasPrefix(a, "-n") && len(a) > 2 && !strings.HasPrefix(a, "--") ||
+			strings.HasPrefix(a, "--state=") || strings.HasPrefix(a, "--type=") ||
+			strings.HasPrefix(a, "--signal=") || strings.HasPrefix(a, "--kill-whom=") ||
+			strings.HasPrefix(a, "--kill-value=") || strings.HasPrefix(a, "--kill-subgroup=") ||
+			strings.HasPrefix(a, "--what=") || strings.HasPrefix(a, "--job-mode=") ||
+			strings.HasPrefix(a, "--timestamp=") || strings.HasPrefix(a, "--message=") ||
+			strings.HasPrefix(a, "--preset-mode=") || strings.HasPrefix(a, "--when=") ||
+			strings.HasPrefix(a, "--property=") || strings.HasPrefix(a, "-s=") ||
+			strings.HasPrefix(a, "-n") && len(a) > 2 && !strings.HasPrefix(a, "--") && isAllDigits(a[2:]) ||
 			strings.HasPrefix(a, "-o") && len(a) > 2 && !strings.HasPrefix(a, "--"):
 			// Compact -n20/-ocat or --lines=20/--output=cat; ignored.
 		case strings.HasPrefix(a, "-"):
@@ -812,7 +997,8 @@ func stripKillFlags(args []string) []string {
 	var out []string
 	for _, a := range args {
 		switch {
-		case a == "-q" || strings.HasPrefix(a, "--quiet") || a == "--no-warn":
+		case a == "-q" || strings.HasPrefix(a, "--quiet") || a == "--no-warn" ||
+			isIgnoredGlobalFlag(a):
 			// Ignored.
 		default:
 			out = append(out, a)
@@ -921,6 +1107,8 @@ func handleListUnits(client *ipc.Client, args []string) {
 			if a == "--failed" {
 				stateFilter["failed"] = struct{}{}
 			}
+		case isIgnoredGlobalFlag(a):
+			// Verb-independent plumbing forwarded from before the verb.
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
 			os.Exit(1)
@@ -1025,6 +1213,9 @@ func handleListUnitFiles(client *ipc.Client, args []string) {
 	// them for existence checks, so filter instead of listing everything.
 	var patterns []string
 	for _, a := range args {
+		if isIgnoredGlobalFlag(a) {
+			continue
+		}
 		if strings.HasPrefix(a, "-") {
 			fmt.Fprintf(os.Stderr, "unknown option %s\n", a)
 			os.Exit(1)
@@ -1114,7 +1305,7 @@ func decodeStatus(resp ipc.Response) ipc.StatusData {
 	return status
 }
 
-func printStatus(status ipc.StatusData, enabled string) {
+func printStatus(status ipc.StatusData, enabled string, maxLines int) {
 	unitBase := strings.TrimSuffix(status.Name, ".service")
 
 	fmt.Printf("● %s - %s\n", status.Name, status.Description)
@@ -1162,9 +1353,13 @@ func printStatus(status ipc.StatusData, enabled string) {
 		}
 	}
 
-	if len(status.Logs) > 0 {
+	logs := status.Logs
+	if maxLines >= 0 && len(logs) > maxLines {
+		logs = logs[len(logs)-maxLines:]
+	}
+	if len(logs) > 0 {
 		fmt.Println("\nLogs:")
-		for _, raw := range status.Logs {
+		for _, raw := range logs {
 			line := strings.TrimSpace(raw)
 
 			// strip kernel-style monotonic prefix: [1234.567890]
@@ -1230,14 +1425,16 @@ func fetchEnabledState(client *ipc.Client, unit string) string {
 	return fmt.Sprintf("%v", resp.Data)
 }
 
-func exitForState(state string) {
+// exitForState maps a unit state to the LSB exit code systemd documents:
+// active is 0, failed is 1, anything else (inactive, dead, unknown) is 3.
+func exitForState(state string) int {
 	switch state {
 	case "active":
-		os.Exit(0)
+		return 0
 	case "failed":
-		os.Exit(1)
+		return 1
 	default:
-		os.Exit(3)
+		return 3
 	}
 }
 
@@ -1280,6 +1477,9 @@ func printHelp() {
 	fmt.Println("  stop UNIT...         Stop (deactivate) one or more units")
 	fmt.Println("  restart UNIT...      Restart one or more units")
 	fmt.Println("  reload UNIT...       Reload one or more units")
+	fmt.Println("  try-restart UNIT...  Restart one or more units if active")
+	fmt.Println("  reload-or-restart UNIT...  Reload if possible, else restart")
+	fmt.Println("  try-reload-or-restart UNIT...  Reload if active, else restart")
 	fmt.Println("  status UNIT...       Show runtime status of one or more units")
 	fmt.Println("  is-active UNIT...    Check whether units are active")
 	fmt.Println("  is-failed [UNIT...]  Check whether units are failed")
@@ -1287,10 +1487,13 @@ func printHelp() {
 	fmt.Println("  is-system-running    Check overall system state")
 	fmt.Println("  enable UNIT...       Enable one or more unit files")
 	fmt.Println("  disable UNIT...      Disable one or more unit files")
+	fmt.Println("  reenable UNIT...     Reenable one or more unit files")
+	fmt.Println("  preset UNIT...       Enable/disable based on presets")
 	fmt.Println("  mask UNIT...         Mask one or more unit files")
 	fmt.Println("  unmask UNIT...       Unmask one or more unit files")
 	fmt.Println("  show UNIT...         Show properties of one or more units")
 	fmt.Println("  cat UNIT...          Show unit file contents")
+	fmt.Println("  help UNIT...         Show unit file contents")
 	fmt.Println("  kill UNIT...         Send signal to unit main process")
 	fmt.Println("  reset-failed [UNIT...] Reset failed state")
 	fmt.Println("  list-units [OPTIONS] List loaded units (--all, --state=, --type=)")
