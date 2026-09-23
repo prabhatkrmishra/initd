@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"initd/internal/boot"
 	"initd/internal/dbus"
@@ -9,12 +10,14 @@ import (
 	"initd/internal/logging"
 	"initd/internal/supervisor"
 	"initd/internal/userpaths"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -36,7 +39,7 @@ func main() {
 
 	if cfg.daemonize && os.Getpid() == 1 {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-		 "--daemonize refused under PID 1: the initial parent exit would panic the kernel; run without --daemonize as init")
+			"--daemonize refused under PID 1: the initial parent exit would panic the kernel; run without --daemonize as init")
 		os.Exit(1)
 	}
 	if cfg.daemonize && os.Getenv("INITD_DAEMONIZED") != "1" {
@@ -56,7 +59,7 @@ func main() {
 	signals := make(chan os.Signal, 16)
 
 	if initMode {
-		signal.Notify(signals, syscall.SIGTERM, syscall.SIGCHLD)
+		signal.Notify(signals, syscall.SIGTERM, syscall.SIGCHLD, syscall.SIGPWR)
 	} else {
 		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	}
@@ -89,7 +92,8 @@ func main() {
 	// Fallback for non-root: /run/initd.sock not writable
 	if socketPath == "/run/initd.sock" && os.Getuid() != 0 {
 		if _, err := os.Stat("/run"); err == nil {
-			if f, err := os.OpenFile("/run/initd.sock.test", os.O_CREATE|os.O_WRONLY, 0600); err != nil {
+			f, err := os.CreateTemp("/run", ".initd-probe-*")
+			if err != nil {
 				fallback := userpaths.SystemSocketPath()
 				if fallback == "/run/initd.sock" {
 					fallback = "/tmp/initd.sock"
@@ -98,19 +102,42 @@ func main() {
 					"no permission for %s, falling back to %s", socketPath, fallback)
 				socketPath = fallback
 			} else {
+				name := f.Name()
 				_ = f.Close()
-				_ = os.Remove("/run/initd.sock.test")
+				_ = os.Remove(name)
 			}
 		}
 	}
 
+	// stopServe is closed by shutdownDaemon. Serve loops check it before
+	// rebinding: without this a shutdown that removes the socket file
+	// would be undone a second later by the retry loop resurrecting it.
+	stopServe := make(chan struct{})
 	serveManager := func(path string, mgr *supervisor.Manager) {
+		backoff := time.Second
 		for {
 			if err := ipc.Serve(path, mgr); err != nil {
+				select {
+				case <-stopServe:
+					return
+				default:
+				}
 				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-					"ipc server error on %s: %v (retrying)", path, err)
-				time.Sleep(time.Second)
+					"ipc server error on %s: %v (retrying in %s)", path, err, backoff)
+				select {
+				case <-stopServe:
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
 				continue
+			}
+			select {
+			case <-stopServe:
+				return
+			default:
 			}
 		}
 	}
@@ -189,7 +216,8 @@ func main() {
 	// (session) bus is always attempted; the system bus is attempted too
 	// but is non-fatal: if initd is not root or no system dbus-daemon is
 	// reachable, we simply skip it and rely on the user bus instead.
-	go startDBusServers(systemManager, userManager)
+	dbusCtx, stopDBus := context.WithCancel(context.Background())
+	go startDBusServers(dbusCtx, systemManager, userManager)
 
 	if initMode {
 		// System units live under /etc/systemd/system and /usr/lib/systemd/system
@@ -230,6 +258,10 @@ func main() {
 					case syscall.SIGTERM:
 						logging.KernelPrintf(os.Stderr, "initd", 1,
 							"SIGTERM ignored by init")
+					case syscall.SIGPWR:
+						logging.KernelPrintf(os.Stderr, "initd", 1,
+							"power failure, shutting down")
+						boot.Shutdown(systemManager, "poweroff")
 					case syscall.SIGCHLD:
 						// reaper handles
 					}
@@ -256,8 +288,8 @@ func main() {
 				select {
 				case sig := <-signals:
 					switch sig {
-					case syscall.SIGTERM:
-						shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
+					case syscall.SIGTERM, syscall.SIGINT:
+						shutdownDaemon(sigName(sig), stopServe, stopDBus, socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
 					}
 				}
 			}
@@ -265,20 +297,48 @@ func main() {
 	}
 	// socket-only mode
 	sig := <-signals
-	if sig == syscall.SIGTERM {
-		shutdownDaemon(socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
+	if sig == syscall.SIGTERM || sig == syscall.SIGINT {
+		shutdownDaemon(sigName(sig), stopServe, stopDBus, socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
 	}
 
 }
 
-// shutdownDaemon performs a clean shutdown on SIGTERM: it stops managed units,
+// sigName renders a signal for shutdown logging.
+func sigName(sig os.Signal) string {
+	if sig == syscall.SIGINT {
+		return "SIGINT"
+	}
+	return "SIGTERM"
+}
+
+// stopManagerBounded stops one manager's units but never longer than the
+// bound: a replacement daemon (e.g. from install.sh's restart) must not
+// hang behind a stuck unit. Per-unit timeouts still apply inside.
+func stopManagerBounded(mgr *supervisor.Manager, bound time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		mgr.StopAllUnits()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(bound):
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"unit shutdown timed out, continuing anyway")
+	}
+}
+
+// shutdownDaemon performs a clean shutdown: it stops the serve loops first
+// (so they can't resurrect the sockets below), stops managed units,
 // removes the IPC sockets, pid file and releases the locks, then exits. This
 // lets a replacement daemon (e.g. from install.sh's restart) take over without
 // a stale socket or lock leaving a split-brain supervisor behind.
-func shutdownDaemon(socketPath, userSocket string, userLock, systemLock *os.File, systemManager, userManager *supervisor.Manager, pidFile string) {
-	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "received SIGTERM, shutting down")
-	userManager.StopAllUnits()
-	systemManager.StopAllUnits()
+func shutdownDaemon(why string, stopServe chan struct{}, stopDBus context.CancelFunc, socketPath, userSocket string, userLock, systemLock *os.File, systemManager, userManager *supervisor.Manager, pidFile string) {
+	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "received %s, shutting down", why)
+	close(stopServe)
+	stopDBus()
+	stopManagerBounded(userManager, 2*time.Minute)
+	stopManagerBounded(systemManager, 2*time.Minute)
 	systemManager.CloseJournal()
 	userManager.CloseJournal()
 	_ = os.Remove(userSocket)
@@ -316,14 +376,31 @@ func removeOwnPidFile(path string) {
 // non-fatal: if a bus isn't available (no dbus-daemon, non-root for system bus),
 // it logs and moves on. The user/session bus is the important one for the VPS
 // case, since initd's own session bus already exists at $XDG_RUNTIME_DIR/bus.
-func startDBusServers(systemManager, userManager *supervisor.Manager) {
-	ctx := context.Background()
+func startDBusServers(ctx context.Context, systemManager, userManager *supervisor.Manager) {
+	var mu sync.Mutex
+	var conns []io.Closer
+	defer func() {
+		// Release the bus names when the daemon shuts down so a
+		// replacement takes over cleanly instead of racing it.
+		go func() {
+			<-ctx.Done()
+			mu.Lock()
+			defer mu.Unlock()
+			for _, c := range conns {
+				_ = c.Close()
+			}
+		}()
+	}()
 	// User (session) bus — initd already owns org.freedesktop.DBus here, so we
 	// also own org.freedesktop.systemd1 and answer systemctl --user introspection.
 	// Retry briefly: the session bus may still be starting (install.sh or the
 	// autostart hook just forked dbus-daemon).
 	for i := 0; i < 5; i++ {
-		if _, err := dbus.ServeUserBus(ctx, userManager); err == nil {
+		conn, err := dbus.ServeUserBus(ctx, userManager)
+		if err == nil {
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
 			break
 		} else if i == 4 {
 			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
@@ -335,9 +412,13 @@ func startDBusServers(systemManager, userManager *supervisor.Manager) {
 	// System bus — allows /usr/bin/systemctl (system scope) to connect and get a
 	// verifiable answer. Non-fatal: fails for non-root or when no system
 	// dbus-daemon is running with a permissive systemd1 policy.
-	if _, err := dbus.ServeSystemBus(ctx, systemManager, userManager); err != nil {
+	if conn, err := dbus.ServeSystemBus(ctx, systemManager, userManager); err != nil {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 			"dbus system bus registration unavailable: %v", err)
+	} else {
+		mu.Lock()
+		conns = append(conns, conn)
+		mu.Unlock()
 	}
 }
 
@@ -377,8 +458,9 @@ func spawnDetached(cfg daemonConfig) error {
 		logPath = defaultLogFile()
 	}
 	if dir := filepath.Dir(logPath); dir != "" {
-		_ = os.MkdirAll(dir, 0o755)
+		_ = os.MkdirAll(dir, dirModeFor(dir))
 	}
+	maybeRotateLog(logPath)
 	logF, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open log file %s: %w", logPath, err)
@@ -398,7 +480,13 @@ func spawnDetached(cfg daemonConfig) error {
 		}
 		childArgs = append(childArgs, a)
 	}
-	cmd := exec.Command(os.Args[0], childArgs...)
+	// The child starts with Dir=/, where a relative argv[0] no longer
+	// resolves. Anchor it so detaching works from any cwd.
+	bin := os.Args[0]
+	if abs, err := filepath.Abs(bin); err == nil {
+		bin = abs
+	}
+	cmd := exec.Command(bin, childArgs...)
 	cmd.Env = append(os.Environ(), "INITD_DAEMONIZED=1")
 	cmd.Dir = "/"
 	cmd.Stdin = null
@@ -416,7 +504,7 @@ func spawnDetached(cfg daemonConfig) error {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := os.Stat(pidPath); err == nil {
+		if childWrotePidFile(pidPath, cmd.Process.Pid) {
 			return nil
 		}
 		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
@@ -429,11 +517,24 @@ func spawnDetached(cfg daemonConfig) error {
 	}
 }
 
+// dirModeFor keeps per-user runtime dirs private: /run/user/* and the
+// XDG runtime dir are 0700 on a normal system, so creating them 0755 would
+// leak pid files and sockets to other users.
+func dirModeFor(path string) os.FileMode {
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" && (path == xdg || len(path) > len(xdg)+1 && path[:len(xdg)+1] == xdg+"/") {
+		return 0o700
+	}
+	if len(path) > len("/run/user/") && path[:len("/run/user/")] == "/run/user/" {
+		return 0o700
+	}
+	return 0o755
+}
+
 // writePidFile records the daemon PID so hooks and boot scripts can wait on
 // a file instead of pgrep. Stale files from a dead owner are replaced.
 func writePidFile(path string) error {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, dirModeFor(dir)); err != nil {
 			return err
 		}
 	}
@@ -443,10 +544,42 @@ func writePidFile(path string) error {
 				if err := proc.Signal(syscall.Signal(0)); err == nil {
 					return fmt.Errorf("pid file %s already owned by live PID %d", path, pid)
 				}
+				if errors.Is(err, syscall.EPERM) {
+					// The process exists but belongs to another user;
+					// overwriting its pid file would hijack it.
+					return fmt.Errorf("pid file %s already owned by live PID %d", path, pid)
+				}
 			}
 		}
 	}
 	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644)
+}
+
+// maxDetachedLog is the point at which the detach log rotates: the daemon
+// appends there forever, so without a cap one verbose unit fills the disk.
+const maxDetachedLog = 64 << 20
+
+// maybeRotateLog moves a full detach log aside (keeping one backup) so it
+// stays bounded across months of appends.
+func maybeRotateLog(path string) {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() <= maxDetachedLog {
+		return
+	}
+	_ = os.Remove(path + ".prev")
+	_ = os.Rename(path, path+".prev")
+}
+
+// childWrotePidFile reports whether pidPath already names our child. The
+// detach parent waits on the pid file, and a stale file from a previous
+// crash (naming some other pid) must not count as a successful start.
+func childWrotePidFile(pidPath string, childPid int) bool {
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	return err == nil && pid == childPid
 }
 
 func parseArgs(args []string) (daemonConfig, error) {
