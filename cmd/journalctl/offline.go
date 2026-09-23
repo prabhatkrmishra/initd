@@ -27,6 +27,8 @@ func runOffline(opts journalOpts) int {
 		Priority: opts.priority, PrioritySet: opts.prioritySet,
 		Grep: opts.grep, CaseSensitive: opts.caseSensitive,
 		Identifier: opts.identifier, Cursor: opts.cursor,
+		Invocation: opts.invocation, ExcludeIdentifier: opts.excludeIdentifier,
+		LatestInvocation: opts.latestInvocation,
 		CursorAfter: opts.afterCursor != "",
 		Lines: opts.lines, LinesPlus: opts.linesPlus, Reverse: opts.reverse,
 	}
@@ -52,15 +54,15 @@ func runOffline(opts journalOpts) int {
 			req.Cursor, req.CursorAfter = raw, true
 		}
 	}
-	entries := fetchScopedEntries(opts, req)
-	lines := formatEntries(applyDisplayFilters(entries, opts), opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	entries := applyDisplayFilters(fetchScopedEntries(opts, req), opts)
+	trailer := ""
 	if opts.showCursor && len(entries) > 0 {
-		lines = append(lines, "-- cursor: "+entries[len(entries)-1].Cursor)
+		trailer = "-- cursor: " + entries[len(entries)-1].Cursor
 	}
 	if opts.cursorFile != "" && len(entries) > 0 {
 		_ = writeCursorFile(opts.cursorFile, entries[len(entries)-1].Cursor)
 	}
-	emitPaged(lines, opts)
+	emitEntries(entries, trailer, opts)
 	return 0
 }
 

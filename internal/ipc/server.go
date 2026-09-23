@@ -32,6 +32,9 @@ type Request struct {
 	Grep   string   `json:"grep,omitempty"`
 	CaseSensitive bool `json:"case_sensitive,omitempty"`
 	Identifier string `json:"identifier,omitempty"`
+	Invocation string `json:"invocation,omitempty"`
+	ExcludeIdentifier string `json:"exclude_identifier,omitempty"`
+	LatestInvocation bool `json:"latest_invocation,omitempty"`
 	Cursor string   `json:"cursor,omitempty"`
 	CursorAfter bool `json:"cursor_after,omitempty"`
 	Reverse bool    `json:"reverse,omitempty"`
@@ -370,6 +373,9 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			Grep:          req.Grep,
 			CaseSensitive: req.CaseSensitive,
 			Identifier:    req.Identifier,
+			Invocation:    req.Invocation,
+			ExcludeIdentifier: req.ExcludeIdentifier,
+			LatestInvocation: req.LatestInvocation,
 			Cursor:        req.Cursor,
 			CursorAfter:   req.CursorAfter,
 			Lines:         req.Lines,

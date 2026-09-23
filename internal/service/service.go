@@ -201,10 +201,26 @@ func (u *Unit) Start() (int, error) {
 	return token, nil
 }
 
+// newInvocationID mints a 128-bit run id like systemd's invocation ids:
+// the kernel uuid when available, else time plus pid (unique per host).
+func newInvocationID() string {
+	if raw, err := os.ReadFile("/proc/sys/kernel/random/uuid"); err == nil {
+		if id := strings.ReplaceAll(strings.TrimSpace(string(raw)), "-", ""); len(id) == 32 {
+			return id
+		}
+	}
+	return fmt.Sprintf("%016x%016x", time.Now().UnixNano(), os.Getpid())
+}
+
 func (u *Unit) runStartSequence(token int, args []string, envMap map[string]string, envList []string, ignoreFailure bool, argv0 string) {
 	if !u.isCurrentToken(token) {
 		return
 	}
+
+	// Every start (including restarts) is a new invocation: lines logged
+	// from here on carry its id so journalctl -I/--invocation can isolate
+	// this run from earlier ones.
+	u.Logs.SetInvocation(newInvocationID())
 
 	if err := u.runExecStartPre(token, envMap, envList); err != nil {
 		u.markFailed(err, false)

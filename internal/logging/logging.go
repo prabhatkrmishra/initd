@@ -35,6 +35,18 @@ type Buffer struct {
 	// file, when non-nil, receives every Add as JSONL. The ring stays a
 	// bounded hot cache; the file is the durable source of truth.
 	file *FileWriter
+	// invocation stamps the current unit run onto durable entries so
+	// journalctl --invocation/-I can tell runs apart. Empty for entries
+	// written before invocation tracking existed.
+	invocation string
+}
+
+// SetInvocation records the current unit run id. The supervisor calls it
+// on every start (including restarts) so all lines of one run share it.
+func (b *Buffer) SetInvocation(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.invocation = id
 }
 
 func NewBuffer(maxEntries int) *Buffer {
@@ -83,6 +95,7 @@ func (b *Buffer) Add(entry Entry) {
 	}
 	b.entries = append(b.entries, entry)
 	w := b.file
+	invocation := b.invocation
 	b.mu.Unlock()
 	if w != nil {
 		// Zero WallTime predates disk persistence (old tests, replayed
@@ -97,6 +110,7 @@ func (b *Buffer) Add(entry Entry) {
 			PID:           entry.PID,
 			Priority:      entry.Priority(),
 			Identifier:    entry.Identifier(),
+			InvocationID:  invocation,
 			Message:       entry.Message,
 			RealtimeUsec:  wall.UnixMicro(),
 		})

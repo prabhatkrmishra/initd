@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -15,7 +16,7 @@ import (
 var outputModes = map[string]bool{
 	"short": true, "short-precise": true, "short-iso": true,
 	"short-iso-precise": true, "short-full": true, "short-monotonic": true,
-	"short-unix": true, "verbose": true, "export": true,
+	"short-unix": true, "short-delta": true, "verbose": true, "export": true,
 	"json": true, "json-pretty": true, "json-sse": true, "json-seq": true,
 	"cat": true, "with-unit": true,
 }
@@ -37,33 +38,11 @@ func formatEntries(entries []logging.StoredEntry, mode string, utc, noHostname b
 		}
 	}
 	out := make([]string, 0, len(entries))
-	for _, e := range entries {
-		switch mode {
-		case "cat":
-			out = append(out, e.Message)
-		case "short-unix":
-			out = append(out, fmt.Sprintf("%d %s[%d]: %s", e.RealtimeUsec/1e6, e.Identifier, e.PID, e.Message))
-		case "short-monotonic":
-			out = append(out, fmt.Sprintf("[%12.6f] %s[%d]: %s", float64(e.MonotonicUsec)/1e6, e.Identifier, e.PID, e.Message))
-		case "short-precise":
-			out = append(out, fmt.Sprintf("%s %s[%d]: %s", wallString(e, utc, true), e.Identifier, e.PID, e.Message))
-		case "short-iso", "short-iso-precise":
-			out = append(out, fmt.Sprintf("%s %s[%d]: %s", isoString(e, utc), e.Identifier, e.PID, e.Message))
-		case "short-full":
-			out = append(out, fmt.Sprintf("%s %s %s[%d]: %s", wallString(e, utc, false), hostString(e, noHostname), e.Identifier, e.PID, e.Message))
-		case "with-unit":
-			out = append(out, fmt.Sprintf("%s %s[%d]: %s (%s)", wallString(e, utc, false), e.Identifier, e.PID, e.Message, e.Unit))
-		case "verbose":
-			out = append(out, verboseBlock(e, want, utc))
-		case "export":
-			out = append(out, exportBlock(e, want))
-		case "json", "json-sse", "json-seq":
-			out = append(out, jsonLine(e, want, false))
-		case "json-pretty":
-			out = append(out, jsonLine(e, want, true))
-		default: // short
-			out = append(out, fmt.Sprintf("%s %s %s[%d]: %s", wallString(e, utc, false), hostString(e, noHostname), e.Identifier, e.PID, e.Message))
-		}
+	var prev *logging.StoredEntry
+	for i := range entries {
+		e := entries[i]
+		out = append(out, formatOne(e, prev, mode, utc, noHostname, want))
+		prev = &entries[i]
 	}
 	if mode == "json-sse" && len(out) > 0 {
 		wrapped := make([]string, 0, len(out)+1)
@@ -81,6 +60,105 @@ func formatEntries(entries []logging.StoredEntry, mode string, utc, noHostname b
 		return wrapped
 	}
 	return out
+}
+
+// formatOne renders a single entry. prev is the previous entry in output
+// order (nil for the first) and feeds short-delta timestamps.
+func formatOne(e logging.StoredEntry, prev *logging.StoredEntry, mode string, utc, noHostname bool, want map[string]bool) string {
+	switch mode {
+	case "cat":
+		return e.Message
+	case "short-unix":
+		return fmt.Sprintf("%d %s[%d]: %s", e.RealtimeUsec/1e6, e.Identifier, e.PID, e.Message)
+	case "short-monotonic":
+		return fmt.Sprintf("[%12.6f] %s[%d]: %s", float64(e.MonotonicUsec)/1e6, e.Identifier, e.PID, e.Message)
+	case "short-delta":
+		return fmt.Sprintf("[%s%s] %s[%d]: %s", monoString(e), deltaString(prev, e), e.Identifier, e.PID, e.Message)
+	case "short-precise":
+			return fmt.Sprintf("%s %s[%d]: %s", wallString(e, utc, true), e.Identifier, e.PID, e.Message)
+	case "short-iso", "short-iso-precise":
+			return fmt.Sprintf("%s %s[%d]: %s", isoString(e, utc), e.Identifier, e.PID, e.Message)
+	case "short-full":
+			return fmt.Sprintf("%s %s %s[%d]: %s", wallString(e, utc, false), hostString(e, noHostname), e.Identifier, e.PID, e.Message)
+	case "with-unit":
+			return fmt.Sprintf("%s %s[%d]: %s (%s)", wallString(e, utc, false), e.Identifier, e.PID, e.Message, e.Unit)
+	case "verbose":
+			return verboseBlock(e, want, utc)
+	case "export":
+			return exportBlock(e, want)
+	case "json", "json-sse", "json-seq":
+			return jsonLine(e, want, false)
+	case "json-pretty":
+		return jsonLine(e, want, true)
+	default: // short
+		return fmt.Sprintf("%s %s %s[%d]: %s", wallString(e, utc, false), hostString(e, noHostname), e.Identifier, e.PID, e.Message)
+	}
+}
+
+// monoString renders monotonic seconds like short-monotonic.
+func monoString(e logging.StoredEntry) string {
+	return fmt.Sprintf("%12.6f", float64(e.MonotonicUsec)/1e6)
+}
+
+// deltaString renders the short-delta gap from the previous entry, mirroring
+// upstream: monotonic delta on the same boot, realtime delta marked "*" when
+// the boot differs or monotonic stamps are missing, blanks for the first line.
+func deltaString(prev *logging.StoredEntry, cur logging.StoredEntry) string {
+	blank := "                "
+	if prev == nil {
+		return blank
+	}
+	if prev.MonotonicUsec > 0 && cur.MonotonicUsec > 0 &&
+		prev.BootID != "" && prev.BootID == cur.BootID {
+		d := cur.MonotonicUsec - prev.MonotonicUsec
+		if d < 0 {
+			d = 0
+		}
+		return fmt.Sprintf(" <%5d.%06d >", d/1e6, d%1e6)
+	}
+	if prev.RealtimeUsec > 0 && cur.RealtimeUsec > 0 {
+		d := cur.RealtimeUsec - prev.RealtimeUsec
+		if d < 0 {
+			d = 0
+		}
+		return fmt.Sprintf(" <%5d.%06d*>", d/1e6, d%1e6)
+	}
+	return blank
+}
+
+// streamEntries writes entries line by line so large journals never sit
+// formatted in memory. It matches formatEntries output exactly (including
+// the json-sse trailing blank line).
+func streamEntries(w io.Writer, entries []logging.StoredEntry, mode string, utc, noHostname bool, fields string) {
+	if !outputModes[mode] {
+		mode = "short"
+	}
+	want := map[string]bool{}
+	if fields != "" {
+		for _, f := range strings.Split(fields, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				want[strings.ToUpper(f)] = true
+			}
+		}
+	}
+	var prev *logging.StoredEntry
+	for i := range entries {
+		e := entries[i]
+		line := formatOne(e, prev, mode, utc, noHostname, want)
+		prev = &entries[i]
+		switch mode {
+		case "json-sse":
+			fmt.Fprintln(w, "data: "+line)
+		case "json-seq":
+			fmt.Fprintln(w, "\x1e"+line)
+		default:
+			fmt.Fprintln(w, line)
+		}
+	}
+	if mode == "json-sse" && len(entries) > 0 {
+		fmt.Fprintln(w)
+	}
 }
 
 func wallTime(e logging.StoredEntry, utc bool) time.Time {
@@ -121,6 +199,7 @@ func entryMap(e logging.StoredEntry) map[string]string {
 		"_PID":                fmt.Sprintf("%d", e.PID),
 		"PRIORITY":            fmt.Sprintf("%d", e.Priority),
 		"SYSLOG_IDENTIFIER":   e.Identifier,
+		"_SYSTEMD_INVOCATION_ID": e.InvocationID,
 		"_HOSTNAME":           e.Hostname,
 		"MESSAGE":             e.Message,
 	}

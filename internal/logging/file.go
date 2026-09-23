@@ -27,6 +27,7 @@ type StoredEntry struct {
 	Priority     int    `json:"PRIORITY,omitempty"`
 	Identifier   string `json:"SYSLOG_IDENTIFIER,omitempty"`
 	Hostname     string `json:"_HOSTNAME,omitempty"`
+	InvocationID string `json:"_SYSTEMD_INVOCATION_ID,omitempty"`
 	Message      string `json:"MESSAGE"`
 }
 

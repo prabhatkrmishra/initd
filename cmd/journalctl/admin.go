@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"initd/internal/ipc"
 	"initd/internal/logging"
@@ -32,6 +33,12 @@ func runAdminCommand(opts journalOpts) int {
 		return runField(opts)
 	case opts.listBoots:
 		return runListBoots(opts)
+	case opts.listInvocations:
+		return runListInvocations(opts)
+	case opts.listNamespaces:
+		// initd keeps a single journal with no namespaces.
+		fmt.Println("No namespaces found.")
+		return 0
 	case opts.diskUsage:
 		return runDiskUsage(opts)
 	case opts.vacuumSize != "" || opts.vacuumFiles != "" || opts.vacuumTime != "":
@@ -91,7 +98,7 @@ func journalScope(opts journalOpts) (sockets []string, dirs []string) {
 // when a daemon is down) and merges in time order.
 func fetchScopedEntries(opts journalOpts, req ipc.Request) []logging.StoredEntry {
 	sockets, dirs := journalScope(opts)
-	var all []logging.StoredEntry
+	var scopes [][]logging.StoredEntry
 	for i, sock := range sockets {
 		var files []string
 		if i < len(dirs) {
@@ -99,14 +106,14 @@ func fetchScopedEntries(opts journalOpts, req ipc.Request) []logging.StoredEntry
 		}
 		if sock == "" {
 			entries, _ := logging.ReadAll(files)
-			all = append(all, filterLocal(entries, req)...)
+			scopes = append(scopes, filterLocal(entries, req))
 			continue
 		}
 		client := &ipc.Client{SocketPath: sock}
 		resp, err := client.Do(req)
 		if err != nil {
 			entries, _ := logging.ReadAll(files)
-			all = append(all, filterLocal(entries, req)...)
+			scopes = append(scopes, filterLocal(entries, req))
 			continue
 		}
 		if !resp.Success {
@@ -115,7 +122,23 @@ func fetchScopedEntries(opts journalOpts, req ipc.Request) []logging.StoredEntry
 		var entries []logging.StoredEntry
 		raw, _ := json.Marshal(resp.Data)
 		_ = json.Unmarshal(raw, &entries)
-		all = append(all, entries...)
+		scopes = append(scopes, entries)
+	}
+	nonEmpty := scopes[:0]
+	for _, sc := range scopes {
+		if len(sc) > 0 {
+			nonEmpty = append(nonEmpty, sc)
+		}
+	}
+	if len(nonEmpty) == 1 {
+		// Common case (one daemon, -D, --file): hand the slice back
+		// directly instead of copying everything into a merged array.
+		// Sources arrive in time order, so no re-sort is needed.
+		return nonEmpty[0]
+	}
+	var all []logging.StoredEntry
+	for _, sc := range nonEmpty {
+		all = append(all, sc...)
 	}
 	sort.Slice(all, func(a, b int) bool {
 		if all[a].RealtimeUsec == all[b].RealtimeUsec {
@@ -141,7 +164,9 @@ func filterLocal(entries []logging.StoredEntry, req ipc.Request) []logging.Store
 		Units: req.Units, BootID: req.Boot, SinceUsec: req.Since, UntilUsec: req.Until,
 		PriorityMax: req.Priority, PrioritySet: req.PrioritySet, Grep: req.Grep,
 		CaseSensitive: req.CaseSensitive, Identifier: req.Identifier,
-		Cursor: req.Cursor, CursorAfter: req.CursorAfter,
+		Invocation: req.Invocation, ExcludeIdentifier: req.ExcludeIdentifier,
+		LatestInvocation: req.LatestInvocation,
+		Cursor:           req.Cursor, CursorAfter: req.CursorAfter,
 		Lines: req.Lines, LinesPlus: req.LinesPlus, Reverse: req.Reverse,
 	})
 }
@@ -185,6 +210,51 @@ func runListBoots(opts journalOpts) int {
 		fmt.Printf("%d %s (%d entries)\n", i, id, seen[id])
 	}
 	return 0
+}
+
+func runListInvocations(opts journalOpts) int {
+	sockets, dirs := journalScope(opts)
+	var all []logging.StoredEntry
+	for i, sock := range sockets {
+		if sock == "" {
+			entries, _ := logging.ReadAll(expandDirEntry(dirs[i], opts))
+			all = append(all, entries...)
+			continue
+		}
+		client := &ipc.Client{SocketPath: sock}
+		resp, err := client.Do(ipc.Request{Action: "journal", Units: allRequestedUnits(opts)})
+		if err != nil || !resp.Success {
+			entries, _ := logging.ReadAll(expandDirEntry(dirs[i], opts))
+			all = append(all, entries...)
+			continue
+		}
+		var entries []logging.StoredEntry
+		raw, _ := json.Marshal(resp.Data)
+		_ = json.Unmarshal(raw, &entries)
+		all = append(all, entries...)
+	}
+	units := map[string]bool{}
+	for _, u := range allRequestedUnits(opts) {
+		units[u] = true
+		units[strings.TrimSuffix(u, ".service")] = true
+	}
+	n := 0
+	for _, inv := range logging.Invocations(all) {
+		if len(units) > 0 && !units[inv.Unit] && !units[strings.TrimSuffix(inv.Unit, ".service")] {
+			continue
+		}
+		n++
+		fmt.Printf("%d %s %s\n", n, inv.ID, formatUnixShort(inv.FirstUsec))
+	}
+	return 0
+}
+
+// formatUnixShort renders microsecond timestamps for --list-invocations.
+func formatUnixShort(usec int64) string {
+	if usec <= 0 {
+		return "-"
+	}
+	return time.UnixMicro(usec).Local().Format("Mon 2006-01-02 15:04:05 MST")
 }
 
 func runDiskUsage(opts journalOpts) int {
@@ -589,7 +659,7 @@ func runHeader(opts journalOpts) int {
 }
 
 func journalFieldNames() []string {
-	return []string{"__CURSOR", "__REALTIME_TIMESTAMP", "_MONOTONIC_USEC", "_BOOT_ID", "_SYSTEMD_UNIT", "_PID", "PRIORITY", "SYSLOG_IDENTIFIER", "_HOSTNAME", "MESSAGE"}
+	return []string{"__CURSOR", "__REALTIME_TIMESTAMP", "_MONOTONIC_USEC", "_BOOT_ID", "_SYSTEMD_UNIT", "_PID", "PRIORITY", "SYSLOG_IDENTIFIER", "_HOSTNAME", "_SYSTEMD_INVOCATION_ID", "MESSAGE"}
 }
 
 func runField(opts journalOpts) int {
@@ -650,6 +720,8 @@ func fieldValue(e logging.StoredEntry, name string) string {
 		return e.BootID
 	case "__CURSOR", "CURSOR":
 		return e.Cursor
+	case "_SYSTEMD_INVOCATION_ID", "INVOCATION_ID", "_INVOCATION_ID":
+		return e.InvocationID
 	case "__REALTIME_TIMESTAMP":
 		return fmt.Sprintf("%d", e.RealtimeUsec)
 	}

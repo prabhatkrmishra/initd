@@ -6,11 +6,17 @@ import (
 	"initd/internal/ipc"
 	"initd/internal/logging"
 	"initd/internal/userpaths"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/google/shlex"
 )
 
 const journalctlVersion = "1.1.0"
@@ -69,6 +75,9 @@ func main() {
 		Grep:        opts.grep,
 		CaseSensitive: opts.caseSensitive,
 		Identifier:    opts.identifier,
+		Invocation:    opts.invocation,
+		ExcludeIdentifier: opts.excludeIdentifier,
+		LatestInvocation: opts.latestInvocation,
 		Cursor:        opts.cursor,
 		Lines:         opts.lines,
 		LinesPlus:     opts.linesPlus,
@@ -104,15 +113,15 @@ func main() {
 		os.Exit(runFollow(client, req, opts))
 	}
 
-	entries := fetchEntries(client, req)
-	lines := formatEntries(applyDisplayFilters(entries, opts), opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	entries := applyDisplayFilters(fetchEntries(client, req), opts)
+	trailer := ""
 	if opts.showCursor && len(entries) > 0 {
-		lines = append(lines, "-- cursor: "+entries[len(entries)-1].Cursor)
+		trailer = "-- cursor: " + entries[len(entries)-1].Cursor
 	}
 	if opts.cursorFile != "" && len(entries) > 0 {
 		_ = writeCursorFile(opts.cursorFile, entries[len(entries)-1].Cursor)
 	}
-	emitPaged(lines, opts)
+	emitEntries(entries, trailer, opts)
 }
 
 // applyDisplayFilters implements the output-only flags the daemon never
@@ -156,15 +165,12 @@ func fetchEntries(client *ipc.Client, req ipc.Request) []logging.StoredEntry {
 
 // runFollow prints the current tail, then polls with after-cursor until
 // interrupted. Polling fits our request/response IPC: no streams needed,
-// and at supervisor log rates a 250ms cadence is instant to a human.
+// and at supervisor log rates a 250ms cadence is instant to a human. Follow
+// output never goes through the pager (like the real tool): it must stay
+// live instead of blocking on a pager quit.
 func runFollow(client *ipc.Client, req ipc.Request, opts journalOpts) int {
 	entries := applyDisplayFilters(fetchEntries(client, req), opts)
-	if !opts.noTail {
-		emitPaged(formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields), opts)
-	} else {
-		// --no-tail with -f means print everything buffered, then follow.
-		emitUnpaged(formatEntries(entries, opts.output, opts.utc, opts.noHostname, opts.outputFields))
-	}
+	streamEntries(os.Stdout, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
 	last := ""
 	if len(entries) > 0 {
 		last = entries[len(entries)-1].Cursor
@@ -185,9 +191,7 @@ func runFollow(client *ipc.Client, req ipc.Request, opts journalOpts) int {
 		if len(next) == 0 {
 			continue
 		}
-		for _, line := range formatEntries(next, opts.output, opts.utc, opts.noHostname, opts.outputFields) {
-			fmt.Println(line)
-		}
+		streamEntries(os.Stdout, next, opts.output, opts.utc, opts.noHostname, opts.outputFields)
 		last = next[len(next)-1].Cursor
 		if opts.cursorFile != "" {
 			_ = writeCursorFile(opts.cursorFile, last)
@@ -195,48 +199,96 @@ func runFollow(client *ipc.Client, req ipc.Request, opts journalOpts) int {
 	}
 }
 
-// emitPaged pipes through $PAGER/less on a tty unless --no-pager; -e jumps
-// to the end. Non-tty output never pages, like the real tool.
-func emitPaged(lines []string, opts journalOpts) {
-	if opts.noPager || !isTerminal() {
-		for _, l := range lines {
-			fmt.Println(l)
+// emitEntries streams entries to stdout, paging only on a tty without
+// --no-pager. The trailer (e.g. --show-cursor) travels through the pager
+// with the entries so output is never printed twice.
+func emitEntries(entries []logging.StoredEntry, trailer string, opts journalOpts) {
+	if opts.noPager || !isTerminal() || len(entries) == 0 && trailer == "" {
+		streamEntries(os.Stdout, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+		if trailer != "" {
+			fmt.Println(trailer)
 		}
 		return
 	}
-	pager := firstNonEmpty(os.Getenv("PAGER"), "less")
-	if opts.pagerEnd {
-		emitUnpaged(lines)
-		_ = exec.Command(pager, "+G").Run()
-		// Fall through to plain print: the +G hint above covers jump-end
-		// on pagers that support it; output itself stays in order.
-		for _, l := range lines {
-			fmt.Println(l)
+	runPager(entries, trailer, opts)
+}
+
+// resolvePager picks the pager like systemd does: $SYSTEMD_PAGER wins over
+// $PAGER, an explicitly empty value disables paging, otherwise less. The
+// value is shell-split so `PAGER="less -R"` works instead of looking for a
+// binary with a space in its name.
+func resolvePager() (string, []string, bool) {
+	if v, set := os.LookupEnv("SYSTEMD_PAGER"); set {
+		if strings.TrimSpace(v) == "" {
+			return "", nil, false
+		}
+		return splitPager(v)
+	}
+	if v, set := os.LookupEnv("PAGER"); set {
+		if strings.TrimSpace(v) == "" {
+			return "", nil, false
+		}
+		return splitPager(v)
+	}
+	return "less", nil, true
+}
+
+func splitPager(v string) (string, []string, bool) {
+	parts, err := shlex.Split(v)
+	if err != nil || len(parts) == 0 {
+		return v, nil, true
+	}
+	return parts[0], parts[1:], true
+}
+
+// runPager streams entries into the pager chunk by chunk instead of joining
+// them into one giant string, so large journals don't blow up memory. The
+// pager runs in its own process group and SIGINT is held while it owns the
+// screen: Ctrl-C then talks to the pager (less quits on it with -K) instead
+// of killing us mid-frame and wedging the terminal in raw mode. less opens
+// /dev/tty itself for keyboard input when its stdin is a pipe.
+func runPager(entries []logging.StoredEntry, trailer string, opts journalOpts) {
+	name, pargs, ok := resolvePager()
+	if !ok {
+		streamEntries(os.Stdout, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+		if trailer != "" {
+			fmt.Println(trailer)
 		}
 		return
 	}
-	cmd := exec.Command(pager)
-	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
+	if opts.pagerEnd && filepath.Base(name) == "less" {
+		pargs = append(pargs, "+G")
+	}
+	pr, pw := io.Pipe()
+	cmd := exec.Command(name, pargs...)
+	cmd.Stdin = pr
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		emitUnpaged(lines)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if filepath.Base(name) == "less" && os.Getenv("LESS") == "" {
+		// Upstream defaults: quit at once when everything fits one
+		// screen (short output never hangs), raw control chars, chop
+		// long lines, no alternate screen (nothing left behind).
+		cmd.Env = append(os.Environ(), "LESS=FRSXMK")
 	}
-}
-
-func emitUnpaged(lines []string) {
-	for _, l := range lines {
-		fmt.Println(l)
-	}
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return v
+	if err := cmd.Start(); err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		streamEntries(os.Stdout, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+		if trailer != "" {
+			fmt.Println(trailer)
 		}
+		return
 	}
-	return ""
+	signal.Ignore(syscall.SIGINT)
+	streamEntries(pw, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	if trailer != "" {
+		fmt.Fprintln(pw, trailer)
+	}
+	_ = pw.Close()
+	_ = cmd.Wait()
+	_ = pr.Close()
+	signal.Reset(syscall.SIGINT)
 }
 
 type journalOpts struct {
@@ -261,6 +313,9 @@ type journalOpts struct {
 	bootSet         bool
 	bootFailed      bool
 	identifier      string
+	excludeIdentifier string
+	invocation      string
+	latestInvocation bool
 	priority        int
 	prioritySet     bool
 	priorityRaw     string
@@ -294,6 +349,8 @@ type journalOpts struct {
 	header          bool
 	listFields      bool
 	field           string
+	listInvocations bool
+	listNamespaces  bool
 }
 
 // parseArgs handles the journalctl surface initd supports. Anything outside
@@ -411,6 +468,26 @@ func parseArgs(args []string) (journalOpts, error) {
 			opts.identifier = strings.TrimPrefix(a, "--identifier=")
 		case strings.HasPrefix(a, "-t"):
 			opts.identifier = strings.TrimPrefix(a, "-t")
+		case a == "-T" || a == "--exclude-identifier":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires a string", a)
+			}
+			opts.excludeIdentifier = args[i]
+		case strings.HasPrefix(a, "--exclude-identifier="):
+			opts.excludeIdentifier = strings.TrimPrefix(a, "--exclude-identifier=")
+		case strings.HasPrefix(a, "-T"):
+			opts.excludeIdentifier = strings.TrimPrefix(a, "-T")
+		case a == "-I":
+			opts.latestInvocation = true
+		case a == "--invocation":
+			i++
+			if i >= len(args) {
+				return opts, fmt.Errorf("%s requires an id", a)
+			}
+			opts.invocation = args[i]
+		case strings.HasPrefix(a, "--invocation="):
+			opts.invocation = strings.TrimPrefix(a, "--invocation=")
 		case a == "-p" || a == "--priority":
 			i++
 			if i >= len(args) {
@@ -471,7 +548,7 @@ func parseArgs(args []string) (journalOpts, error) {
 			opts.reverse = true
 		case a == "--utc":
 			opts.utc = true
-		case a == "--no-hostname":
+		case a == "--no-hostname" || a == "-W":
 			opts.noHostname = true
 		case a == "--no-full":
 			opts.noFull = true
@@ -503,12 +580,14 @@ func parseArgs(args []string) (journalOpts, error) {
 			opts.directory = strings.TrimPrefix(a, "--directory=")
 		case strings.HasPrefix(a, "--file="):
 			opts.file = strings.TrimPrefix(a, "--file=")
-		case a == "--file":
+		case a == "--file" || a == "-i":
 			i++
 			if i >= len(args) {
 				return opts, fmt.Errorf("%s requires a path", a)
 			}
 			opts.file = args[i]
+		case strings.HasPrefix(a, "-i"):
+			opts.file = strings.TrimPrefix(a, "-i")
 		case strings.HasPrefix(a, "--root="):
 			opts.root = strings.TrimPrefix(a, "--root=")
 		case a == "--root":
@@ -519,6 +598,13 @@ func parseArgs(args []string) (journalOpts, error) {
 			opts.root = args[i]
 		case a == "--list-boots":
 			opts.listBoots = true
+		case a == "--list-invocations":
+			opts.listInvocations = true
+		case a == "--list-namespaces":
+			opts.listNamespaces = true
+		case a == "--synchronize-on-exit" || strings.HasPrefix(a, "--synchronize-on-exit="):
+			// Accepted: the daemon flushes on its own cadence, so there is
+			// nothing extra to wait for on exit.
 		case a == "--disk-usage":
 			opts.diskUsage = true
 		case strings.HasPrefix(a, "--vacuum-size="):
@@ -702,7 +788,7 @@ func printHelp() {
 	fmt.Println("      --user                  Show the user journal for the current user")
 	fmt.Println("  -m, --merge                 Show entries from all available journals")
 	fmt.Println("  -D, --directory=PATH        Show journal files from directory")
-	fmt.Println("      --file=PATH             Show journal file")
+	fmt.Println("  -i, --file=PATH             Show journal file")
 	fmt.Println("      --root=PATH             Operate on an alternate filesystem root")
 	fmt.Println()
 	fmt.Println("Filtering Options:")
@@ -714,7 +800,10 @@ func printHelp() {
 	fmt.Println("  -b, --boot[=ID]             Show current boot or the specified boot")
 	fmt.Println("  -u, --unit=UNIT             Show logs from the specified unit")
 	fmt.Println("      --user-unit=UNIT        Show logs from the specified user unit")
+	fmt.Println("      --invocation=ID         Show logs from the matching invocation ID")
+	fmt.Println("  -I                          Show logs from the latest invocation of unit")
 	fmt.Println("  -t, --identifier=STRING     Show entries with the specified syslog identifier")
+	fmt.Println("  -T, --exclude-identifier=STRING Hide entries with the specified syslog identifier")
 	fmt.Println("  -p, --priority=RANGE        Show entries with the specified priority")
 	fmt.Println("  -g, --grep=PATTERN          Show entries with MESSAGE matching PATTERN")
 	fmt.Println("      --case-sensitive[=BOOL] Force case sensitive or insensitive matching")
@@ -722,7 +811,7 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Output Control Options:")
 	fmt.Println("  -o, --output=STRING         Change output mode (short, short-precise,")
-	fmt.Println("                                short-iso, short-full, short-monotonic, short-unix,")
+	fmt.Println("                                short-iso, short-full, short-monotonic, short-unix, short-delta,")
 	fmt.Println("                                verbose, export, json, json-pretty, json-sse,")
 	fmt.Println("                                json-seq, cat, with-unit)")
 	fmt.Println("      --output-fields=LIST    Select fields to print in verbose/export/json modes")
@@ -731,11 +820,12 @@ func printHelp() {
 	fmt.Println("      --show-cursor           Print the cursor after all the entries")
 	fmt.Println("      --utc                   Express time in Coordinated Universal Time (UTC)")
 	fmt.Println("  -x, --catalog               Accepted (no catalog content to add)")
-	fmt.Println("      --no-hostname           Suppress output of hostname field")
+	fmt.Println("  -W, --no-hostname           Suppress output of hostname field")
 	fmt.Println("  -a, --all                   Accepted (all fields always shown)")
 	fmt.Println("  -f, --follow                Follow the journal")
 	fmt.Println("      --no-tail               Show all lines, even in follow mode")
 	fmt.Println("  -q, --quiet                 Do not show info messages")
+	fmt.Println("      --synchronize-on-exit=BOOL Accepted (daemon flushes on its own cadence)")
 	fmt.Println()
 	fmt.Println("Pager Control Options:")
 	fmt.Println("      --no-pager              Do not pipe output into a pager")
@@ -745,6 +835,8 @@ func printHelp() {
 	fmt.Println("  -N, --fields                List all field names currently used")
 	fmt.Println("  -F, --field=FIELD           List all values that a specified field takes")
 	fmt.Println("      --list-boots            Show terse information about recorded boots")
+	fmt.Println("      --list-invocations      Show invocation IDs of specified unit")
+	fmt.Println("      --list-namespaces       Accepted (no namespaces under initd)")
 	fmt.Println("      --disk-usage            Show total disk usage of all journal files")
 	fmt.Println("      --vacuum-size=BYTES     Reduce disk usage below specified size")
 	fmt.Println("      --vacuum-files=INT      Leave only the specified number of journal files")
