@@ -787,6 +787,11 @@ func (u *Unit) runStopCommand(command string) error {
 }
 
 func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
+	// Deliberate deviation from systemd's minimal default: every unit
+	// inherits the daemon's full environment (container/chroot sessions
+	// rely on PATH/HOME/proxy flowing through), with Environment= and
+	// EnvironmentFile= overlaying on top. Units opt out per-variable
+	// with UnsetEnvironment= (parsed above, applied last).
 	envMap := map[string]string{}
 	for _, pair := range os.Environ() {
 		if key, value, ok := strings.Cut(pair, "="); ok {
@@ -812,6 +817,17 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 		}
 	}
 
+	for _, name := range u.GetConfig().Service.UnsetEnvironment {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		// Strip optional VAR= form down to the name.
+		if key, _, ok := strings.Cut(name, "="); ok {
+			name = strings.TrimSpace(key)
+		}
+		delete(envMap, name)
+	}
 	envList := make([]string, 0, len(envMap))
 	for key, value := range envMap {
 		envList = append(envList, fmt.Sprintf("%s=%s", key, value))

@@ -71,6 +71,7 @@ type ServiceSection struct {
 	LimitNOFILE              string
 	Environment              []string
 	EnvironmentFile          []string
+	UnsetEnvironment         []string
 }
 
 type SocketSection struct {
@@ -497,6 +498,12 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				} else {
 					unit.Service.EnvironmentFile = append(unit.Service.EnvironmentFile, value)
 				}
+			case "UnsetEnvironment":
+				if value == "" {
+					unit.Service.UnsetEnvironment = nil
+				} else {
+					unit.Service.UnsetEnvironment = append(unit.Service.UnsetEnvironment, splitList(value)...)
+				}
 			default:
 				unit.Ignored["Service."+key] = value
 			}
@@ -713,6 +720,9 @@ func mergeUnit(base, overlay *Unit) {
 	}
 	if len(overlay.Service.EnvironmentFile) > 0 {
 		base.Service.EnvironmentFile = append(base.Service.EnvironmentFile, overlay.Service.EnvironmentFile...)
+	}
+	if len(overlay.Service.UnsetEnvironment) > 0 {
+		base.Service.UnsetEnvironment = append(base.Service.UnsetEnvironment, overlay.Service.UnsetEnvironment...)
 	}
 	if len(overlay.Socket.ListenStream) > 0 {
 		base.Socket.ListenStream = append(base.Socket.ListenStream, overlay.Socket.ListenStream...)

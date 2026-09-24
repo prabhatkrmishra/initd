@@ -744,8 +744,7 @@ func buildServiceProps(mgr *supervisor.Manager, name string) map[string]*prop.Pr
 		"Environment":      {Value: cfg.GetConfig().Service.Environment, Writable: false, Emit: prop.EmitConst},
 		// EnvironmentFiles is a(sb): one (path, ignore-missing) struct per file.
 		"EnvironmentFiles": {Value: envFileSpecs(cfg.GetConfig().Service.EnvironmentFile), Writable: false, Emit: prop.EmitConst},
-		// The initd unit parser does not track UnsetEnvironment; report empty.
-		"UnsetEnvironment": {Value: []string{}, Writable: false, Emit: prop.EmitConst},
+		"UnsetEnvironment": {Value: cfg.GetConfig().Service.UnsetEnvironment, Writable: false, Emit: prop.EmitConst},
 	}
 }
 
@@ -813,10 +812,12 @@ func shellSplitExecStart(value string) []string {
 		args []string
 		cur  strings.Builder
 		inQ  byte
+		tok  bool
 	)
 	flush := func() {
 		args = append(args, cur.String())
 		cur.Reset()
+		tok = false
 	}
 	for i := 0; i < len(value); i++ {
 		c := value[i]
@@ -824,22 +825,27 @@ func shellSplitExecStart(value string) []string {
 		case c == '"' || c == '\'':
 			if inQ == c {
 				inQ = 0
+				tok = true
 			} else if inQ == 0 {
 				inQ = c
+				tok = true
 			} else {
 				cur.WriteByte(c)
+				tok = true
 			}
 		case c == ' ' || c == '\t':
 			if inQ != 0 {
 				cur.WriteByte(c)
-			} else if cur.Len() > 0 {
+				tok = true
+			} else if cur.Len() > 0 || tok {
 				flush()
 			}
 		default:
 			cur.WriteByte(c)
+			tok = true
 		}
 	}
-	if cur.Len() > 0 || len(args) > 0 && (value[len(value)-1] == '"' || value[len(value)-1] == '\'') {
+	if cur.Len() > 0 || tok {
 		flush()
 	}
 	return args

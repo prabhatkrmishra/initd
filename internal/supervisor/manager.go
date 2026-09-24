@@ -255,6 +255,10 @@ func (m *Manager) LoadUnits() error {
 	return nil
 }
 
+// onFailureCallback runs async (handleExitCode fires it via `go handler`),
+// never synchronously inside a startMu-held walk, so the StartUnit/Stop
+// calls below cannot deadlock against StartUnit's startMu. Keep it that
+// way: never invoke the returned func while holding startMu.
 func (m *Manager) onFailureCallback(unitName string) func(string) {
 	return func(failedUnit string) {
 		m.mu.Lock()
@@ -454,6 +458,9 @@ func (m *Manager) startSocketUnit(name string) error {
 	for _, rawPath := range cfg.Socket.ListenStream {
 		sockPath := m.expandSocketPath(rawPath)
 		dir := filepath.Dir(sockPath)
+		// Parent dirs are intentionally left behind on setup errors below:
+		// they are shared (/run, /run/user/<uid>) and may hold other
+		// sockets; only created listeners/paths are cleaned up.
 		_ = os.MkdirAll(dir, 0755)
 		_ = os.Remove(sockPath)
 		l, err := net.Listen("unix", sockPath)
