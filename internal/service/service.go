@@ -610,39 +610,11 @@ func (u *Unit) Stop(timeout time.Duration) error {
 	cmd := u.Cmd
 	u.mu.Unlock()
 
-	// -----------------------------
-	// Special handling for notify
-	// -----------------------------
-	if serviceType == "notify" {
-		if pid != 0 {
-			// Respect KillMode=process
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-		}
-
-		if u.reaper == nil && cmd != nil {
-			done := make(chan error, 1)
-			go func() {
-				done <- cmd.Wait()
-			}()
-
-			if timeout > 0 {
-				select {
-				case <-done:
-				case <-time.After(timeout):
-					if pid != 0 {
-						_ = syscall.Kill(pid, syscall.SIGKILL)
-					}
-					<-done
-				}
-			} else {
-				<-done
-			}
-		}
-
-		u.transitionState(StateInactive, "")
-		return nil
-	}
-
+	// Notify uses the same stop path as simple: kill the (possibly adopted)
+	// main PID or the whole process group per KillMode, poll for exit and
+	// escalate to SIGKILL after the timeout. The old notify-only branch
+	// killed a single PID and returned without waiting when a reaper was
+	// set, leaving children behind and reporting inactive while alive.
 	// -----------------------------
 	// Forking handling
 	// -----------------------------
@@ -939,11 +911,12 @@ func (u *Unit) handleExitStatusForPID(token int, watchedPID int, status syscall.
 func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
 	serviceType := u.canonicalServiceType()
 	if serviceType == "notify" && watchedPID != 0 && !u.StopRequested() {
-		adoptTimeout := u.StartTimeout()
-		if adoptTimeout <= 0 {
-			adoptTimeout = 30 * time.Second
-		}
-		if adoptedPID := u.waitForNotifyMainPID(watchedPID, adoptTimeout, 50*time.Millisecond); adoptedPID != 0 && adoptedPID != watchedPID {
+		// Non-blocking adopt check only: the old code waited up to
+		// StartTimeout (30s) inside the reaper callback, delaying
+		// failure reporting and racing waitNotify's timer. A daemon
+		// that forks-then-exits must have its successor visible already
+		// (PIDFile or group member); otherwise this exit is real.
+		if adoptedPID := u.adoptedNotifyPID(watchedPID); adoptedPID != 0 && adoptedPID != watchedPID {
 			u.mu.Lock()
 			if u.startToken == token {
 				if u.notifyServer != nil {
@@ -2057,12 +2030,40 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 	// Type=notify process that dies before sending READY=1 is left as a
 	// zombie and the unit is stuck in "activating" until timeout, then
 	// wrongly marked "active" because a zombie still passes processAlive.
-	// A single Wait() goroutine is shared by all branches below.
+	// A single Wait() goroutine is shared by all branches below. When a
+	// reaper owns Wait4 (production daemon), poll liveness instead so an
+	// early exit still fails fast; the reaper's own handler will also
+	// fire and duplicate handleExit is idempotent.
 	waitCh := make(chan error, 1)
-	if u.reaper == nil && cmd != nil {
-		go func(c *exec.Cmd) {
-			waitCh <- c.Wait()
-		}(cmd)
+	if cmd != nil && cmd.Process != nil {
+		if u.reaper == nil {
+			go func(c *exec.Cmd) {
+				waitCh <- c.Wait()
+			}(cmd)
+		} else {
+			go func(pid int, token int) {
+				for {
+					// Stop polling once this start is superseded or the
+				// unit left activating (READY arrived or reaper marked
+				// it Failed): post-READY exits belong to the reaper
+				// handler from runStartSequence, not this watcher.
+					if !u.IsCurrentToken(token) || u.StopRequested() {
+						return
+					}
+					if snap := u.Snapshot(); snap.State == StateActive || snap.State == StateFailed || snap.State == StateInactive {
+						return
+					}
+					if !processAlive(pid) {
+						select {
+						case waitCh <- fmt.Errorf("process exited"):
+						default:
+						}
+						return
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}(cmd.Process.Pid, token)
+		}
 	}
 
 	select {
@@ -2098,6 +2099,12 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 	case <-timer.C:
 		u.mu.Lock()
 		if u.startToken != token || u.stopRequested {
+			u.mu.Unlock()
+			return
+		}
+		// The reaper handler may have already resolved an early exit
+		// while we slept: never resurrect Failed/Inactive with Active.
+		if u.Runtime.State == StateFailed || u.Runtime.State == StateInactive {
 			u.mu.Unlock()
 			return
 		}
