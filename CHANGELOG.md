@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `systemctl` accepts global flags (`--no-pager`, `--quiet`, `--now`, `-n`, `-o`, `--state`, `--type`, `-p`, `-P`, `--value`, `-s`, …) before the verb as well as after it, like real systemctl. `try-restart`, `reload-or-restart`, `try-reload-or-restart`, `reenable`, `preset`, and `help` are now listed in `--help`.
+- `journalctl` gained `-i`, `-W`, `-T/--exclude-identifier`, `-I/--invocation`, `--list-invocations`, `--list-namespaces`, `--synchronize-on-exit`, and `-o short-delta` (upstream delta format). Units stamp a fresh `_SYSTEMD_INVOCATION_ID` on every start so `-I` and `--invocation` isolate runs.
+- `loginctl` covers the full session/user/seat verb set with strict flag parsing, `-P`, `-a/--all`, `--legend=`, `--json`/`-j`, greppable column-zero `show-*` output, and a real linger store (`/var/lib/initd/linger`, else the user state dir).
+
+### Fixed
+- `systemctl` verbs act on every unit instead of just the first, with combined LSB exit codes (unknown units report `unknown` and exit 4); `status` caps logs at 10 lines unless `-n` says otherwise; `--quiet` suppresses `is-active`/`is-enabled`/`is-failed`; usage errors go to stderr in all shims.
+- `journalctl` streams entries to stdout/pager instead of joining them into one giant string (52MB journal: ~185MB steady down to ~121MB), pages with `SYSTEMD_PAGER` > `PAGER` precedence, shell-split pager commands, `LESS=FRSXMK` defaults, and SIGINT held while the pager owns the screen; `-e` prints once with `+G` for less; `-f` never pages.
+- `loginctl` no longer swallows flag typos and no longer reports linger as always on; session/seat actions fail honestly instead of pretending to work.
+- `initd` shuts down cleanly on SIGINT, no longer resurrects sockets after shutdown (stop-aware serve loops with backoff), bounds unit stops during daemon shutdown, refuses to steal other users' pid files, keeps runtime dirs 0700, rotates the 64MB detach log, verifies the detached child via its pid file, detaches from any cwd, releases D-Bus names on shutdown, and powers off orderly on SIGPWR as PID 1.
+
+
 ## [1.0.3] - 2026-09-02
 
 ### Fixed

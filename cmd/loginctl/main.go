@@ -691,7 +691,7 @@ func userShell(name string) string {
 }
 
 func usage() {
-	fmt.Println("Usage: loginctl [OPTIONS...] COMMAND ...")
+	fmt.Fprintln(os.Stderr, "Usage: loginctl [OPTIONS...] COMMAND ...")
 }
 
 func wantsHelp(args []string) bool {

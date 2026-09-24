@@ -20,23 +20,53 @@ for f in /tmp/real-systemctl-help.txt /tmp/real-journalctl-help.txt /tmp/real-lo
   [ -s "$f" ] && ok "reference $(basename "$f")" || bad "reference $f missing"
 done
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  (cd "$ROOT" && GOCACHE=/tmp/gocache GOPROXY=off go build ./... >/tmp/compat-build.log 2>&1) \
+  # Sandboxes often mount the default build cache read-only; fall back to
+  # a temp cache so the harness works there too.
+  _gocache=$(go env GOCACHE 2>/dev/null)
+  if [ -z "$_gocache" ] || [ ! -w "$_gocache" ]; then
+    export GOCACHE=/tmp/gocache
+    mkdir -p "$GOCACHE"
+  fi
+  (cd "$ROOT" && go build ./... >/tmp/compat-build.log 2>&1) \
     && ok "go build ./..." || { bad "go build ./... (see /tmp/compat-build.log)"; tail -5 /tmp/compat-build.log; }
 fi
 for v in systemctl journalctl loginctl initd; do
   "$ROOT/build/linux-amd64/$v" --help >/dev/null 2>&1 && ok "$v --help runs" || bad "$v --help fails"
 done
-echo "--- behavior spot checks (informational in Phase 0) ---"
+echo "--- behavior checks (enforced since Phases 1-3) ---"
 if "$ROOT/build/linux-amd64/systemctl" --no-pager status foo >/tmp/compat-sc.log 2>&1; then
   echo "systemctl --no-pager status foo exit=0 (daemon answered, unexpected here)"
 else
   if grep -q "Usage:" /tmp/compat-sc.log; then
-    echo "systemctl --no-pager status foo: rejected at parse (Phase 1 target: parses past Usage)"
+    bad "systemctl --no-pager status foo rejected at parse"
   else
-    echo "systemctl --no-pager status foo: parsed, failed past parse (dial, Phase 1 parse part done)"
+    ok "systemctl before-verb flags parse"
   fi
 fi
-"$ROOT/build/linux-amd64/journalctl" --help 2>&1 | grep -q "short-delta" && echo "journalctl short-delta: present" || echo "journalctl short-delta: missing (Phase 2)"
-"$ROOT/build/linux-amd64/loginctl" show-user root 2>&1 | grep -q "^Name=" && echo "loginctl show-user col0: yes" || echo "loginctl show-user col0: no (Phase 3)"
+if "$ROOT/build/linux-amd64/journalctl" --help 2>&1 | grep -q "short-delta"; then
+  ok "journalctl short-delta present"
+else
+  bad "journalctl short-delta missing"
+fi
+if "$ROOT/build/linux-amd64/journalctl" --help 2>&1 | grep -q -- "--list-invocations"; then
+  ok "journalctl invocation flags present"
+else
+  bad "journalctl invocation flags missing"
+fi
+if "$ROOT/build/linux-amd64/loginctl" show-user root 2>&1 | grep -q "^Name="; then
+  ok "loginctl show-user col0"
+else
+  bad "loginctl show-user col0"
+fi
+if "$ROOT/build/linux-amd64/loginctl" --nolegend list-users >/tmp/compat-lc.log 2>&1; then
+  bad "loginctl typo flag accepted"
+else
+  ok "loginctl typo flag rejected"
+fi
+if "$ROOT/build/linux-amd64/loginctl" --help 2>&1 | grep -q "list-sessions"; then
+  ok "loginctl session verbs present"
+else
+  bad "loginctl session verbs missing"
+fi
 if [ "$fail" -ne 0 ]; then echo "PROBE FAILED"; exit 1; fi
 echo "PROBE PASSED"

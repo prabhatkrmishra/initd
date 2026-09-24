@@ -1525,7 +1525,10 @@ func ensureUserDaemon(socketPath string) {
 	if bin == "" {
 		return
 	}
-	cmd := exec.Command(bin, "--socket")
+	// Aim at the user socket explicitly: a bare --socket would listen on
+	// the system default instead, and the dial check below would never
+	// succeed. (Abstract sockets return before this point.)
+	cmd := exec.Command(bin, "--socket="+socketPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	// When root runs systemctl --user (via sudo), the spawned daemon must
