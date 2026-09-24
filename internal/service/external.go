@@ -187,6 +187,13 @@ func (u *Unit) FindExternalPID() (int, string) {
 // externally (SysV / manual / nohup start, e.g. a daemon launched via
 // /etc/init.d or nohup outside initd supervision). It also returns
 // the external PID (0 when none).
+//
+// Matching is argv-based over a whole-/proc scan: a deliberately coarse
+// compatibility fallback. Two units with byte-identical commands can claim
+// the same process, and a hand-run copy of a command is indistinguishable
+// from the real daemon. Cgroup membership (process identity via controller,
+// not command line) would be the strong fix; initd has no cgroup tracking,
+// so treat external matches as advisory, never as supervision.
 func (u *Unit) EffectiveState() (State, int) {
 	snap := u.Snapshot()
 	if snap.State == StateActive || snap.State == StateActivating {
