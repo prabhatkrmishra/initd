@@ -159,6 +159,7 @@ func (m *Manager) LoadUnits() error {
 			path := filepath.Join(dir, entry.Name())
 			unitConfig, err := parser.ParseUnitWithDropins(path, m.SearchPaths, m.EnabledRoot)
 			if err != nil {
+				logKernelWarning("skipping unparsable unit " + path + ": " + err.Error())
 				continue
 			}
 			unitConfig.Name = entry.Name()
@@ -369,6 +370,7 @@ func (m *Manager) loadUnitFromDiskLocked(n string) *service.Unit {
 		}
 		unitConfig, err := parser.ParseUnitWithDropins(p, m.SearchPaths, m.EnabledRoot)
 		if err != nil {
+			logKernelWarning("skipping unparsable unit " + p + ": " + err.Error())
 			continue
 		}
 		unitConfig.Name = n

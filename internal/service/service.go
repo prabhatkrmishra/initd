@@ -770,7 +770,7 @@ func (u *Unit) Reload() error {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{}, u.StartTimeout()); err != nil {
 			return err
 		}
 	}
@@ -783,7 +783,7 @@ func (u *Unit) runStopCommand(command string) error {
 		return err
 	}
 
-	return u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly})
+	return u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}, u.StopTimeout())
 }
 
 func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
@@ -968,6 +968,15 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 
 	u.mu.Lock()
 	if u.startToken != token {
+		u.mu.Unlock()
+		return
+	}
+
+	// Preserve an earlier failure reason (e.g. ExecStartPost): waitSimple
+	// kills the main process after marking Failed, and the reaper's exit
+	// for that SIGTERM must not overwrite LastError with "terminated by
+	// signal SIGTERM" / 143.
+	if u.Runtime.State == StateFailed {
 		u.mu.Unlock()
 		return
 	}
@@ -1414,6 +1423,7 @@ func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr strin
 }
 
 func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []string) error {
+	timeout := u.StartTimeout()
 	for _, command := range u.GetConfig().Service.ExecStartPre {
 		if !u.isCurrentToken(token) {
 			return nil
@@ -1421,7 +1431,7 @@ func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []st
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}, timeout); err != nil {
 			return err
 		}
 	}
@@ -1440,7 +1450,7 @@ func (u *Unit) runExecCondition() (string, error) {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		status, err := u.runCommandStatus(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly})
+		status, err := u.runCommandStatus(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}, u.StartTimeout())
 		if err != nil {
 			return "", err
 		}
@@ -1457,6 +1467,7 @@ func (u *Unit) runExecCondition() (string, error) {
 }
 
 func (u *Unit) runExecStartPost(token int, envMap map[string]string, envList []string) error {
+	timeout := u.StartTimeout()
 	for _, command := range u.GetConfig().Service.ExecStartPost {
 		if !u.isCurrentToken(token) {
 			return nil
@@ -1464,7 +1475,7 @@ func (u *Unit) runExecStartPost(token int, envMap map[string]string, envList []s
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}, timeout); err != nil {
 			return err
 		}
 	}
@@ -1472,6 +1483,7 @@ func (u *Unit) runExecStartPost(token int, envMap map[string]string, envList []s
 }
 
 func (u *Unit) runExecStopPost() error {
+	timeout := u.StopTimeout()
 	envMap, envList, err := u.buildEnvironment()
 	if err != nil {
 		return err
@@ -1480,15 +1492,15 @@ func (u *Unit) runExecStopPost() error {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}, timeout); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (u *Unit) runCommand(command string, envMap map[string]string, envList []string, opts commandOptions) error {
-	status, err := u.runCommandStatus(command, envMap, envList, opts)
+func (u *Unit) runCommand(command string, envMap map[string]string, envList []string, opts commandOptions, timeout time.Duration) error {
+	status, err := u.runCommandStatus(command, envMap, envList, opts, timeout)
 	command, ignoreFailure := stripPrefix(command)
 	if err != nil {
 		if ignoreFailure {
@@ -1505,7 +1517,7 @@ func (u *Unit) runCommand(command string, envMap map[string]string, envList []st
 	return nil
 }
 
-func (u *Unit) runCommandStatus(command string, envMap map[string]string, envList []string, opts commandOptions) (int, error) {
+func (u *Unit) runCommandStatus(command string, envMap map[string]string, envList []string, opts commandOptions, timeout time.Duration) (int, error) {
 	command, ignoreFailure := stripPrefix(command)
 	command = u.expandSpecifiers(command)
 	expanded := expandWithEnv(command, envMap)
@@ -1537,26 +1549,94 @@ func (u *Unit) runCommandStatus(command string, envMap map[string]string, envLis
 	}
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
+	// Helpers honor the unit's start/stop timeout instead of waiting forever:
+	// a stuck ExecStartPre must fail the start, not wedge the unit in
+	// activating. timeout <= 0 means systemd "infinity" (wait unbounded).
+	killHelper := func() {
+		pid := 0
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+		if pid > 0 {
+			// Helpers run in their own process group (Setpgid); take the
+			// whole group so orphaned grandchildren don't linger.
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	timeoutErr := func() error {
+		if ignoreFailure {
+			return nil
+		}
+		return fmt.Errorf("command timed out after %s: %s", timeout, command)
+	}
 	if u.reaper != nil {
 		done := make(chan syscall.WaitStatus, 1)
 		u.reaper.Register(cmd.Process.Pid, func(status syscall.WaitStatus) {
-			done <- status
-		})
-		status := <-done
-		return commandExitStatus(status), nil
-	}
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				return commandExitStatus(status), nil
+			select {
+			case done <- status:
+			default:
 			}
+		})
+		if timeout <= 0 {
+			status := <-done
+			return commandExitStatus(status), nil
 		}
+		select {
+		case status := <-done:
+			return commandExitStatus(status), nil
+		case <-time.After(timeout):
+			killHelper()
+			if ignoreFailure {
+				return 0, nil
+			}
+			return 0, timeoutErr()
+		}
+	}
+	type waitRes struct {
+		status int
+		err    error
+	}
+	resCh := make(chan waitRes, 1)
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+					resCh <- waitRes{status: commandExitStatus(status)}
+					return
+				}
+			}
+			resCh <- waitRes{err: err}
+			return
+		}
+		resCh <- waitRes{}
+	}()
+	if timeout <= 0 {
+		res := <-resCh
+		if res.err != nil {
+			if ignoreFailure {
+				return 0, nil
+			}
+			return 0, res.err
+		}
+		return res.status, nil
+	}
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			if ignoreFailure {
+				return 0, nil
+			}
+			return 0, res.err
+		}
+		return res.status, nil
+	case <-time.After(timeout):
+		killHelper()
 		if ignoreFailure {
 			return 0, nil
 		}
-		return 0, err
+		return 0, timeoutErr()
 	}
-	return 0, nil
 }
 
 func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, error) {

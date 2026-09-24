@@ -240,11 +240,44 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 	}
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// Join backslash continuations into logical lines before parsing:
+	// a trailing odd-run backslash escapes the newline and the next line's
+	// leading whitespace is stripped, so multi-line ExecStart and friends
+	// parse as one entry instead of failing on a bare continuation.
+	var logical []string
+	var cur string
+	pending := false
+	for scanner.Scan() {
+		raw := scanner.Text()
+		if pending {
+			raw = trimLeftSpaces(raw)
+			cur += raw
+		} else {
+			cur = raw
+		}
+		stripped := trimRightSpaces(cur)
+		if trailingBackslashes(stripped)%2 == 1 {
+			cur = stripped[:len(stripped)-1]
+			pending = true
+			continue
+		}
+		logical = append(logical, cur)
+		cur = ""
+		pending = false
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if pending {
+		// Dangling backslash at EOF: keep what we have, like systemd.
+		logical = append(logical, cur)
+	}
 	section := ""
 	seenEntries := 0
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, rawLine := range logical {
+		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
@@ -710,4 +743,22 @@ func splitList(value string) []string {
 		return nil
 	}
 	return fields
+}
+
+func trimLeftSpaces(s string) string {
+	return strings.TrimLeft(s, " \t\r")
+}
+
+func trimRightSpaces(s string) string {
+	return strings.TrimRight(s, " \t\r")
+}
+
+// trailingBackslashes counts consecutive backslashes at the end of s.
+// An odd count means the final newline is escaped (continuation).
+func trailingBackslashes(s string) int {
+	n := 0
+	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
+		n++
+	}
+	return n
 }
