@@ -113,6 +113,14 @@ func main() {
 		os.Exit(runFollow(client, req, opts))
 	}
 
+	// Unbounded non-reverse queries stream in cursor pages (flat memory on
+	// both ends) instead of materializing the whole result. Invocation
+	// grouping needs the full set to find the newest run, so it keeps the
+	// old path; those results are one run and small by construction.
+	if req.Lines == 0 && !req.Reverse && !req.LatestInvocation {
+		os.Exit(runUnbounded(client, req, opts))
+	}
+
 	entries := applyDisplayFilters(fetchEntries(client, req), opts)
 	trailer := ""
 	if opts.showCursor && len(entries) > 0 {
@@ -247,14 +255,20 @@ func splitPager(v string) (string, []string, bool) {
 // screen: Ctrl-C then talks to the pager (less quits on it with -K) instead
 // of killing us mid-frame and wedging the terminal in raw mode. less opens
 // /dev/tty itself for keyboard input when its stdin is a pipe.
-func runPager(entries []logging.StoredEntry, trailer string, opts journalOpts) {
+// journalPageSize bounds one IPC round-trip and one in-memory chunk when
+// streaming an unbounded query. 5000 entries are ~1-2MB on the wire:
+// small enough to stay flat under spam, large enough to keep round-trips
+// negligible.
+const journalPageSize = 5000
+
+// startPager launches the pager like runPager does and returns its stdin
+// plus a finish func that prints the trailer and waits. When no pager is
+// available it returns stdout with a nil finish (caller prints the trailer
+// itself), exactly mirroring runPager's fallbacks.
+func startPager(opts journalOpts) (io.Writer, func(string)) {
 	name, pargs, ok := resolvePager()
 	if !ok {
-		streamEntries(os.Stdout, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
-		if trailer != "" {
-			fmt.Println(trailer)
-		}
-		return
+		return os.Stdout, nil
 	}
 	if opts.pagerEnd && filepath.Base(name) == "less" {
 		pargs = append(pargs, "+G")
@@ -274,21 +288,89 @@ func runPager(entries []logging.StoredEntry, trailer string, opts journalOpts) {
 	if err := cmd.Start(); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
-		streamEntries(os.Stdout, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
-		if trailer != "" {
-			fmt.Println(trailer)
-		}
-		return
+		return os.Stdout, nil
 	}
 	signal.Ignore(syscall.SIGINT)
-	streamEntries(pw, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
-	if trailer != "" {
-		fmt.Fprintln(pw, trailer)
+	finish := func(trailer string) {
+		if trailer != "" {
+			fmt.Fprintln(pw, trailer)
+		}
+		_ = pw.Close()
+		_ = cmd.Wait()
+		_ = pr.Close()
+		signal.Reset(syscall.SIGINT)
 	}
-	_ = pw.Close()
-	_ = cmd.Wait()
-	_ = pr.Close()
-	signal.Reset(syscall.SIGINT)
+	return pw, finish
+}
+
+func runPager(entries []logging.StoredEntry, trailer string, opts journalOpts) {
+	pw, finish := startPager(opts)
+	streamEntries(pw, entries, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+	if finish != nil {
+		finish(trailer)
+	} else if trailer != "" {
+		fmt.Println(trailer)
+	}
+}
+
+// runUnbounded streams a query with no line limit in fixed cursor pages so
+// neither the source nor this client ever holds the whole result: each page
+// is a bounded head-after-cursor request answered by scanning to the limit
+// and stopping. Rotation mid-stream can duplicate or skip a boundary entry;
+// ordering within a boot is exact.
+func runUnbounded(client *ipc.Client, req ipc.Request, opts journalOpts) int {
+	return streamUnbounded(req, opts, func(q ipc.Request) []logging.StoredEntry {
+		return fetchEntries(client, q)
+	})
+}
+
+// streamUnbounded drives chunked output for unbounded non-reverse queries.
+// fetch returns one raw page for the paged request; the driver advances the
+// cursor, filters, emits and tracks the trailer cursor. Memory stays flat:
+// one page in flight at a time on top of steady output.
+func streamUnbounded(req ipc.Request, opts journalOpts, fetch func(ipc.Request) []logging.StoredEntry) int {
+	var pw io.Writer
+	var finish func(string)
+	if !opts.noPager && isTerminal() {
+		pw, finish = startPager(opts)
+	} else {
+		pw = os.Stdout
+	}
+	q := req
+	q.Lines = journalPageSize
+	q.LinesPlus = true
+	last := ""
+	haveLast := false
+	for {
+		raw := fetch(q)
+		if len(raw) == 0 {
+			break
+		}
+		q.Cursor = raw[len(raw)-1].Cursor
+		q.CursorAfter = true
+		chunk := applyDisplayFilters(raw, opts)
+		if len(chunk) > 0 {
+			streamEntries(pw, chunk, opts.output, opts.utc, opts.noHostname, opts.outputFields)
+			last = chunk[len(chunk)-1].Cursor
+			haveLast = true
+		}
+		if len(raw) < journalPageSize {
+			break
+		}
+	}
+	trailer := ""
+	if opts.showCursor && haveLast {
+		trailer = "-- cursor: " + last
+	}
+	if opts.cursorFile != "" && haveLast {
+		_ = writeCursorFile(opts.cursorFile, last)
+	}
+	if finish != nil {
+		finish(trailer)
+	} else if trailer != "" {
+		fmt.Println(trailer)
+	}
+	return 0
 }
 
 type journalOpts struct {

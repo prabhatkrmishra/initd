@@ -54,6 +54,18 @@ func runOffline(opts journalOpts) int {
 			req.Cursor, req.CursorAfter = raw, true
 		}
 	}
+	// Single-source offline queries stream in cursor pages like the live
+	// path (flat memory); merged multi-source queries keep the old
+	// materializing path since one cursor cannot page several scopes.
+	if req.Lines == 0 && !req.Reverse && !req.LatestInvocation {
+		if _, dirs := journalScope(opts); len(dirs) == 1 {
+			files := expandDirEntry(dirs[0], opts)
+			return streamUnbounded(req, opts, func(q ipc.Request) []logging.StoredEntry {
+				out, _ := logging.QueryJournalStream(files, requestFilter(q))
+				return out
+			})
+		}
+	}
 	entries := applyDisplayFilters(fetchScopedEntries(opts, req), opts)
 	trailer := ""
 	if opts.showCursor && len(entries) > 0 {

@@ -158,9 +158,10 @@ func expandDirEntry(dir string, opts journalOpts) []string {
 	return logging.ListFiles(dir)
 }
 
-// filterLocal applies the request filter to offline-read entries.
-func filterLocal(entries []logging.StoredEntry, req ipc.Request) []logging.StoredEntry {
-	return logging.QueryJournal(entries, logging.JournalFilter{
+// requestFilter maps an IPC journal request onto the log query filter so
+// live, offline and streaming paths filter identically.
+func requestFilter(req ipc.Request) logging.JournalFilter {
+	return logging.JournalFilter{
 		Units: req.Units, BootID: req.Boot, SinceUsec: req.Since, UntilUsec: req.Until,
 		PriorityMax: req.Priority, PrioritySet: req.PrioritySet, Grep: req.Grep,
 		CaseSensitive: req.CaseSensitive, Identifier: req.Identifier,
@@ -168,7 +169,12 @@ func filterLocal(entries []logging.StoredEntry, req ipc.Request) []logging.Store
 		LatestInvocation: req.LatestInvocation,
 		Cursor:           req.Cursor, CursorAfter: req.CursorAfter,
 		Lines: req.Lines, LinesPlus: req.LinesPlus, Reverse: req.Reverse,
-	})
+	}
+}
+
+// filterLocal applies the request filter to offline-read entries.
+func filterLocal(entries []logging.StoredEntry, req ipc.Request) []logging.StoredEntry {
+	return logging.QueryJournal(entries, requestFilter(req))
 }
 
 func runListBoots(opts journalOpts) int {

@@ -455,29 +455,50 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true, Data: manager.NeedDaemonReload()}
 	case "journal":
+		filter := logging.JournalFilter{
+			Units:             req.Units,
+			BootID:           req.Boot,
+			SinceUsec:        req.Since,
+			UntilUsec:        req.Until,
+			PriorityMax:      req.Priority,
+			PrioritySet:      req.PrioritySet,
+			Grep:             req.Grep,
+			CaseSensitive:    req.CaseSensitive,
+			Identifier:       req.Identifier,
+			Invocation:       req.Invocation,
+			ExcludeIdentifier: req.ExcludeIdentifier,
+			LatestInvocation:  req.LatestInvocation,
+			Cursor:           req.Cursor,
+			CursorAfter:      req.CursorAfter,
+			Lines:             req.Lines,
+			LinesPlus:         req.LinesPlus,
+			Reverse:          req.Reverse,
+		}
+		// Bounded head-after-cursor queries stream file-by-file and stop
+		// at the limit, so listing a huge journal never loads it whole.
+		// Every other shape (tails, reverse, invocation grouping) still
+		// needs the full set and uses the materializing path.
+		if req.Lines > 0 && req.LinesPlus && !req.Reverse && !req.LatestInvocation {
+			out, err := logging.QueryJournalStream(manager.JournalFiles(), filter)
+			if err != nil {
+				return Response{Success: false, Message: err.Error()}
+			}
+			return Response{Success: true, Data: out}
+		}
+		// Tail-N queries stop after banking N matches from the newest
+		// files, so `-n` is finally a safe workaround on huge journals.
+		if req.Lines > 0 && !req.LinesPlus && !req.Reverse && !req.LatestInvocation && req.Cursor == "" {
+			out, err := logging.QueryJournalTail(manager.JournalFiles(), filter)
+			if err != nil {
+				return Response{Success: false, Message: err.Error()}
+			}
+			return Response{Success: true, Data: out}
+		}
 		entries, err := logging.ReadAll(manager.JournalFiles())
 		if err != nil {
 			return Response{Success: false, Message: err.Error()}
 		}
-		out := logging.QueryJournal(entries, logging.JournalFilter{
-			Units:         req.Units,
-			BootID:        req.Boot,
-			SinceUsec:     req.Since,
-			UntilUsec:     req.Until,
-			PriorityMax:   req.Priority,
-			PrioritySet:   req.PrioritySet,
-			Grep:          req.Grep,
-			CaseSensitive: req.CaseSensitive,
-			Identifier:    req.Identifier,
-			Invocation:    req.Invocation,
-			ExcludeIdentifier: req.ExcludeIdentifier,
-			LatestInvocation: req.LatestInvocation,
-			Cursor:        req.Cursor,
-			CursorAfter:   req.CursorAfter,
-			Lines:         req.Lines,
-			LinesPlus:     req.LinesPlus,
-			Reverse:       req.Reverse,
-		})
+		out := logging.QueryJournal(entries, filter)
 		return Response{Success: true, Data: out}
 	case "journal-boots":
 		entries, err := logging.ReadAll(manager.JournalFiles())

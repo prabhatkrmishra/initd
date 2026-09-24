@@ -124,3 +124,37 @@ func TestEntryHelpers(t *testing.T) {
 		t.Fatalf("helpers = %d/%q", e.Priority(), e.Identifier())
 	}
 }
+
+// Retention enforced on rotate must bound file count and bytes while never
+// deleting the active file.
+func TestRetentionOnRotate(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewFileWriter(dir, "boot-r", "h", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.SetRetention(3, 1<<20)
+	for i := 0; i < 30; i++ {
+		_ = w.Append(StoredEntry{Unit: "a.service", Message: "padding line to force rotation over the tiny cap xx"})
+	}
+	_ = w.Sync()
+	files := ListFiles(dir)
+	if len(files) > 4 { // 3 retained + active
+		t.Fatalf("files = %d, want <= 4", len(files))
+	}
+	active := dir + "/boot-r.jsonl"
+	found := false
+	for _, f := range files {
+		if f == active {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("active file must survive retention: %v", files)
+	}
+	entries, _ := ReadAll(files)
+	if len(entries) == 0 {
+		t.Fatalf("retention must leave readable history")
+	}
+	_ = w.Close()
+}

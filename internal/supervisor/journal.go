@@ -52,6 +52,16 @@ func (m *Manager) OpenJournal() error {
 	if err != nil {
 		return err
 	}
+	// Cap total retention so a chatty unit cannot grow the journal without
+	// bound between explicit vacuums. Mirrors VacuumJournal's defaults:
+	// user scope keeps ~20MB, system scope ~100MB, both at most 10 files.
+	// Age expiry stays manual (`--vacuum-time`); rotation only enforces
+	// size/count, never deletes the active file.
+	if m.UserMode {
+		w.SetRetention(10, 20<<20)
+	} else {
+		w.SetRetention(10, 100<<20)
+	}
 	m.journal = w
 	for _, u := range m.Units {
 		u.Logs.AttachFile(w)

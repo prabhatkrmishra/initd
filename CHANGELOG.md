@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Unbounded `journalctl` queries no longer load the whole journal into RAM on either end: clients page head-after-cursor in fixed chunks (including offline single-source reads and pager output), the daemon answers bounded pages by scanning to the limit and stopping, and tail `-n` reads newest-first with early stop. A spam-looping unit can no longer OOM the daemon or the client.
+- The daemon now caps journal retention automatically (user scope ~20MB/10 files, system ~100MB/10 files, active file never deleted) so history cannot grow without bound between explicit vacuums.
+
 ### Added
 - `systemctl` accepts global flags (`--no-pager`, `--quiet`, `--now`, `-n`, `-o`, `--state`, `--type`, `-p`, `-P`, `--value`, `-s`, …) before the verb as well as after it, like real systemctl. `try-restart`, `reload-or-restart`, `try-reload-or-restart`, `reenable`, `preset`, and `help` are now listed in `--help`.
 - `journalctl` gained `-i`, `-W`, `-T/--exclude-identifier`, `-I/--invocation`, `--list-invocations`, `--list-namespaces`, `--synchronize-on-exit`, and `-o short-delta` (upstream delta format). Units stamp a fresh `_SYSTEMD_INVOCATION_ID` on every start so `-I` and `--invocation` isolate runs.

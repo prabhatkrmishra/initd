@@ -40,6 +40,11 @@ type FileWriter struct {
 	bootID   string
 	hostname string
 	maxBytes int64
+	// retainFiles/retainBytes cap total retention, enforced on every
+	// rotate so history cannot grow without bound between explicit
+	// vacuums. Zero disables (library default; the daemon opts in).
+	retainFiles int
+	retainBytes int64
 	seq      uint64
 	offset   uint64
 	file     *os.File
@@ -237,6 +242,64 @@ func (w *FileWriter) Rotate() error {
 	return w.rotateLocked()
 }
 
+// SetRetention caps the journal directory at roughly files files and
+// bytes total, enforced automatically after each rotation. Never deletes
+// the active file. Zero disables.
+func (w *FileWriter) SetRetention(files int, bytes int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.retainFiles = files
+	w.retainBytes = bytes
+}
+
+// enforceRetentionLocked deletes oldest generations until the caps hold.
+// Caller holds w.mu. Only runs on rotation, so steady-state cost is nil.
+// The active file is never deleted.
+func (w *FileWriter) enforceRetentionLocked() {
+	if w.retainFiles <= 0 && w.retainBytes <= 0 {
+		return
+	}
+	active := w.activePath()
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return
+	}
+	type generation struct {
+		path string
+		size int64
+	}
+	var gens []generation
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		full := filepath.Join(w.dir, e.Name())
+		if full == active {
+			continue
+		}
+		st, err := os.Stat(full)
+		if err != nil {
+			continue
+		}
+		gens = append(gens, generation{full, st.Size()})
+		total += st.Size()
+	}
+	sort.Slice(gens, func(i, j int) bool { return gens[i].path < gens[j].path })
+	kept := len(gens)
+	for _, g := range gens {
+		tooMany := w.retainFiles > 0 && kept > w.retainFiles
+		tooBig := w.retainBytes > 0 && total > w.retainBytes
+		if !tooMany && !tooBig {
+			break
+		}
+		if os.Remove(g.path) == nil {
+			total -= g.size
+		}
+		kept--
+	}
+}
+
 func (w *FileWriter) rotateLocked() error {
 	if w.buf != nil {
 		_ = w.buf.Flush()
@@ -250,7 +313,11 @@ func (w *FileWriter) rotateLocked() error {
 	w.file = nil
 	w.buf = nil
 	w.offset = 0
-	return w.openLocked()
+	if err := w.openLocked(); err != nil {
+		return err
+	}
+	w.enforceRetentionLocked()
+	return nil
 }
 
 // Close flushes and releases the writer.
