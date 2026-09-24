@@ -2,7 +2,9 @@ package logging
 
 import (
 	"fmt"
+	"os"
 	"testing"
+	"time"
 )
 
 func seedStreamFiles(t *testing.T, dir, boot string, n int) []StoredEntry {
@@ -129,6 +131,73 @@ func TestTailMatchesQuery(t *testing.T) {
 			if got[i].Cursor != full[i].Cursor {
 				t.Fatalf("n=%d entry %d differs", n, i)
 			}
+		}
+	}
+}
+
+// Files older than the window must be skipped without opening.
+func TestFilesNewerThan(t *testing.T) {
+	dir := t.TempDir()
+	old, recent := dir+"/old.jsonl", dir+"/recent.jsonl"
+	if err := os.WriteFile(old, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recent, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMicro()
+	kept := filesNewerThan([]string{old, recent, dir + "/missing.jsonl"}, now-10*60*1000000)
+	if len(kept) != 2 || kept[0] != recent || kept[1] != dir+"/missing.jsonl" {
+		t.Fatalf("kept = %v", kept)
+	}
+	if got := filesNewerThan([]string{old, recent}, 0); len(got) != 2 {
+		t.Fatalf("zero since must keep all: %v", got)
+	}
+}
+
+// A trailing window over mostly-stale files returns only fresh matches.
+func TestStreamSkipsStaleFiles(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewFileWriter(dir, "boot-old", "h", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTs := time.Now().Add(-2 * time.Hour).UnixMicro()
+	for i := 0; i < 20; i++ {
+		_ = w.Append(StoredEntry{Unit: "old.service", PID: 1, Priority: 6, Message: "ancient", RealtimeUsec: oldTs})
+	}
+	_ = w.Sync()
+	_ = w.Close()
+	for _, f := range ListFiles(dir) {
+		past := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(f, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w2, err := NewFileWriter(dir, "boot-new", "h", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		_ = w2.Append(StoredEntry{Unit: "new.service", PID: 1, Priority: 6, Message: "fresh"})
+	}
+	_ = w2.Sync()
+	_ = w2.Close()
+	since := time.Now().Add(-10 * time.Minute).UnixMicro()
+	out, err := QueryJournalStream(ListFiles(dir), JournalFilter{SinceUsec: since, Lines: 100, LinesPlus: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 5 {
+		t.Fatalf("got %d, want only the 5 fresh entries", len(out))
+	}
+	for _, e := range out {
+		if e.Unit != "new.service" {
+			t.Fatalf("stale entry leaked: %+v", e)
 		}
 	}
 }

@@ -271,6 +271,32 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
+// filesNewerThan drops files whose modification time predates sinceUsec.
+// A journal file's mtime tracks its last flush, which always follows the
+// entries it contains (buffered appends flush after the lines they carry,
+// and rotation renames preserve mtime), so a file older than the window
+// cannot hold in-window entries and is skipped without opening. Paths that
+// cannot be stated are kept. This turns trailing-window queries over deep
+// history from full-archive scans into recent-file reads.
+func filesNewerThan(files []string, sinceUsec int64) []string {
+	if sinceUsec <= 0 {
+		return files
+	}
+	kept := make([]string, 0, len(files))
+	for _, path := range files {
+		st, err := os.Stat(path)
+		if err != nil {
+			kept = append(kept, path)
+			continue
+		}
+		if st.ModTime().UnixMicro() < sinceUsec {
+			continue
+		}
+		kept = append(kept, path)
+	}
+	return kept
+}
+
 // QueryJournalStream answers a first-N-after-cursor query (Lines>0 with
 // LinesPlus, no Reverse, no LatestInvocation) by scanning files oldest-first
 // and stopping as soon as limit matches are collected, so unbounded journals
@@ -282,6 +308,7 @@ func QueryJournalStream(files []string, f JournalFilter) ([]StoredEntry, error) 
 	if f.Lines <= 0 {
 		return nil, nil
 	}
+	files = filesNewerThan(files, f.SinceUsec)
 	units := journalUnits(f)
 	grep := journalGrepLower(f)
 	out := make([]StoredEntry, 0, f.Lines)
@@ -333,6 +360,7 @@ func QueryJournalTail(files []string, f JournalFilter) ([]StoredEntry, error) {
 	if f.Lines <= 0 {
 		return nil, nil
 	}
+	files = filesNewerThan(files, f.SinceUsec)
 	units := journalUnits(f)
 	grep := journalGrepLower(f)
 	var chunks [][]StoredEntry
