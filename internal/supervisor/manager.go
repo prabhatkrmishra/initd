@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"initd/internal/logging"
 	"initd/internal/parser"
 	"initd/internal/service"
@@ -530,41 +532,109 @@ func (m *Manager) startSocketUnit(name string) error {
 	for _, l := range listeners {
 		go m.acceptLoop(name, rt, l)
 	}
+	for _, pc := range packets {
+		go m.packetLoop(name, rt, pc)
+	}
 
 	return nil
 }
 
+// socketFD extracts the underlying fd for readiness polling without
+// consuming anything. Both *net.UnixListener and *net.UnixConn implement
+// syscall.Conn.
+func socketFD(v interface{ SyscallConn() (syscall.RawConn, error) }) (int, bool) {
+	raw, err := v.SyscallConn()
+	if err != nil {
+		return -1, false
+	}
+	fd := -1
+	if err := raw.Control(func(f uintptr) { fd = int(f) }); err != nil || fd < 0 {
+		return -1, false
+	}
+	return fd, true
+}
+
+// pollReadable reports whether fd has pending connections/datagrams,
+// waiting up to timeoutMs. False covers timeout and errors; callers loop
+// and re-check stopCh.
+func pollReadable(fd int, timeoutMs int) bool {
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, timeoutMs)
+	if err != nil || n <= 0 {
+		return false
+	}
+	return fds[0].Revents&unix.POLLIN != 0
+}
+
+// triggerSocketActivation starts the service when it is not already
+// running. The triggering connection/datagram is never consumed here:
+// for Accept=no semantics the listener/packet fd stays unread so the
+// first request remains queued for the child, which receives the same
+// fds via LISTEN_FDS.
+func (m *Manager) triggerSocketActivation(serviceName, socketName string, rt *socketRuntime) {
+	unit, err := m.FindUnit(serviceName)
+	if err != nil {
+		return
+	}
+	snap := unit.Snapshot()
+	if snap.State == service.StateActive || snap.State == service.StateActivating {
+		return
+	}
+	if err := m.startWithSocketActivation(serviceName, socketName, rt); err != nil {
+		_ = m.StartUnit(serviceName)
+	}
+}
+
 func (m *Manager) acceptLoop(socketName string, rt *socketRuntime, l net.Listener) {
 	serviceName := strings.TrimSuffix(socketName, ".socket") + ".service"
+	sc, ok := l.(syscall.Conn)
+	if !ok {
+		return
+	}
+	fd, ok := socketFD(sc)
+	if !ok {
+		return
+	}
 	for {
 		select {
 		case <-rt.stopCh:
 			return
 		default:
 		}
-		conn, err := l.Accept()
-		if err != nil {
-			select {
-			case <-rt.stopCh:
-				return
-			default:
-				continue
-			}
+		if !pollReadable(fd, 500) {
+			continue
 		}
-		go func(c net.Conn) {
-			defer c.Close()
-			unit, err := m.FindUnit(serviceName)
-			if err != nil {
-				return
-			}
-			snap := unit.Snapshot()
-			if snap.State == service.StateActive || snap.State == service.StateActivating {
-				return
-			}
-			if err := m.startWithSocketActivation(serviceName, socketName, rt); err != nil {
-				_ = m.StartUnit(serviceName)
-			}
-		}(conn)
+		m.triggerSocketActivation(serviceName, socketName, rt)
+		// Keep polling (do not Accept): when the child accepts, the
+		// queue drains and poll goes quiet; if the service later stops,
+		// the next connection triggers a fresh start. A short pause
+		// avoids hot-polling while a queued connection waits for an
+		// already-running child to accept it.
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (m *Manager) packetLoop(socketName string, rt *socketRuntime, pc net.PacketConn) {
+	serviceName := strings.TrimSuffix(socketName, ".socket") + ".service"
+	sc, ok := pc.(syscall.Conn)
+	if !ok {
+		return
+	}
+	fd, ok := socketFD(sc)
+	if !ok {
+		return
+	}
+	for {
+		select {
+		case <-rt.stopCh:
+			return
+		default:
+		}
+		if !pollReadable(fd, 500) {
+			continue
+		}
+		m.triggerSocketActivation(serviceName, socketName, rt)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
