@@ -762,6 +762,10 @@ func (m *Manager) startUnitWithDependencies(name string, started map[string]stru
 	if err != nil {
 		return err
 	}
+	if err := unit.AdmitStart(); err != nil {
+		delete(stack, name)
+		return err
+	}
 	stack[name] = struct{}{}
 
 	// Conflicts: stop conflicting active units before starting
@@ -1084,7 +1088,16 @@ func (m *Manager) RestartUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	return unit.Restart(unit.StopTimeout())
+	if err := unit.Stop(unit.StopTimeout()); err != nil {
+		return err
+	}
+	// Restarts consume the same StartLimit budget as starts; otherwise
+	// repeated `systemctl restart` bypasses the storm guard entirely.
+	if err := unit.AdmitStart(); err != nil {
+		return err
+	}
+	_, err = unit.Start()
+	return err
 }
 
 func (m *Manager) ReloadUnit(name string) error {

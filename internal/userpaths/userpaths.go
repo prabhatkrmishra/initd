@@ -130,6 +130,19 @@ func UserJournalDir() string {
 	return filepath.Join(UserStateDir(), "journal")
 }
 
+// UserCacheDir follows XDG ($XDG_CACHE_HOME or ~/.cache), falling back to
+// the runtime dir when HOME is unavailable (minimal chroots).
+func UserCacheDir() string {
+	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "initd")
+	}
+	home := RealHome()
+	if home != "" && home != "/tmp" {
+		return filepath.Join(home, ".cache", "initd")
+	}
+	return filepath.Join(UserRuntimeDir(), "cache")
+}
+
 // UserStateDir follows XDG ($XDG_STATE_HOME or ~/.local/state), falling back
 // to the runtime dir when HOME is unavailable (minimal chroots).
 func UserStateDir() string {

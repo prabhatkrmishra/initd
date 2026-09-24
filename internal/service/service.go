@@ -17,6 +17,7 @@ import (
 
 	"initd/internal/logging"
 	"initd/internal/parser"
+	"initd/internal/userpaths"
 
 	"github.com/google/shlex"
 )
@@ -140,6 +141,28 @@ func (u *Unit) supervisedPGID() int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.pgid
+}
+
+// AdmitStart enforces StartLimitBurst for every Manager-driven start path
+// (manual systemctl starts, dependency starts, OnFailure forwards), not
+// just the automatic restart loop. Already-running units are no-ops and
+// cost nothing. Over budget it marks the unit failed, mirroring the
+// restart loop's "repeated too quickly" behavior.
+func (u *Unit) AdmitStart() error {
+	interval, burst := u.StartLimit()
+	if interval <= 0 || burst <= 0 {
+		return nil
+	}
+	snap := u.Snapshot()
+	if snap.State == StateActive || snap.State == StateActivating {
+		return nil
+	}
+	if n := u.RecordRestart(time.Now(), interval); n > burst {
+		u.MarkFailed("Start request repeated too quickly")
+		u.Log(logging.LevelError, "Start request repeated too quickly.")
+		return fmt.Errorf("Start request repeated too quickly")
+	}
+	return nil
 }
 
 // AllowFailureForward reports whether an OnFailure edge into this unit may
@@ -1461,23 +1484,37 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 }
 
 func (u *Unit) ensureRuntimeDirectory() error {
-	return u.ensureNamedDirectories("/run", u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode)
+	runBase, _, _, _, _ := u.directoryBases()
+	return u.ensureNamedDirectories(runBase, u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode)
+}
+
+// directoryBases resolves Runtime/State/Cache/Logs/Configuration roots for
+// the manager scope. System daemons (root) use the FHS paths; anything else
+// is a user manager that cannot create /run or /var/*, so XDG locations are
+// used instead. The daemon UID decides, not per-unit User= (which only
+// affects the child credentials, not where the supervisor may write).
+func (u *Unit) directoryBases() (run, state, cache, logs, config string) {
+	if os.Geteuid() == 0 {
+		return "/run", "/var/lib", "/var/cache", "/var/log", "/etc"
+	}
+	return userpaths.UserRuntimeDir(), userpaths.UserStateDir(), userpaths.UserCacheDir(), filepath.Join(userpaths.UserStateDir(), "log"), userpaths.UserConfigHome()
 }
 
 func (u *Unit) ensureManagedDirectories() error {
-	if err := u.ensureRuntimeDirectory(); err != nil {
+	runBase, stateBase, cacheBase, logsBase, configBase := u.directoryBases()
+	if err := u.ensureNamedDirectories(runBase, u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/var/lib", u.GetConfig().Service.StateDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories(stateBase, u.GetConfig().Service.StateDirectory, "0755"); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/var/cache", u.GetConfig().Service.CacheDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories(cacheBase, u.GetConfig().Service.CacheDirectory, "0755"); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/var/log", u.GetConfig().Service.LogsDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories(logsBase, u.GetConfig().Service.LogsDirectory, "0755"); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/etc", u.GetConfig().Service.ConfigurationDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories(configBase, u.GetConfig().Service.ConfigurationDirectory, "0755"); err != nil {
 		return err
 	}
 	return nil
@@ -1758,15 +1795,33 @@ func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, 
 	limitNOFILE := strings.TrimSpace(u.GetConfig().Service.LimitNOFILE)
 	var cmd *exec.Cmd
 	if umask != "" || limitNOFILE != "" {
+		// Validate before spawning: a malformed value must fail the start
+		// instead of running silently without the requested setting.
+		if umask != "" {
+			if _, err := validateUMask(umask); err != nil {
+				return nil, err
+			}
+		}
+		if limitNOFILE != "" {
+			if _, err := validateLimitNOFILE(limitNOFILE); err != nil {
+				return nil, err
+			}
+		}
+		// NOTE: configuring either directive routes exec through /bin/sh,
+		// changing the immediate child from the service binary to a shell
+		// that sets up and execs (same PID after exec, but an extra fork
+		// and shell signal semantics before it). A Linux-specific pre-exec
+		// setup (prctl/setrlimit in the child) would avoid the wrapper;
+		// until then failures abort via && so they can never be silent.
 		setup := make([]string, 0, 2)
 		if umask != "" {
 			setup = append(setup, fmt.Sprintf("umask %s", umask))
 		}
 		if limitNOFILE != "" {
-			setup = append(setup, fmt.Sprintf("ulimit -n %s >/dev/null 2>&1 || true", limitNOFILE))
+			setup = append(setup, fmt.Sprintf("ulimit -n %s", limitNOFILE))
 		}
 		setup = append(setup, `exec "$@"`)
-		shellArgs := []string{"-c", strings.Join(setup, "; "), "_"}
+		shellArgs := []string{"-c", strings.Join(setup, " && "), "_"}
 		shellArgs = append(shellArgs, args...)
 		cmd = exec.Command("/bin/sh", shellArgs...)
 	} else {
@@ -2583,6 +2638,28 @@ func parseSystemdDuration(raw string, defaultValue time.Duration) time.Duration 
 		mult = 30 * 24 * time.Hour
 	}
 	return time.Duration(val * float64(mult))
+}
+
+// validateUMask parses a UMask value (octal, 000-777). Anything else fails
+// the start instead of running with an unintended mask.
+func validateUMask(raw string) (os.FileMode, error) {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(raw), 8, 32)
+	if err != nil || parsed > 0o777 {
+		return 0, fmt.Errorf("invalid UMask %q: want octal 000-777", raw)
+	}
+	return os.FileMode(parsed), nil
+}
+
+// validateLimitNOFILE parses LimitNOFILE (integer or infinity/unlimited).
+func validateLimitNOFILE(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if strings.EqualFold(s, "infinity") || strings.EqualFold(s, "unlimited") {
+		return s, nil
+	}
+	if _, err := strconv.ParseUint(s, 10, 64); err != nil || s == "" {
+		return "", fmt.Errorf("invalid LimitNOFILE %q: want integer or infinity", raw)
+	}
+	return s, nil
 }
 
 func parseFileMode(raw string, defaultValue os.FileMode) (os.FileMode, error) {

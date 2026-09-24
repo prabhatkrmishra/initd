@@ -66,12 +66,30 @@ func managerUnitProps(mgr *supervisor.Manager, name string) (map[string]string, 
 	return nil, false
 }
 
+// isNotFoundErr classifies "no such unit" errors. Mutating Manager/Unit
+// calls must surface these as NoSuchUnit instead of swallowing them into
+// success (automation cannot distinguish a started unit from a typo
+// otherwise); only read-only probes ever special-case absence.
 func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "not found")
+}
+
+// unitDBusError maps manager failures onto D-Bus errors with systemd's
+// names: missing units become NoSuchUnit with the exact "Unit %s not found."
+// body callers match verbatim (see LoadUnit), everything else stays Failed.
+// Mutating calls must never report success for a unit that does not exist.
+func unitDBusError(name string, err error) *dbus.Error {
+	if err == nil {
+		return nil
+	}
+	if isNotFoundErr(err) {
+		return &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
+	}
+	return dbus.MakeFailedError(err)
 }
 
 // unitObjectPath converts a unit name to its D-Bus object path. systemd
@@ -231,32 +249,32 @@ func (m *systemd1Manager) DisableUnitFiles(files []string, runtime bool) (bool, 
 
 func (m *systemd1Manager) RestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
 	mgr := m.primarySafe()
-	if err := mgr.RestartUnit(name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(name, mgr.RestartUnit(name)); derr != nil {
+		return "", derr
 	}
 	return m.unitPathFor(name), nil
 }
 
 func (m *systemd1Manager) StopUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
 	mgr := m.primarySafe()
-	if err := mgr.StopUnit(name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(name, mgr.StopUnit(name)); derr != nil {
+		return "", derr
 	}
 	return m.unitPathFor(name), nil
 }
 
 func (m *systemd1Manager) StartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
 	mgr := m.primarySafe()
-	if err := mgr.StartUnit(name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(name, mgr.StartUnit(name)); derr != nil {
+		return "", derr
 	}
 	return m.unitPathFor(name), nil
 }
 
 func (m *systemd1Manager) ReloadUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
 	mgr := m.primarySafe()
-	if err := mgr.ReloadUnit(name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(name, mgr.ReloadUnit(name)); derr != nil {
+		return "", derr
 	}
 	return m.unitPathFor(name), nil
 }
@@ -271,26 +289,20 @@ func (m *systemd1Manager) ReloadOrTryRestartUnit(name string, mode string) (dbus
 
 func (m *systemd1Manager) TryRestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
 	mgr := m.primarySafe()
-	if err := mgr.RestartUnit(name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(name, mgr.RestartUnit(name)); derr != nil {
+		return "", derr
 	}
 	return m.unitPathFor(name), nil
 }
 
 func (m *systemd1Manager) KillUnit(name string, whom string, signal int32) *dbus.Error {
 	mgr := m.primarySafe()
-	if err := mgr.KillUnit(name, fmt.Sprintf("%d", signal)); err != nil && !isNotFoundErr(err) {
-		return dbus.MakeFailedError(err)
-	}
-	return nil
+	return unitDBusError(name, mgr.KillUnit(name, fmt.Sprintf("%d", signal)))
 }
 
 func (m *systemd1Manager) ResetFailedUnit(name string) *dbus.Error {
 	mgr := m.primarySafe()
-	if err := mgr.ResetFailed(name); err != nil && !isNotFoundErr(err) {
-		return dbus.MakeFailedError(err)
-	}
-	return nil
+	return unitDBusError(name, mgr.ResetFailed(name))
 }
 
 // listUnitEntry matches systemd's a(st) unit-listing return shape.
@@ -351,8 +363,34 @@ func (m *systemd1Manager) ListUnits() ([]listUnitEntry, *dbus.Error) {
 }
 
 func (m *systemd1Manager) ListUnitsFiltered(states []string) ([]listUnitEntry, *dbus.Error) {
-	_ = states
-	return m.ListUnits()
+	all, derr := m.ListUnits()
+	if derr != nil {
+		return nil, derr
+	}
+	if len(states) == 0 {
+		return all, nil
+	}
+	want := map[string]struct{}{}
+	for _, s := range states {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s != "" {
+			want[s] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return all, nil
+	}
+	out := make([]listUnitEntry, 0, len(all))
+	for _, u := range all {
+		if _, ok := want[strings.ToLower(u.ActiveState)]; ok {
+			out = append(out, u)
+			continue
+		}
+		if _, ok := want[strings.ToLower(u.SubState)]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
 }
 
 func (m *systemd1Manager) ListUnitsByNames(names []string) ([]listUnitEntry, *dbus.Error) {
@@ -386,29 +424,29 @@ type systemd1Unit struct {
 }
 
 func (u *systemd1Unit) Start(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if err := u.mgr.StartUnit(u.name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(u.name, u.mgr.StartUnit(u.name)); derr != nil {
+		return "", derr
 	}
 	return unitObjectPath(u.name), nil
 }
 
 func (u *systemd1Unit) Stop(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if err := u.mgr.StopUnit(u.name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(u.name, u.mgr.StopUnit(u.name)); derr != nil {
+		return "", derr
 	}
 	return unitObjectPath(u.name), nil
 }
 
 func (u *systemd1Unit) Restart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if err := u.mgr.RestartUnit(u.name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(u.name, u.mgr.RestartUnit(u.name)); derr != nil {
+		return "", derr
 	}
 	return unitObjectPath(u.name), nil
 }
 
 func (u *systemd1Unit) Reload(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if err := u.mgr.ReloadUnit(u.name); err != nil && !isNotFoundErr(err) {
-		return "", dbus.MakeFailedError(err)
+	if derr := unitDBusError(u.name, u.mgr.ReloadUnit(u.name)); derr != nil {
+		return "", derr
 	}
 	return unitObjectPath(u.name), nil
 }
@@ -426,15 +464,11 @@ func (u *systemd1Unit) ReloadOrTryRestart(mode string) (dbus.ObjectPath, *dbus.E
 }
 
 func (u *systemd1Unit) Kill(whom string, signal int32) *dbus.Error {
-	if err := u.mgr.KillUnit(u.name, fmt.Sprintf("%d", signal)); err != nil && !isNotFoundErr(err) {
-		return dbus.MakeFailedError(err)
-	}
-	return nil
+	return unitDBusError(u.name, u.mgr.KillUnit(u.name, fmt.Sprintf("%d", signal)))
 }
 
 func (u *systemd1Unit) ResetFailed() *dbus.Error {
-	_ = u.mgr.ResetFailed(u.name)
-	return nil
+	return unitDBusError(u.name, u.mgr.ResetFailed(u.name))
 }
 
 type unitSubtreeHandler struct {
