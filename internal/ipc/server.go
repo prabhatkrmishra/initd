@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"initd/internal/boot"
 	"initd/internal/logging"
 	"initd/internal/service"
@@ -149,10 +151,57 @@ func abstractFallback(manager *supervisor.Manager) string {
 	return fmt.Sprintf("@initd-system-%d.sock", uid)
 }
 
+// peerUID returns the caller's UID via SO_PEERCRED. False when the
+// connection is not a Unix socket or credentials are unavailable
+// (tests using net.Pipe, non-Linux builds): callers treat that as
+// "no evidence" and fall back to filesystem permissions.
+func peerUID(conn net.Conn) (uint32, bool) {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, false
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	var uid uint32
+	ok = false
+	if err := raw.Control(func(fd uintptr) {
+		cred, cerr := unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+		if cerr != nil {
+			return
+		}
+		uid = cred.Uid
+		ok = true
+	}); err != nil || !ok {
+		return 0, false
+	}
+	return uid, true
+}
+
+// allowedPeer mirrors the filesystem socket's 0600 for transports without
+// permission bits (Linux abstract namespace, used when the path exceeds
+// ~90 bytes). The daemon's own UID may always connect; root may always
+// connect (admin + sudo flows); anyone else is rejected before dispatch
+// regardless of action, including read-only ones, matching the 0600
+// posture of the filesystem socket.
+func allowedPeer(manager *supervisor.Manager, uid uint32) bool {
+	if uid == 0 {
+		return true
+	}
+	return int(uid) == os.Getuid()
+}
+
 func handleConn(conn net.Conn, manager *supervisor.Manager) {
 	defer conn.Close()
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
+	// Enforce only when we have kernel credentials. Filesystem sockets
+	// remain protected by 0600 even if this check is skipped (tests).
+	if uid, ok := peerUID(conn); ok && !allowedPeer(manager, uid) {
+		_ = encoder.Encode(Response{Success: false, Message: "access denied: caller UID not authorized for this manager"})
+		return
+	}
 
 	var req Request
 	if err := decoder.Decode(&req); err != nil {
