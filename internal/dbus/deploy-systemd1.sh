@@ -57,18 +57,31 @@ install -D -m 0644 \
   "$SYSTEMD1_POLICY"
 
 echo "Reloading/restarting the system D-Bus daemon to pick up the new policy..."
-if pgrep -x dbus-daemon >/dev/null 2>&1; then
-  # A system dbus-daemon is running; restart it so the new policy takes effect
-  # and any stale systemd1 name owner is released.
-  pkill -x dbus-daemon || true
+# Operate only on the system bus recorded in /run/dbus/pid: a global
+# `pkill -x dbus-daemon` would also terminate every user/session bus.
+if [ -f /run/dbus/pid ]; then
+  _sysbus_pid="$(cat /run/dbus/pid 2>/dev/null)"
+  if [ -n "${_sysbus_pid:-}" ] && [ "$_sysbus_pid" != "1" ] \
+      && ps -p "$_sysbus_pid" -o comm= 2>/dev/null | grep -q "dbus-daemon"; then
+    kill "$_sysbus_pid" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f /run/dbus/pid
+fi
+if ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+  dbus-daemon --system --fork
   sleep 1
 fi
-rm -f /run/dbus/pid
-dbus-daemon --system --fork
-sleep 1
 
 echo "Restarting initd daemon (owns org.freedesktop.systemd1 on both buses)..."
-pkill -u "$RUN_USER" -x initd 2>/dev/null || true
+# Never signal PID 1 even if patterns overlap a PID-1 initd.
+for _pid in $(pgrep -u "$RUN_USER" -x initd 2>/dev/null); do
+  if [ "$_pid" = "1" ]; then
+    echo "refusing to signal PID 1; manage a PID-1 initd via its control interface." >&2
+    continue
+  fi
+  kill "$_pid" 2>/dev/null || true
+done
 sleep 1
 rm -f "/run/user/$(id -u "$RUN_USER")/initd.lock" \
       "/run/user/$(id -u "$RUN_USER")/initd.sock" \

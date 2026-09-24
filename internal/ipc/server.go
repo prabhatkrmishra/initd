@@ -3,6 +3,7 @@ package ipc
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -79,6 +80,43 @@ type UnitFileData struct {
 	Path  string `json:"path"`
 }
 
+const (
+	// maxRequestBytes caps a single IPC request (real requests are a few
+	// hundred bytes of JSON); larger payloads fail decoding instead of
+	// ballooning decoder buffers.
+	maxRequestBytes = 1 << 20
+	// maxIPCConns bounds concurrent control connections (goroutine/FD
+	// pressure from a hostile or wedged local client).
+	maxIPCConns = 128
+	// acceptErrorDelay keeps EMFILE-style accept failures from spinning.
+	acceptErrorDelay = 50 * time.Millisecond
+	// readTimeout bounds the request read; the response deadline is
+	// generous separately (stops can legitimately take minutes).
+	readTimeout  = 30 * time.Second
+	writeTimeout = 10 * time.Minute
+)
+
+// ipcConnSem bounds in-flight control connections across every listener a
+// daemon serves (filesystem + abstract fallback share it).
+var ipcConnSem = make(chan struct{}, maxIPCConns)
+
+// serveConn admits one accepted connection with bounded concurrency. When
+// saturated the connection is closed immediately without a reply or a new
+// goroutine: answering inline would stall the accept loop behind a peer
+// that never reads, and a detached replier would reintroduce the pressure
+// being bounded. Excess peers see EOF and retry.
+func serveConn(conn net.Conn, manager *supervisor.Manager) {
+	select {
+	case ipcConnSem <- struct{}{}:
+		go func() {
+			defer func() { <-ipcConnSem }()
+			handleConn(conn, manager)
+		}()
+	default:
+		_ = conn.Close()
+	}
+}
+
 func Serve(socketPath string, manager *supervisor.Manager) error {
 	if strings.HasPrefix(socketPath, "@") {
 		addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(socketPath, "@"), Net: "unix"}
@@ -90,9 +128,10 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
+				time.Sleep(acceptErrorDelay)
 				continue
 			}
-			go handleConn(conn, manager)
+			serveConn(conn, manager)
 		}
 	}
 
@@ -118,9 +157,10 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 				for {
 					conn, err := abstractListener.Accept()
 					if err != nil {
+						time.Sleep(acceptErrorDelay)
 						continue
 					}
-					go handleConn(conn, manager)
+					serveConn(conn, manager)
 				}
 			}
 		}
@@ -134,9 +174,10 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			time.Sleep(acceptErrorDelay)
 			continue
 		}
-		go handleConn(conn, manager)
+		serveConn(conn, manager)
 	}
 }
 
@@ -194,7 +235,8 @@ func allowedPeer(manager *supervisor.Manager, uid uint32) bool {
 
 func handleConn(conn net.Conn, manager *supervisor.Manager) {
 	defer conn.Close()
-	decoder := json.NewDecoder(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+	decoder := json.NewDecoder(io.LimitReader(conn, maxRequestBytes))
 	encoder := json.NewEncoder(conn)
 	// Enforce only when we have kernel credentials. Filesystem sockets
 	// remain protected by 0600 even if this check is skipped (tests).
@@ -209,6 +251,11 @@ func handleConn(conn net.Conn, manager *supervisor.Manager) {
 		return
 	}
 
+	// The request arrived whole; the response may legitimately take
+	// minutes (stop/restart waits out TimeoutStopSec), so clear the read
+	// deadline and allow a generous write deadline instead.
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	response := dispatch(req, manager)
 	_ = encoder.Encode(response)
 }

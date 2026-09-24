@@ -37,15 +37,14 @@ RUN_USER="$(id -un)"
 RUN_UID="$(id -u)"
 
 # `as_root` runs a command with privileges. Root needs no sudo; a non-root
-# invoker uses sudo (set SUDO_PASSWORD for headless runs to avoid prompts).
+# invoker uses sudo with normal credential handling (prompt or cached
+# timestamp). Passwords are never taken from the environment: env vars are
+# visible to other local processes and would leak the credential.
 if [ "$RUN_UID" -eq 0 ]; then
   as_root() { "$@"; }
 else
   as_root() { sudo "$@"; }
   echo "sudo is required to install binaries and D-Bus configuration under /usr." >&2
-  if [ -n "${SUDO_PASSWORD:-}" ]; then
-    sudo() { printf '%s\n' "$SUDO_PASSWORD" | command sudo -S "$@"; }
-  fi
   if ! sudo -n true 2>/dev/null; then
     sudo -v 2>/dev/null || { echo "sudo required; aborting." >&2; exit 1; }
   fi
@@ -213,11 +212,23 @@ cat > "$tmp_autostart" <<'EOSH'
 # the systemd1 D-Bus interface and unit supervision instead.
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+# XDG requires the runtime dir to be private; enforce 0700 whether new or not.
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+# Never chmod /tmp or / itself if XDG_RUNTIME_DIR was overridden to shared space.
+case "$XDG_RUNTIME_DIR" in
+  /tmp|/) : ;;
+  *) chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true ;;
+esac
 if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
     if ! dbus-send --session --dest=org.freedesktop.DBus --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
-        rm -f "$XDG_RUNTIME_DIR/bus"
-        dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
+        # Unresponsive bus: only replace the socket when no daemon is serving
+        # it. Removing a live daemon's socket forks a second, competing bus.
+        if pgrep -f "dbus-daemon.*$XDG_RUNTIME_DIR/bus" >/dev/null 2>&1; then
+            echo "session bus unresponsive but its daemon is still running; leaving the socket alone." >&2
+        else
+            rm -f "$XDG_RUNTIME_DIR/bus"
+            dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
+        fi
     fi
 else
     dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
@@ -248,9 +259,16 @@ rm -f "$tmp_autostart"
 # --- session bus for the daemon ------------------------------------------------
 echo "Ensuring session bus at $XDG_RUNTIME_DIR/bus ..."
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+# Never chmod /tmp or / itself if XDG_RUNTIME_DIR was overridden to shared space.
+case "$XDG_RUNTIME_DIR" in
+  /tmp|/) : ;;
+  *) chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true ;;
+esac
 if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
   if dbus-send --session --dest=org.freedesktop.DBus --type=method_call /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
     echo "session bus socket already exists and is responsive."
+  elif pgrep -f "dbus-daemon.*$XDG_RUNTIME_DIR/bus" >/dev/null 2>&1; then
+    echo "session bus socket is unresponsive but its daemon is still running; leaving it alone (no duplicate bus)." >&2
   else
     echo "session bus socket is stale, removing and restarting..."
     rm -f "$XDG_RUNTIME_DIR/bus"
@@ -266,9 +284,26 @@ else
   sleep 1
 fi
 
+# Never signal PID 1: if initd itself is the init system and this script runs
+# as root, a bare `pkill -x initd` pattern can match PID 1. All kills below go
+# through kill_initd_user, which filters it out.
+kill_initd_user() {
+  # $1 = signal number or name (default TERM). Kills exact-name initd
+  # processes owned by $RUN_USER except PID 1. Never fails (|| true callers).
+  local sig="${1:-TERM}"
+  local pid
+  for pid in $(pgrep -u "$RUN_USER" -x initd 2>/dev/null); do
+    if [ "$pid" = "1" ]; then
+      echo "refusing to signal PID 1 ($sig); use the control interface to manage a PID-1 initd." >&2
+      continue
+    fi
+    kill "-$sig" "$pid" 2>/dev/null || true
+  done
+}
+
 # --- (re)start the initd daemon as `initd --init` (starts enabled units) -------
 echo "Stopping any existing initd daemon for $RUN_USER ..."
-pkill -u "$RUN_USER" -x initd 2>/dev/null || true
+kill_initd_user TERM
 # Wait for the old daemon to actually exit before starting a new one. A stale
 # daemon that ignores SIGTERM would otherwise keep its sockets and lock, and a
 # second daemon would then split the supervisor in two (two listeners on the
@@ -282,7 +317,7 @@ for _ in $(seq 1 20); do
 done
 if pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
   echo "initd did not exit on SIGTERM; sending SIGKILL." >&2
-  pkill -9 -u "$RUN_USER" -x initd 2>/dev/null || true
+  kill_initd_user KILL
   sleep 0.5
 fi
 # clear any stale daemon sockets owned by this user
