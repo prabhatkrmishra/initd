@@ -206,9 +206,27 @@ func (u *Unit) processGroupAlive(pgid int) bool {
 // with the recorded starter group as fallback for orphans whose leader
 // already exited. The leader itself is always signalled too, covering a
 // daemon that left the group (setsid) between resolution and kill.
+//
+// Safety rule: the supervisor never signals its own group. If the resolved
+// or recorded group contains initd itself (group collapse from a shared
+// session, or PID reuse landing on the daemon), that group kill is skipped
+// and only the leader PID is signalled — taking the daemon down with the
+// unit is always the worse outcome.
 func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Signal) {
+	selfPGID := syscall.Getpgrp()
+	groupHasSelf := func(gid int) bool {
+		if gid <= 0 || gid != selfPGID {
+			return false
+		}
+		// Same numeric group: confirm the daemon really is still in it
+		// (guards PID-reuse races on the group id).
+		if cur, err := syscall.Getpgid(os.Getpid()); err == nil && cur == gid {
+			return true
+		}
+		return false
+	}
 	if pid <= 0 {
-		if group && fallbackPGID > 0 {
+		if group && fallbackPGID > 0 && !groupHasSelf(fallbackPGID) {
 			_ = syscall.Kill(-fallbackPGID, sig)
 		}
 		return
@@ -217,13 +235,15 @@ func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Sign
 		_ = syscall.Kill(pid, sig)
 		return
 	}
-	if gid, err := syscall.Getpgid(pid); err == nil && gid > 0 {
+	if gid, err := syscall.Getpgid(pid); err == nil && gid > 0 && !groupHasSelf(gid) {
 		_ = syscall.Kill(-gid, sig)
 	}
 	_ = syscall.Kill(pid, sig)
 	if fallbackPGID > 0 {
 		if gid, err := syscall.Getpgid(pid); err != nil || gid != fallbackPGID {
-			_ = syscall.Kill(-fallbackPGID, sig)
+			if !groupHasSelf(fallbackPGID) {
+				_ = syscall.Kill(-fallbackPGID, sig)
+			}
 		}
 	}
 }
@@ -462,9 +482,16 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// Child has its own dups now; release the parent copies.
 	closeSocketFiles()
 
+	// Record the starter's OWN group, not its PID-as-group: children that
+	// share the daemon's session (common when the daemon was launched from
+	// the same shell/session, e.g. hermes) would otherwise make the daemon
+	// a member of the unit's recorded group, and a later group kill would
+	// take the supervisor down with the unit.
 	starterPGID := 0
 	if cmd.Process != nil {
-		starterPGID = cmd.Process.Pid
+		if gid, err := syscall.Getpgid(cmd.Process.Pid); err == nil && gid > 0 {
+			starterPGID = gid
+		}
 	}
 
 	u.mu.Lock()
@@ -527,7 +554,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 func (u *Unit) waitSimple(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
 	if err := u.runExecStartPost(token, envMap, envList); err != nil {
-		u.killMainProcess(syscall.SIGTERM)
+		u.killMainProcess(u.stopSignal())
 		u.markFailed(err, ignoreFailure)
 		return
 	}
@@ -581,7 +608,7 @@ func (u *Unit) waitForking(token int, envMap map[string]string, envList []string
 	u.mu.Unlock()
 	if err := u.runExecStartPost(token, envMap, envList); err != nil {
 		if pid != 0 {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
+			_ = syscall.Kill(pid, u.stopSignal())
 		}
 		u.markFailed(err, ignoreFailure)
 		return
@@ -682,9 +709,9 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		// Kill the activating process and wait for it to exit, then
 		// go inactive. Don't rely on handleExit (token was bumped).
 		if pid != 0 || (killProcessGroup && pgid > 0) {
-			u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGTERM)
+			u.signalUnitPID(pid, pgid, killProcessGroup, u.stopSignal())
 		} else if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
+			_ = cmd.Process.Signal(u.stopSignal())
 		}
 		// timeout <=0 means infinity (systemd's "infinity"); wait
 		// without deadline in that case.
@@ -788,10 +815,10 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		// A forking daemon may have left the supervisor's group (setsid),
 		// so signal both its group (when KillMode allows) and the leader
 		// itself; group membership is resolved, never assumed from the PID.
-		u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGTERM)
+		u.signalUnitPID(pid, pgid, killProcessGroup, u.stopSignal())
 	} else {
 		// simple / others (includes adopted notify PIDs)
-		u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGTERM)
+		u.signalUnitPID(pid, pgid, killProcessGroup, u.stopSignal())
 	}
 
 	waitUntilStopped := func() bool {
@@ -1311,6 +1338,7 @@ func (u *Unit) IsFailed() bool {
 func (u *Unit) Kill(sig syscall.Signal) error {
 	u.mu.Lock()
 	pid := u.Runtime.MainPID
+	pgid := u.pgid
 	state := u.Runtime.State
 	killProcessGroup := !u.killModeProcess()
 	u.mu.Unlock()
@@ -1320,13 +1348,14 @@ func (u *Unit) Kill(sig syscall.Signal) error {
 	if pid <= 0 || !processAlive(pid) {
 		return fmt.Errorf("no main PID")
 	}
-	if killProcessGroup {
-		if err := syscall.Kill(-pid, sig); err != nil {
-			return err
-		}
+	// Route through the self-guarded path (never -PID when that group
+	// holds the daemon); a failed direct kill still surfaces an error.
+	u.signalUnitPID(pid, pgid, killProcessGroup, sig)
+	if pid > 0 && syscall.Kill(pid, 0) != nil {
+		// Leader already gone; the group signal (if any) was still sent.
 		return nil
 	}
-	return syscall.Kill(pid, sig)
+	return nil
 }
 
 func expandWithEnv(input string, envMap map[string]string) string {
@@ -1896,28 +1925,93 @@ func (u *Unit) checkConditions() error {
 }
 
 func (u *Unit) killModeProcess() bool {
-	return strings.EqualFold(strings.TrimSpace(u.GetConfig().Service.KillMode), "process")
+	mode := strings.ToLower(strings.TrimSpace(u.GetConfig().Service.KillMode))
+	// Only the group flavors take the whole process group. Everything else
+	// — process, mixed, none, unset — kills the main PID only; mixed's
+	// children are reaped by the ExecStopPost cgroup cleanup instead.
+	switch mode {
+	case "control-group", "controlgroup", "control_group":
+		return false
+	default:
+		return true
+	}
+}
+
+// stopSignal resolves KillSignal= (SIGTERM default). Accepts names with or
+// without the SIG prefix and bare numbers, mirroring systemctl kill.
+func (u *Unit) stopSignal() syscall.Signal {
+	raw := strings.TrimSpace(u.GetConfig().Service.KillSignal)
+	if raw == "" {
+		return syscall.SIGTERM
+	}
+	stripped := strings.TrimPrefix(raw, "-")
+	if n, err := strconv.Atoi(stripped); err == nil && n > 0 {
+		return syscall.Signal(n)
+	}
+	upper := strings.ToUpper(stripped)
+	if !strings.HasPrefix(upper, "SIG") {
+		upper = "SIG" + upper
+	}
+	if sig, ok := signalByName(upper); ok {
+		return sig
+	}
+	return syscall.SIGTERM
+}
+
+func signalByName(name string) (syscall.Signal, bool) {
+	switch name {
+	case "SIGHUP":
+		return syscall.SIGHUP, true
+	case "SIGINT":
+		return syscall.SIGINT, true
+	case "SIGQUIT":
+		return syscall.SIGQUIT, true
+	case "SIGTERM":
+		return syscall.SIGTERM, true
+	case "SIGUSR1":
+		return syscall.SIGUSR1, true
+	case "SIGUSR2":
+		return syscall.SIGUSR2, true
+	case "SIGKILL":
+		return syscall.SIGKILL, true
+	case "SIGSTOP":
+		return syscall.SIGSTOP, true
+	case "SIGCONT":
+		return syscall.SIGCONT, true
+	case "SIGWINCH":
+		return syscall.SIGWINCH, true
+	}
+	return 0, false
 }
 
 func (u *Unit) killMainProcess(sig syscall.Signal) {
 	u.mu.Lock()
 	cmd := u.Cmd
+	pgid := u.pgid
+	mainPID := u.Runtime.MainPID
 	killProcessGroup := !u.killModeProcess()
 	u.mu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
+		// No starter process (adopted PIDFile/notify unit, already
+		// reaped, etc.): signal the recorded main PID directly so
+		// KillSignal still reaches the daemon.
+		if mainPID > 0 {
+			u.signalUnitPID(mainPID, pgid, killProcessGroup, sig)
+		}
 		return
 	}
 
 	pid := cmd.Process.Pid
-
-	if killProcessGroup {
-		// Kill entire process group
-		_ = syscall.Kill(-pid, sig)
-	} else {
-		// Kill only main process
-		_ = syscall.Kill(pid, sig)
+	// Prefer the recorded MainPID when it differs: the starter (sh
+	// wrapper, double-fork parent) may not be the supervised daemon,
+	// and killing its group can hit siblings — including the daemon
+	// itself when groups are shared (see group-collapse below).
+	target := mainPID
+	if target <= 0 || target == cmd.Process.Pid {
+		target = pid
 	}
+	u.signalUnitPID(target, pgid, killProcessGroup, sig)
 }
 
 func (u *Unit) mainPID() int {
@@ -2358,7 +2452,7 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 		}
 		u.mu.Unlock()
 		if err := u.runExecStartPost(token, envMap, envList); err != nil && !u.StopRequested() {
-			u.killMainProcess(syscall.SIGTERM)
+			u.killMainProcess(u.stopSignal())
 			u.markFailed(err, ignoreFailure)
 			return
 		}
@@ -2411,7 +2505,7 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 		}
 
 		if cmd != nil && cmd.Process != nil {
-			u.killMainProcess(syscall.SIGTERM)
+			u.killMainProcess(u.stopSignal())
 		}
 
 		u.markFailed(fmt.Errorf("notify timeout"), ignoreFailure)

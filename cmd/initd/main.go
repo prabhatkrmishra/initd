@@ -37,6 +37,13 @@ func main() {
 	// in every mode; --daemonize additionally leaves the session entirely.
 	signal.Ignore(syscall.SIGHUP)
 
+	// Under memory pressure the OOM killer picks the fattest victim, which
+	// is often the supervisor itself on a box whose units log hard. Make
+	// the daemon the last resort: best-effort oom_score_adj of -500 so the
+	// kernel reaps a runaway child before its supervisor. Read-only /proc
+	// (containers) just skips this; supervision never depends on it.
+	protectFromOOM()
+
 	if cfg.daemonize && os.Getpid() == 1 {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 			"--daemonize refused under PID 1: the initial parent exit would panic the kernel; run without --daemonize as init")
@@ -642,6 +649,23 @@ func parseArgs(args []string) (daemonConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+// protectFromOOM lowers /proc/self/oom_score_adj best-effort so the
+// supervisor survives memory pressure longer than the units it watches.
+// -500 mirrors a protected system daemon: adjustable by admins afterwards,
+// still killable when truly nothing else can go. Failures (read-only
+// /proc, containers, non-Linux) are silent by design.
+func protectFromOOM() {
+	f, err := os.OpenFile("/proc/self/oom_score_adj", os.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString("-500"); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"oom_score_adj not writable: %v", err)
+	}
 }
 
 func printHelp() {

@@ -69,6 +69,7 @@ type ServiceSection struct {
 	SupplementaryGroups      []string
 	UMask                    string
 	LimitNOFILE              string
+	KillSignal               string
 	Environment              []string
 	EnvironmentFile          []string
 	UnsetEnvironment         []string
@@ -486,6 +487,8 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				unit.Service.UMask = value
 			case "LimitNOFILE":
 				unit.Service.LimitNOFILE = value
+			case "KillSignal":
+				unit.Service.KillSignal = value
 			case "Environment":
 				if value == "" {
 					unit.Service.Environment = nil
@@ -690,6 +693,9 @@ func mergeUnit(base, overlay *Unit) {
 	}
 	if overlay.Service.KillMode != "" {
 		base.Service.KillMode = overlay.Service.KillMode
+	}
+	if overlay.Service.KillSignal != "" {
+		base.Service.KillSignal = overlay.Service.KillSignal
 	}
 	if overlay.Service.TimeoutStartSec != "" {
 		base.Service.TimeoutStartSec = overlay.Service.TimeoutStartSec

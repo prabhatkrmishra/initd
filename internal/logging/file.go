@@ -252,6 +252,15 @@ func (w *FileWriter) SetRetention(files int, bytes int64) {
 	w.retainBytes = bytes
 }
 
+// EnforceRetention trims the journal directory to the retention caps
+// now, best-effort. Exposed for the startup guard; rotation calls the
+// locked twin internally.
+func (w *FileWriter) EnforceRetention() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.enforceRetentionLocked()
+}
+
 // enforceRetentionLocked deletes oldest generations until the caps hold.
 // Caller holds w.mu. Only runs on rotation, so steady-state cost is nil.
 // The active file is never deleted.
