@@ -43,14 +43,22 @@ type Runtime struct {
 }
 
 type Unit struct {
-	mu               sync.Mutex
-	configMu         sync.RWMutex
-	Config           *parser.Unit
-	Path             string
-	Runtime          Runtime
-	Cmd              *exec.Cmd
-	Logs             *logging.Buffer
-	restartHistory   []time.Time
+	mu             sync.Mutex
+	configMu       sync.RWMutex
+	Config         *parser.Unit
+	Path           string
+	Runtime        Runtime
+	Cmd            *exec.Cmd
+	Logs           *logging.Buffer
+	restartHistory []time.Time
+	// pgid is the supervisor-side process group created for the last start
+	// (Setpgid=true makes it equal the starter's PID). MainPID may later be
+	// replaced by PIDFile/notify adoption, which is often NOT the group
+	// leader, so group kills must use pgid, never -MainPID.
+	pgid int
+	// failFwdHistory bounds OnFailure forwarding storms (see
+	// allowFailureForward); independent from restartHistory.
+	failFwdHistory   []time.Time
 	startToken       int
 	stopRequested    bool
 	reaper           ExitReaper
@@ -127,6 +135,97 @@ func (u *Unit) Snapshot() Runtime {
 	return u.Runtime
 }
 
+// supervisedPGID returns the last start's process group (0 when none).
+func (u *Unit) supervisedPGID() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.pgid
+}
+
+// AllowFailureForward reports whether an OnFailure edge into this unit may
+// fire now. It consumes from the unit's StartLimit burst budget, so an
+// A<->B failure ping-pong trips "repeated too quickly" instead of looping
+// forever. Units without a configured limit are unbounded (as before).
+func (u *Unit) AllowFailureForward() bool {
+	interval, burst := u.StartLimit()
+	if interval <= 0 || burst <= 0 {
+		return true
+	}
+	now := time.Now()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	cutoff := now.Add(-interval)
+	kept := u.failFwdHistory[:0]
+	for _, s := range u.failFwdHistory {
+		if s.After(cutoff) {
+			kept = append(kept, s)
+		}
+	}
+	u.failFwdHistory = kept
+	if len(u.failFwdHistory) >= burst {
+		return false
+	}
+	u.failFwdHistory = append(u.failFwdHistory, now)
+	return true
+}
+
+// processGroupAlive reports whether any process still runs in pgid.
+func (u *Unit) processGroupAlive(pgid int) bool {
+	if pgid <= 0 {
+		return false
+	}
+	return u.processGroupMemberPID(pgid, 0) != 0
+}
+
+// signalUnitPID sends sig to the service process in the mode KillMode
+// selects. Group kills never fabricate a group ID from a bare (possibly
+// adopted) PID: the group is resolved via Getpgid on the live leader,
+// with the recorded starter group as fallback for orphans whose leader
+// already exited. The leader itself is always signalled too, covering a
+// daemon that left the group (setsid) between resolution and kill.
+func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Signal) {
+	if pid <= 0 {
+		if group && fallbackPGID > 0 {
+			_ = syscall.Kill(-fallbackPGID, sig)
+		}
+		return
+	}
+	if !group {
+		_ = syscall.Kill(pid, sig)
+		return
+	}
+	if gid, err := syscall.Getpgid(pid); err == nil && gid > 0 {
+		_ = syscall.Kill(-gid, sig)
+	}
+	_ = syscall.Kill(pid, sig)
+	if fallbackPGID > 0 {
+		if gid, err := syscall.Getpgid(pid); err != nil || gid != fallbackPGID {
+			_ = syscall.Kill(-fallbackPGID, sig)
+		}
+	}
+}
+
+// unitGroupAlive reports whether the service still has live processes:
+// the main PID, or (in group mode) any member of its resolved or starter
+// group. Without cgroups this is best-effort, but it never reports stopped
+// while supervised children remain.
+func (u *Unit) unitGroupAlive(pid, fallbackPGID int, group bool) bool {
+	if pid > 0 && processAlive(pid) {
+		return true
+	}
+	if !group {
+		return false
+	}
+	if pid > 0 {
+		if gid, err := syscall.Getpgid(pid); err == nil && gid > 0 {
+			if u.processGroupAlive(gid) {
+				return true
+			}
+		}
+	}
+	return u.processGroupAlive(fallbackPGID)
+}
+
 func (u *Unit) Start() (int, error) {
 	u.mu.Lock()
 	if u.Runtime.State == StateActive || u.Runtime.State == StateActivating {
@@ -155,6 +254,7 @@ func (u *Unit) Start() (int, error) {
 	u.Runtime.FinishedAtMonotonic = 0
 	u.Runtime.StartedAtMonotonic = 0
 	u.Runtime.MainPID = 0
+	u.pgid = 0
 	u.mu.Unlock()
 
 	if err := u.checkConditions(); err != nil {
@@ -339,7 +439,13 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// Child has its own dups now; release the parent copies.
 	closeSocketFiles()
 
+	starterPGID := 0
+	if cmd.Process != nil {
+		starterPGID = cmd.Process.Pid
+	}
+
 	u.mu.Lock()
+	u.pgid = starterPGID
 
 	if u.startToken != token {
 		u.mu.Unlock()
@@ -528,12 +634,14 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		// the unit active after we've asked it to stop.
 		u.startToken++
 		pid := u.Runtime.MainPID
+		pgid := u.pgid
 		cmd := u.Cmd
 		srv := u.notifyServer
 		u.notifyServer = nil
 		if pid == 0 && (cmd == nil || cmd.Process == nil) {
 			u.Runtime.State = StateInactive
 			u.Runtime.MainPID = 0
+			u.pgid = 0
 			u.Runtime.LastError = ""
 			u.Runtime.FinishedAt = time.Now()
 			u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
@@ -550,12 +658,8 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		}
 		// Kill the activating process and wait for it to exit, then
 		// go inactive. Don't rely on handleExit (token was bumped).
-		if pid != 0 {
-			if killProcessGroup {
-				_ = syscall.Kill(-pid, syscall.SIGTERM)
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGTERM)
-			}
+		if pid != 0 || (killProcessGroup && pgid > 0) {
+			u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGTERM)
 		} else if cmd != nil && cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
@@ -567,6 +671,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 					u.mu.Lock()
 					u.Runtime.State = StateInactive
 					u.Runtime.MainPID = 0
+					u.pgid = 0
 					u.Runtime.LastError = ""
 					u.Runtime.ExitCode = 0
 					u.Runtime.FinishedAt = time.Now()
@@ -579,6 +684,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 						u.mu.Lock()
 						u.Runtime.State = StateInactive
 						u.Runtime.MainPID = 0
+						u.pgid = 0
 						u.Runtime.LastError = ""
 						u.Runtime.ExitCode = 0
 						u.Runtime.FinishedAt = time.Now()
@@ -596,6 +702,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 				u.mu.Lock()
 				u.Runtime.State = StateInactive
 				u.Runtime.MainPID = 0
+				u.pgid = 0
 				u.Runtime.LastError = ""
 				u.Runtime.ExitCode = 0
 				u.Runtime.FinishedAt = time.Now()
@@ -608,6 +715,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 					u.mu.Lock()
 					u.Runtime.State = StateInactive
 					u.Runtime.MainPID = 0
+					u.pgid = 0
 					u.Runtime.LastError = ""
 					u.Runtime.ExitCode = 0
 					u.Runtime.FinishedAt = time.Now()
@@ -618,19 +726,15 @@ func (u *Unit) Stop(timeout time.Duration) error {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-		if pid != 0 {
-			if killProcessGroup {
-				_ = syscall.Kill(-pid, syscall.SIGKILL)
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		} else if cmd != nil && cmd.Process != nil {
+		u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGKILL)
+		if pid == 0 && cmd != nil && cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
 		time.Sleep(150 * time.Millisecond)
 		u.mu.Lock()
 		u.Runtime.State = StateInactive
 		u.Runtime.MainPID = 0
+		u.pgid = 0
 		u.Runtime.LastError = ""
 		u.Runtime.ExitCode = 0
 		u.Runtime.FinishedAt = time.Now()
@@ -640,6 +744,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 	}
 	u.Runtime.State = StateStopping
 	pid := u.Runtime.MainPID
+	pgid := u.pgid
 	cmd := u.Cmd
 	u.mu.Unlock()
 
@@ -657,23 +762,22 @@ func (u *Unit) Stop(timeout time.Duration) error {
 				pid = mainPID
 			}
 		}
-		if pid != 0 {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-		}
+		// A forking daemon may have left the supervisor's group (setsid),
+		// so signal both its group (when KillMode allows) and the leader
+		// itself; group membership is resolved, never assumed from the PID.
+		u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGTERM)
 	} else {
-		// simple / others
-		if pid != 0 {
-			if killProcessGroup {
-				_ = syscall.Kill(-pid, syscall.SIGTERM)
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGTERM)
-			}
-		}
+		// simple / others (includes adopted notify PIDs)
+		u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGTERM)
 	}
 
 	waitUntilStopped := func() bool {
 		if serviceType == "forking" {
-			if pid == 0 || !processAlive(pid) {
+			if pid == 0 && (!killProcessGroup || !u.processGroupAlive(pgid)) {
+				u.transitionState(StateInactive, "")
+				return true
+			}
+			if pid != 0 && !u.unitGroupAlive(pid, pgid, killProcessGroup) {
 				u.transitionState(StateInactive, "")
 				return true
 			}
@@ -690,7 +794,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 				u.transitionState(StateInactive, "")
 				return true
 			}
-			if pid != 0 && !processAlive(pid) {
+			if pid != 0 && !u.unitGroupAlive(pid, pgid, killProcessGroup) {
 				u.transitionState(StateInactive, "")
 				return true
 			}
@@ -718,24 +822,13 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		}
 	}
 
-	// Timeout escalation
-	if serviceType == "forking" {
-		if pid != 0 {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-		}
-	} else {
-		if pid != 0 {
-			if killProcessGroup {
-				_ = syscall.Kill(-pid, syscall.SIGKILL)
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
-	}
+	// Timeout escalation mirrors the initial mode: group kills stay group
+	// kills, process kills stay process kills.
+	u.signalUnitPID(pid, pgid, killProcessGroup, syscall.SIGKILL)
 
 	// Give SIGKILL a moment to take effect before judging.
 	time.Sleep(150 * time.Millisecond)
-	if pid != 0 && !processAlive(pid) {
+	if !u.unitGroupAlive(pid, pgid, killProcessGroup) {
 		u.transitionState(StateInactive, "")
 		return nil
 	}
@@ -1341,6 +1434,7 @@ func (u *Unit) transitionState(next State, reason string) {
 	// on an inactive unit (or a stopping unit reporting a stale PID).
 	if next == StateInactive {
 		u.Runtime.MainPID = 0
+		u.pgid = 0
 	}
 	u.Runtime.State = next
 	if reason != "" {
@@ -1360,6 +1454,7 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 	u.Runtime.LastError = err.Error()
 	u.Runtime.ExitCode = 1
 	u.Runtime.MainPID = 0
+	u.pgid = 0
 	u.Runtime.FinishedAt = time.Now()
 	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 	u.mu.Unlock()
@@ -2173,9 +2268,9 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			go func(pid int, token int) {
 				for {
 					// Stop polling once this start is superseded or the
-				// unit left activating (READY arrived or reaper marked
-				// it Failed): post-READY exits belong to the reaper
-				// handler from runStartSequence, not this watcher.
+					// unit left activating (READY arrived or reaper marked
+					// it Failed): post-READY exits belong to the reaper
+					// handler from runStartSequence, not this watcher.
 					if !u.IsCurrentToken(token) || u.StopRequested() {
 						return
 					}

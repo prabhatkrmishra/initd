@@ -23,8 +23,13 @@ import (
 )
 
 type Manager struct {
-	mu             sync.Mutex
-	startMu        sync.Mutex
+	mu      sync.Mutex
+	startMu sync.Mutex
+	// socketMu serializes socket-unit creation (check-then-listen-then-install)
+	// so two concurrent starters cannot both observe inactive and bind
+	// duplicate listeners. It nests inside startMu (startMu -> socketMu);
+	// no path takes them in the reverse order.
+	socketMu       sync.Mutex
 	Units          map[string]*service.Unit
 	SocketUnits    map[string]*parser.Unit
 	SocketPaths    map[string]string
@@ -284,6 +289,16 @@ func (m *Manager) onFailureCallback(unitName string) func(string) {
 			if t == "" {
 				continue
 			}
+			// Storm guard: A<->B mutual OnFailure would otherwise
+			// ping-pong forever outside Restart= limits. Each target
+			// consumes from its StartLimit burst; over budget, skip and
+			// log instead of starting.
+			if tu, err := m.FindUnit(t); err == nil {
+				if !tu.AllowFailureForward() {
+					logKernelWarning(fmt.Sprintf("OnFailure to %s suppressed: repeated too quickly.", t))
+					continue
+				}
+			}
 			_ = m.StartUnit(t)
 		}
 		for _, dep := range bindsDependents {
@@ -434,6 +449,8 @@ func (m *Manager) expandSocketPath(p string) string {
 }
 
 func (m *Manager) startSocketUnit(name string) error {
+	m.socketMu.Lock()
+	defer m.socketMu.Unlock()
 	m.mu.Lock()
 	cfg, ok := m.SocketUnits[name]
 	if !ok {
@@ -551,7 +568,9 @@ func (m *Manager) startSocketUnit(name string) error {
 // socketFD extracts the underlying fd for readiness polling without
 // consuming anything. Both *net.UnixListener and *net.UnixConn implement
 // syscall.Conn.
-func socketFD(v interface{ SyscallConn() (syscall.RawConn, error) }) (int, bool) {
+func socketFD(v interface {
+	SyscallConn() (syscall.RawConn, error)
+}) (int, bool) {
 	raw, err := v.SyscallConn()
 	if err != nil {
 		return -1, false
@@ -686,6 +705,11 @@ func (m *Manager) startWithSocketActivation(serviceName, socketName string, rt *
 }
 
 func (m *Manager) stopSocketUnit(name string) error {
+	// Same order as startSocketUnit (socketMu -> m.mu): serializes close
+	// against a concurrent create of the same path so a stop's Remove
+	// cannot unlink a just-bound replacement listener.
+	m.socketMu.Lock()
+	defer m.socketMu.Unlock()
 	m.mu.Lock()
 	rt, ok := m.SocketRuntimes[name]
 	if !ok || !rt.active {
@@ -917,7 +941,7 @@ func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, start
 			continue
 		}
 		if meta.required {
-			if err := m.waitForUnitReady(depUnit, 30*time.Second); err != nil {
+			if err := m.waitForUnitReady(depUnit, depUnit.StartTimeout()); err != nil {
 				return fmt.Errorf("required unit %s failed: %w", depUnit.GetConfig().Name, err)
 			}
 		}
@@ -926,6 +950,22 @@ func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, start
 }
 
 func (m *Manager) waitForUnitReady(unit *service.Unit, timeout time.Duration) error {
+	if timeout <= 0 {
+		// Dependency opted into systemd "infinity": wait without deadline.
+		for {
+			snapshot := unit.Snapshot()
+			if snapshot.State == service.StateFailed {
+				if snapshot.LastError != "" {
+					return errors.New(snapshot.LastError)
+				}
+				return fmt.Errorf("unit %s failed", unit.GetConfig().Name)
+			}
+			if snapshot.State != service.StateActivating && snapshot.State != service.StateStopping {
+				return nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		snapshot := unit.Snapshot()
@@ -940,8 +980,8 @@ func (m *Manager) waitForUnitReady(unit *service.Unit, timeout time.Duration) er
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	logKernelWarning(fmt.Sprintf("Timeout waiting for %s to finish activating; continuing.", unit.GetConfig().Name))
-	return nil
+	logKernelWarning(fmt.Sprintf("Timeout waiting for %s to finish activating; failing dependent.", unit.GetConfig().Name))
+	return fmt.Errorf("timed out waiting for %s to be ready", unit.GetConfig().Name)
 }
 
 func (m *Manager) StopAllUnits() {
@@ -974,6 +1014,17 @@ func (m *Manager) StopAllUnits() {
 }
 
 func (m *Manager) StopUnit(name string) error {
+	return m.stopUnitRecursive(name, map[string]struct{}{})
+}
+
+// stopUnitRecursive stops a unit and its PartOf/BindsTo dependents depth
+// first (A PartOf B PartOf C stops C's chain fully, not just one level).
+// The visited set makes dependency diamonds and cycles safe.
+func (m *Manager) stopUnitRecursive(name string, visited map[string]struct{}) error {
+	if _, ok := visited[name]; ok {
+		return nil
+	}
+	visited[name] = struct{}{}
 	if strings.HasSuffix(name, ".socket") {
 		return m.stopSocketUnit(name)
 	}
@@ -984,11 +1035,15 @@ func (m *Manager) StopUnit(name string) error {
 	if err := unit.Stop(unit.StopTimeout()); err != nil {
 		return err
 	}
-	// Cascade to PartOf and BindsTo dependents
+	// Cascade to PartOf and BindsTo dependents through the same path so
+	// their own dependents propagate in turn.
 	m.mu.Lock()
 	dependents := []string{}
 	for otherName, otherUnit := range m.Units {
 		if otherName == name {
+			continue
+		}
+		if _, done := visited[otherName]; done {
 			continue
 		}
 		for _, p := range otherUnit.GetConfig().PartOf {
@@ -1017,7 +1072,7 @@ func (m *Manager) StopUnit(name string) error {
 	for _, dep := range dependents {
 		if u, err := m.FindUnit(dep); err == nil {
 			if snap := u.Snapshot(); snap.State == service.StateActive || snap.State == service.StateActivating {
-				_ = u.Stop(u.StopTimeout())
+				_ = m.stopUnitRecursive(dep, visited)
 			}
 		}
 	}
