@@ -2,9 +2,13 @@ package ipc
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
+
+	"initd/internal/userpaths"
 )
 
 const DefaultTimeout = 60 * time.Second
@@ -31,7 +35,21 @@ func (c *Client) Do(req Request) (Response, error) {
 	}
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
-		return Response{}, err
+		// Mirror Serve's abstract fallback for >90ch filesystem paths:
+		// the daemon may be listening on @initd-{user,system}-<uid>.sock
+		// while the client still dials the long filesystem path. Only
+		// the guessed scope is tried: falling through to the other
+		// scope would silently answer a user query from the system
+		// daemon (or vice versa).
+		if fallback, ok := abstractDialFallback(c.SocketPath); ok {
+			if fconn, ferr := net.Dial("unix", fallback); ferr == nil {
+				conn = fconn
+				err = nil
+			}
+		}
+		if err != nil {
+			return Response{}, err
+		}
 	}
 	defer conn.Close()
 	if d := c.effectiveTimeout(); d > 0 {
@@ -50,4 +68,19 @@ func (c *Client) Do(req Request) (Response, error) {
 		return Response{}, err
 	}
 	return resp, nil
+}
+
+// abstractDialFallback maps a long filesystem socket path to the abstract
+// name Serve falls back to, or false when no fallback applies.
+func abstractDialFallback(socketPath string) (string, bool) {
+	if len(socketPath) <= 90 || strings.HasPrefix(socketPath, "@") {
+		return "", false
+	}
+	// Heuristic mirrors userpaths: user sockets end in initd.sock,
+	// system sockets in initd-system.sock or /run/initd.sock.
+	base := socketPath
+	if strings.HasSuffix(base, "initd-system.sock") || base == "/run/initd.sock" {
+		return fmt.Sprintf("\x00initd-system-%d.sock", os.Getuid()), true
+	}
+	return fmt.Sprintf("\x00initd-user-%d.sock", userpaths.RealUID()), true
 }

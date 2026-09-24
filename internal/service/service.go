@@ -237,9 +237,13 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		u.markFailed(err, ignoreFailure)
 		return
 	}
-	// Socket activation: pass listening fds if present
+	// Socket activation: pass listening fds if present. The dup'd files
+	// are parent copies: close them after Start (the child has its own
+	// dups) and on every failure path so fds don't accumulate.
 	socketActivated := false
+	var socketFiles []*os.File
 	if files, env := u.takeSocketActivation(); len(files) > 0 {
+		socketFiles = files
 		cmd.ExtraFiles = files
 		for k, v := range env {
 			if k == "LISTEN_PID" {
@@ -255,6 +259,12 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 			socketActivated = true
 		}
 	}
+	closeSocketFiles := func() {
+		for _, f := range socketFiles {
+			_ = f.Close()
+		}
+		socketFiles = nil
+	}
 	if argv0 != "" && !socketActivated {
 		cmd.Args[0] = argv0
 	}
@@ -265,6 +275,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	if serviceType == "notify" {
 		server, err := notify.Start()
 		if err != nil {
+			closeSocketFiles()
 			u.markFailed(fmt.Errorf("notify socket create failed: %w", err), ignoreFailure)
 			return
 		}
@@ -294,6 +305,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	u.configureCommand(cmd, envList, stdoutLogger, stderrLogger)
 
 	if err := cmd.Start(); err != nil {
+		closeSocketFiles()
 		u.markFailed(err, ignoreFailure)
 
 		u.mu.Lock()
@@ -305,6 +317,9 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 		return
 	}
+
+	// Child has its own dups now; release the parent copies.
+	closeSocketFiles()
 
 	u.mu.Lock()
 

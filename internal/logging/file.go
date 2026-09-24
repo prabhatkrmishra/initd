@@ -82,14 +82,48 @@ func (w *FileWriter) openLocked() error {
 	if err != nil {
 		return err
 	}
-	// Tail scan for seq continuity. Cheap: only the last 64k is read.
+	// Seq must stay monotonic across rotates and restarts: the active
+	// file alone is not enough (after a rotate it is empty and would
+	// reset seq to 0, duplicating cursors). Take the max across the dir,
+	// keep offset from the active tail for the cursor suffix.
 	if st, err := f.Stat(); err == nil && st.Size() > 0 {
-		w.seq, w.offset = tailSeqOffset(path, st.Size())
+		lastSeq, lines := tailSeqOffset(path, st.Size())
+		w.offset = lines
+		w.seq = lastSeq
+	} else {
+		w.offset = 0
+	}
+	if max := dirMaxSeq(w.dir); max > w.seq {
+		w.seq = max
 	}
 	w.file = f
 	w.buf = bufio.NewWriterSize(f, 64*1024)
 	w.lines = 0
 	return nil
+}
+
+// dirMaxSeq returns the highest Seq seen in any *.jsonl in dir, using the
+// cheap 64k tail scan per file. Torn lines are skipped by tailSeqOffset.
+func dirMaxSeq(dir string) uint64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var max uint64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		st, err := os.Stat(full)
+		if err != nil || st.Size() == 0 {
+			continue
+		}
+		if last, _ := tailSeqOffset(full, st.Size()); last > max {
+			max = last
+		}
+	}
+	return max
 }
 
 // tailSeqOffset recovers the last seq and line count from the file tail so a
