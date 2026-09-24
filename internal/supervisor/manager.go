@@ -171,19 +171,19 @@ func (m *Manager) LoadUnits() error {
 				continue
 			}
 			if old, ok := oldUnits[entry.Name()]; ok {
-				old.Config = unitConfig
+				old.SetConfig(unitConfig)
 				old.Path = path
 				if old.Reaper() == nil && m.reaper != nil {
 					old.SetReaper(m.reaper)
 				}
-				old.SetOnFailureHandler(m.onFailureCallback(old.Config.Name))
+				old.SetOnFailureHandler(m.onFailureCallback(old.GetConfig().Name))
 				units[entry.Name()] = old
 			} else {
 				unit := service.NewUnit(unitConfig, path)
 				if m.reaper != nil {
 					unit.SetReaper(m.reaper)
 				}
-				unit.SetOnFailureHandler(m.onFailureCallback(unit.Config.Name))
+				unit.SetOnFailureHandler(m.onFailureCallback(unit.GetConfig().Name))
 				m.attachJournalLocked(unit)
 				units[entry.Name()] = unit
 			}
@@ -208,8 +208,8 @@ func (m *Manager) LoadUnits() error {
 			continue
 		}
 		// Re-instantiate from updated template
-		newConfig := cloneAndExpandTemplate(tmpl.Config, name, instance)
-		oldUnit.Config = newConfig
+		newConfig := cloneAndExpandTemplate(tmpl.GetConfig(), name, instance)
+		oldUnit.SetConfig(newConfig)
 		oldUnit.Path = tmpl.Path
 		if oldUnit.Reaper() == nil && m.reaper != nil {
 			oldUnit.SetReaper(m.reaper)
@@ -260,11 +260,11 @@ func (m *Manager) onFailureCallback(unitName string) func(string) {
 			m.mu.Unlock()
 			return
 		}
-		targets := append([]string{}, cfg.Config.OnFailure...)
+		targets := append([]string{}, cfg.GetConfig().OnFailure...)
 		// Collect BindsTo dependents that should be stopped on failure
 		bindsDependents := []string{}
 		for otherName, otherUnit := range m.Units {
-			for _, b := range otherUnit.Config.BindsTo {
+			for _, b := range otherUnit.GetConfig().BindsTo {
 				if strings.TrimSpace(b) == failedUnit {
 					bindsDependents = append(bindsDependents, otherName)
 					break
@@ -303,7 +303,7 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 	if isTemplateInstance(name) {
 		tmplName, instance := parseTemplateInstance(name)
 		if tmpl, ok := m.Units[tmplName]; ok {
-			newConfig := cloneAndExpandTemplate(tmpl.Config, name, instance)
+			newConfig := cloneAndExpandTemplate(tmpl.GetConfig(), name, instance)
 			unit := service.NewUnit(newConfig, tmpl.Path)
 			if m.reaper != nil {
 				unit.SetReaper(m.reaper)
@@ -331,7 +331,7 @@ func (m *Manager) findUnitLocked(name string) (*service.Unit, error) {
 	if isTemplateInstance(name) {
 		tmplName, instance := parseTemplateInstance(name)
 		if tmpl, ok := m.Units[tmplName]; ok {
-			newConfig := cloneAndExpandTemplate(tmpl.Config, name, instance)
+			newConfig := cloneAndExpandTemplate(tmpl.GetConfig(), name, instance)
 			unit := service.NewUnit(newConfig, tmpl.Path)
 			if m.reaper != nil {
 				unit.SetReaper(m.reaper)
@@ -374,7 +374,7 @@ func (m *Manager) loadUnitFromDiskLocked(n string) *service.Unit {
 		if m.reaper != nil {
 			unit.SetReaper(m.reaper)
 		}
-		unit.SetOnFailureHandler(m.onFailureCallback(unit.Config.Name))
+		unit.SetOnFailureHandler(m.onFailureCallback(unit.GetConfig().Name))
 		m.attachJournalLocked(unit)
 		m.Units[n] = unit
 		m.UnitOrder = append(m.UnitOrder, n)
@@ -662,7 +662,7 @@ func (m *Manager) startUnitWithDependencies(name string, started map[string]stru
 	stack[name] = struct{}{}
 
 	// Conflicts: stop conflicting active units before starting
-	for _, conflict := range unit.Config.Conflicts {
+	for _, conflict := range unit.GetConfig().Conflicts {
 		conflict = strings.TrimSpace(conflict)
 		if conflict == "" {
 			continue
@@ -691,7 +691,7 @@ func (m *Manager) startUnitWithDependencies(name string, started map[string]stru
 		if err != nil {
 			continue
 		}
-		for _, c := range other.Config.Conflicts {
+		for _, c := range other.GetConfig().Conflicts {
 			if strings.TrimSpace(c) == name {
 				if snap := other.Snapshot(); snap.State == service.StateActive || snap.State == service.StateActivating {
 					_ = other.Stop(other.StopTimeout())
@@ -742,7 +742,7 @@ func (m *Manager) StartEnabledUnits() error {
 	ordered := m.orderUnitsByAfter(units)
 	started := map[string]struct{}{}
 	for _, unit := range ordered {
-		if err := m.startUnitWithDependencies(unit.Config.Name, started, map[string]struct{}{}); err != nil {
+		if err := m.startUnitWithDependencies(unit.GetConfig().Name, started, map[string]struct{}{}); err != nil {
 			unit.Log(logging.LevelError, fmt.Sprintf("Failed to start enabled unit: %v", err))
 		}
 	}
@@ -761,7 +761,7 @@ type dependency struct {
 }
 
 func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
-	deps := make([]dependency, 0, len(unit.Config.Requires)+len(unit.Config.Wants)+len(unit.Config.BindsTo))
+	deps := make([]dependency, 0, len(unit.GetConfig().Requires)+len(unit.GetConfig().Wants)+len(unit.GetConfig().BindsTo))
 	seen := map[string]struct{}{}
 	add := func(name string, required bool) {
 		name = strings.TrimSpace(name)
@@ -774,13 +774,13 @@ func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
 		seen[name] = struct{}{}
 		deps = append(deps, dependency{name: name, required: required})
 	}
-	for _, dep := range unit.Config.Requires {
+	for _, dep := range unit.GetConfig().Requires {
 		add(dep, true)
 	}
-	for _, dep := range unit.Config.BindsTo {
+	for _, dep := range unit.GetConfig().BindsTo {
 		add(dep, true)
 	}
-	for _, dep := range unit.Config.Wants {
+	for _, dep := range unit.GetConfig().Wants {
 		add(dep, false)
 	}
 	return deps
@@ -824,22 +824,22 @@ func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, start
 			continue
 		}
 		depUnits = append(depUnits, depUnit)
-		depMeta[depUnit.Config.Name] = dep
+		depMeta[depUnit.GetConfig().Name] = dep
 	}
 
 	ordered := m.orderUnitsByAfter(depUnits)
 	for _, depUnit := range ordered {
-		meta := depMeta[depUnit.Config.Name]
-		if err := m.startUnitWithDependencies(depUnit.Config.Name, started, stack); err != nil {
+		meta := depMeta[depUnit.GetConfig().Name]
+		if err := m.startUnitWithDependencies(depUnit.GetConfig().Name, started, stack); err != nil {
 			if meta.required {
-				return fmt.Errorf("required unit %s failed: %w", depUnit.Config.Name, err)
+				return fmt.Errorf("required unit %s failed: %w", depUnit.GetConfig().Name, err)
 			}
-			unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s failed: %v", depUnit.Config.Name, err))
+			unit.Log(logging.LevelError, fmt.Sprintf("Wanted unit %s failed: %v", depUnit.GetConfig().Name, err))
 			continue
 		}
 		if meta.required {
 			if err := m.waitForUnitReady(depUnit, 30*time.Second); err != nil {
-				return fmt.Errorf("required unit %s failed: %w", depUnit.Config.Name, err)
+				return fmt.Errorf("required unit %s failed: %w", depUnit.GetConfig().Name, err)
 			}
 		}
 	}
@@ -854,14 +854,14 @@ func (m *Manager) waitForUnitReady(unit *service.Unit, timeout time.Duration) er
 			if snapshot.LastError != "" {
 				return errors.New(snapshot.LastError)
 			}
-			return fmt.Errorf("unit %s failed", unit.Config.Name)
+			return fmt.Errorf("unit %s failed", unit.GetConfig().Name)
 		}
 		if snapshot.State != service.StateActivating && snapshot.State != service.StateStopping {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	logKernelWarning(fmt.Sprintf("Timeout waiting for %s to finish activating; continuing.", unit.Config.Name))
+	logKernelWarning(fmt.Sprintf("Timeout waiting for %s to finish activating; continuing.", unit.GetConfig().Name))
 	return nil
 }
 
@@ -912,13 +912,13 @@ func (m *Manager) StopUnit(name string) error {
 		if otherName == name {
 			continue
 		}
-		for _, p := range otherUnit.Config.PartOf {
+		for _, p := range otherUnit.GetConfig().PartOf {
 			if strings.TrimSpace(p) == name {
 				dependents = append(dependents, otherName)
 				break
 			}
 		}
-		for _, b := range otherUnit.Config.BindsTo {
+		for _, b := range otherUnit.GetConfig().BindsTo {
 			if strings.TrimSpace(b) == name {
 				found := false
 				for _, d := range dependents {
@@ -1050,7 +1050,7 @@ func (m *Manager) Reload() error {
 }
 
 func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
-	restart := strings.ToLower(strings.TrimSpace(unit.Config.Service.Restart))
+	restart := strings.ToLower(strings.TrimSpace(unit.GetConfig().Service.Restart))
 	if restart == "" || restart == "no" {
 		return
 	}
@@ -1130,9 +1130,9 @@ func (m *Manager) enableUnitInternal(name string, now bool) error {
 	var alsoList, aliasList []string
 	if unit, err := m.FindUnit(name); err == nil {
 		unitPath = unit.Path
-		install = unit.Config.Install
-		alsoList = unit.Config.Install.Also
-		aliasList = unit.Config.Install.Alias
+		install = unit.GetConfig().Install
+		alsoList = unit.GetConfig().Install.Also
+		aliasList = unit.GetConfig().Install.Alias
 	} else if sock, err := m.FindSocketUnit(name); err == nil {
 		if p, ok := m.SocketPaths[name]; ok {
 			unitPath = p
@@ -1173,7 +1173,7 @@ func (m *Manager) enableUnitInternal(name string, now bool) error {
 			continue
 		}
 		if alsoUnit, err := m.FindUnit(alsoName); err == nil {
-			for _, target := range alsoUnit.Config.Install.WantedBy {
+			for _, target := range alsoUnit.GetConfig().Install.WantedBy {
 				wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
 				_ = os.MkdirAll(wantsDir, 0o755)
 				linkPath := filepath.Join(wantsDir, alsoName)
@@ -1228,9 +1228,9 @@ func (m *Manager) disableUnitInternal(name string, now bool) error {
 	var alsoList, aliasList []string
 	if unit, err := m.FindUnit(name); err == nil {
 		unitPath = unit.Path
-		install = unit.Config.Install
-		alsoList = unit.Config.Install.Also
-		aliasList = unit.Config.Install.Alias
+		install = unit.GetConfig().Install
+		alsoList = unit.GetConfig().Install.Also
+		aliasList = unit.GetConfig().Install.Alias
 	} else if sock, err := m.FindSocketUnit(name); err == nil {
 		if p, ok := m.SocketPaths[name]; ok {
 			unitPath = p
@@ -1258,7 +1258,7 @@ func (m *Manager) disableUnitInternal(name string, now bool) error {
 			continue
 		}
 		if alsoUnit, err := m.FindUnit(alsoName); err == nil {
-			for _, target := range alsoUnit.Config.Install.WantedBy {
+			for _, target := range alsoUnit.GetConfig().Install.WantedBy {
 				wantsDir := filepath.Join(root, fmt.Sprintf("%s.wants", target))
 				linkPath := filepath.Join(wantsDir, alsoName)
 				_ = os.Remove(linkPath)
@@ -1470,7 +1470,7 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 	}
 	snap := unit.Snapshot()
 	effState, effPID := unit.EffectiveState()
-	cfg := unit.Config
+	cfg := unit.GetConfig()
 	data := map[string]string{
 		"Id":                    cfg.Name,
 		"Names":                 cfg.Name,
@@ -1761,43 +1761,43 @@ func (m *Manager) orderUnitsByAfter(units []*service.Unit) []*service.Unit {
 	orderIndex := map[string]int{}
 	nameToUnit := map[string]*service.Unit{}
 	for idx, unit := range units {
-		orderIndex[unit.Config.Name] = idx
-		nameToUnit[unit.Config.Name] = unit
+		orderIndex[unit.GetConfig().Name] = idx
+		nameToUnit[unit.GetConfig().Name] = unit
 	}
 
 	adj := map[string][]string{}
 	indegree := map[string]int{}
 	for _, unit := range units {
-		indegree[unit.Config.Name] = 0
+		indegree[unit.GetConfig().Name] = 0
 	}
 
 	for _, unit := range units {
-		for _, dep := range unit.Config.After {
+		for _, dep := range unit.GetConfig().After {
 			if strings.HasSuffix(dep, ".target") || !strings.HasSuffix(dep, ".service") {
 				continue
 			}
-			if _, ok := nameToUnit[dep]; !ok || dep == unit.Config.Name {
+			if _, ok := nameToUnit[dep]; !ok || dep == unit.GetConfig().Name {
 				continue
 			}
-			adj[dep] = append(adj[dep], unit.Config.Name)
-			indegree[unit.Config.Name]++
+			adj[dep] = append(adj[dep], unit.GetConfig().Name)
+			indegree[unit.GetConfig().Name]++
 		}
-		for _, dep := range unit.Config.Before {
+		for _, dep := range unit.GetConfig().Before {
 			if strings.HasSuffix(dep, ".target") || !strings.HasSuffix(dep, ".service") {
 				continue
 			}
-			if _, ok := nameToUnit[dep]; !ok || dep == unit.Config.Name {
+			if _, ok := nameToUnit[dep]; !ok || dep == unit.GetConfig().Name {
 				continue
 			}
-			adj[unit.Config.Name] = append(adj[unit.Config.Name], dep)
+			adj[unit.GetConfig().Name] = append(adj[unit.GetConfig().Name], dep)
 			indegree[dep]++
 		}
 	}
 
 	queue := make([]string, 0, len(units))
 	for _, unit := range units {
-		if indegree[unit.Config.Name] == 0 {
-			queue = append(queue, unit.Config.Name)
+		if indegree[unit.GetConfig().Name] == 0 {
+			queue = append(queue, unit.GetConfig().Name)
 		}
 	}
 

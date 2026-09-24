@@ -44,6 +44,7 @@ type Runtime struct {
 
 type Unit struct {
 	mu               sync.Mutex
+	configMu         sync.RWMutex
 	Config           *parser.Unit
 	Path             string
 	Runtime          Runtime
@@ -85,6 +86,23 @@ func NewUnit(config *parser.Unit, path string) *Unit {
 	}
 }
 
+// GetConfig returns the parsed unit config. The pointer itself is swapped
+// under configMu by daemon-reload; the pointed-to Unit is immutable after
+// publish, so callers may read fields without further locking.
+func (u *Unit) GetConfig() *parser.Unit {
+	u.configMu.RLock()
+	defer u.configMu.RUnlock()
+	return u.Config
+}
+
+// SetConfig swaps the parsed config, preserving runtime state across
+// daemon-reload. Uses a dedicated mutex so it never deadlocks with mu.
+func (u *Unit) SetConfig(c *parser.Unit) {
+	u.configMu.Lock()
+	u.Config = c
+	u.configMu.Unlock()
+}
+
 func (u *Unit) SetReaper(reaper ExitReaper) {
 	u.mu.Lock()
 	u.reaper = reaper
@@ -117,10 +135,10 @@ func (u *Unit) Start() (int, error) {
 		return token, nil
 	}
 	state := u.Runtime.State
-	ignored := u.Config.Ignored
+	ignored := u.GetConfig().Ignored
 	u.mu.Unlock()
 	if state == StateStopping {
-		return 0, fmt.Errorf("unit %s is stopping, try again", u.Config.Name)
+		return 0, fmt.Errorf("unit %s is stopping, try again", u.GetConfig().Name)
 	}
 	// Surface silently-dropped hardening directives before supervising.
 	// The Ignored snapshot above is read without the log lock held (Log
@@ -152,7 +170,7 @@ func (u *Unit) Start() (int, error) {
 		return token, nil
 	}
 
-	execStart := strings.TrimSpace(u.Config.Service.ExecStart)
+	execStart := strings.TrimSpace(u.GetConfig().Service.ExecStart)
 	if execStart == "" {
 		err := errors.New("ExecStart is empty")
 		u.markFailed(err, false)
@@ -288,14 +306,14 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	}
 
 	stdoutLogger := &logging.LineLogger{
-		Unit:   u.Config.Name,
+		Unit:   u.GetConfig().Name,
 		PID:    0,
 		Level:  logging.LevelInfo,
 		Buffer: u.Logs,
 		Output: os.Stdout,
 	}
 	stderrLogger := &logging.LineLogger{
-		Unit:   u.Config.Name,
+		Unit:   u.GetConfig().Name,
 		PID:    0,
 		Level:  logging.LevelError,
 		Buffer: u.Logs,
@@ -472,7 +490,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		}
 	}()
 
-	stopCommand := strings.TrimSpace(u.Config.Service.ExecStop)
+	stopCommand := strings.TrimSpace(u.GetConfig().Service.ExecStop)
 	if stopCommand != "" {
 		if err := u.runStopCommand(stopCommand); err != nil {
 			return err
@@ -740,7 +758,7 @@ func (u *Unit) Reload() error {
 	if !active {
 		return errors.New("unit is not active")
 	}
-	if len(u.Config.Service.ExecReload) == 0 {
+	if len(u.GetConfig().Service.ExecReload) == 0 {
 		return errors.New("ExecReload not set")
 	}
 
@@ -748,7 +766,7 @@ func (u *Unit) Reload() error {
 	if err != nil {
 		return err
 	}
-	for _, command := range u.Config.Service.ExecReload {
+	for _, command := range u.GetConfig().Service.ExecReload {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
@@ -765,7 +783,7 @@ func (u *Unit) runStopCommand(command string) error {
 		return err
 	}
 
-	return u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly})
+	return u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly})
 }
 
 func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
@@ -776,13 +794,13 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 		}
 	}
 
-	for _, entry := range u.Config.Service.EnvironmentFile {
+	for _, entry := range u.GetConfig().Service.EnvironmentFile {
 		if err := u.loadEnvironmentFile(entry, envMap); err != nil {
 			return nil, nil, err
 		}
 	}
 
-	for _, entry := range u.Config.Service.Environment {
+	for _, entry := range u.GetConfig().Service.Environment {
 		parts, err := shlex.Split(entry)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse Environment: %w", err)
@@ -875,7 +893,7 @@ func (u *Unit) waitForPIDFile(timeout time.Duration, poll time.Duration) (int, e
 }
 
 func (u *Unit) readPIDFile() (int, error) {
-	path := strings.TrimSpace(u.Config.Service.PIDFile)
+	path := strings.TrimSpace(u.GetConfig().Service.PIDFile)
 	if path == "" {
 		return 0, errors.New("PIDFile not set")
 	}
@@ -1015,7 +1033,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 			u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 			didFail := true
 			handler := u.onFailureHandler
-			name := u.Config.Name
+			name := u.GetConfig().Name
 			u.mu.Unlock()
 			if handler != nil {
 				go handler(name)
@@ -1082,7 +1100,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 
 	didFail2 := u.Runtime.State == StateFailed
 	handler2 := u.onFailureHandler
-	name2 := u.Config.Name
+	name2 := u.GetConfig().Name
 	origErr := err
 	u.mu.Unlock()
 	if didFail2 && handler2 != nil && origErr != nil {
@@ -1097,7 +1115,7 @@ func (u *Unit) Log(level logging.Level, message string) {
 	u.Logs.Add(logging.Entry{
 		Timestamp: logging.MonotonicNow(),
 		WallTime:  time.Now(),
-		Unit:      u.Config.Name,
+		Unit:      u.GetConfig().Name,
 		PID:       pid,
 		Level:     level,
 		Message:   message,
@@ -1183,7 +1201,7 @@ func (u *Unit) expandSpecifiers(s string) string {
 	if !strings.Contains(s, "%") {
 		return s
 	}
-	fullName := u.Config.Name
+	fullName := u.GetConfig().Name
 	prefix := fullName
 	instance := ""
 	if idx := strings.Index(fullName, "@"); idx >= 0 {
@@ -1268,7 +1286,7 @@ func processAlive(pid int) bool {
 }
 
 func (u *Unit) canonicalServiceType() string {
-	serviceType := strings.ToLower(strings.TrimSpace(u.Config.Service.Type))
+	serviceType := strings.ToLower(strings.TrimSpace(u.GetConfig().Service.Type))
 
 	switch serviceType {
 	case "", "simple":
@@ -1323,23 +1341,23 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 }
 
 func (u *Unit) ensureRuntimeDirectory() error {
-	return u.ensureNamedDirectories("/run", u.Config.Service.RuntimeDirectory, u.Config.Service.RuntimeDirectoryMode)
+	return u.ensureNamedDirectories("/run", u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode)
 }
 
 func (u *Unit) ensureManagedDirectories() error {
 	if err := u.ensureRuntimeDirectory(); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/var/lib", u.Config.Service.StateDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories("/var/lib", u.GetConfig().Service.StateDirectory, "0755"); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/var/cache", u.Config.Service.CacheDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories("/var/cache", u.GetConfig().Service.CacheDirectory, "0755"); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/var/log", u.Config.Service.LogsDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories("/var/log", u.GetConfig().Service.LogsDirectory, "0755"); err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories("/etc", u.Config.Service.ConfigurationDirectory, "0755"); err != nil {
+	if err := u.ensureNamedDirectories("/etc", u.GetConfig().Service.ConfigurationDirectory, "0755"); err != nil {
 		return err
 	}
 	return nil
@@ -1396,14 +1414,14 @@ func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr strin
 }
 
 func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []string) error {
-	for _, command := range u.Config.Service.ExecStartPre {
+	for _, command := range u.GetConfig().Service.ExecStartPre {
 		if !u.isCurrentToken(token) {
 			return nil
 		}
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}); err != nil {
 			return err
 		}
 	}
@@ -1411,18 +1429,18 @@ func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []st
 }
 
 func (u *Unit) runExecCondition() (string, error) {
-	if len(u.Config.Service.ExecCondition) == 0 {
+	if len(u.GetConfig().Service.ExecCondition) == 0 {
 		return "continue", nil
 	}
 	envMap, envList, err := u.buildEnvironment()
 	if err != nil {
 		return "", err
 	}
-	for _, command := range u.Config.Service.ExecCondition {
+	for _, command := range u.GetConfig().Service.ExecCondition {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		status, err := u.runCommandStatus(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly})
+		status, err := u.runCommandStatus(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly})
 		if err != nil {
 			return "", err
 		}
@@ -1439,14 +1457,14 @@ func (u *Unit) runExecCondition() (string, error) {
 }
 
 func (u *Unit) runExecStartPost(token int, envMap map[string]string, envList []string) error {
-	for _, command := range u.Config.Service.ExecStartPost {
+	for _, command := range u.GetConfig().Service.ExecStartPost {
 		if !u.isCurrentToken(token) {
 			return nil
 		}
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}); err != nil {
 			return err
 		}
 	}
@@ -1458,11 +1476,11 @@ func (u *Unit) runExecStopPost() error {
 	if err != nil {
 		return err
 	}
-	for _, command := range u.Config.Service.ExecStopPost {
+	for _, command := range u.GetConfig().Service.ExecStopPost {
 		if strings.TrimSpace(command) == "" {
 			continue
 		}
-		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.Config.Service.PermissionsStartOnly}); err != nil {
+		if err := u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}); err != nil {
 			return err
 		}
 	}
@@ -1508,8 +1526,8 @@ func (u *Unit) runCommandStatus(command string, envMap map[string]string, envLis
 		}
 		return 0, err
 	}
-	stdoutLogger := &logging.LineLogger{Unit: u.Config.Name, PID: 0, Level: logging.LevelInfo, Buffer: u.Logs, Output: os.Stdout}
-	stderrLogger := &logging.LineLogger{Unit: u.Config.Name, PID: 0, Level: logging.LevelError, Buffer: u.Logs, Output: os.Stderr}
+	stdoutLogger := &logging.LineLogger{Unit: u.GetConfig().Name, PID: 0, Level: logging.LevelInfo, Buffer: u.Logs, Output: os.Stdout}
+	stderrLogger := &logging.LineLogger{Unit: u.GetConfig().Name, PID: 0, Level: logging.LevelError, Buffer: u.Logs, Output: os.Stderr}
 	u.configureCommand(cmd, envList, stdoutLogger, stderrLogger)
 	if err := cmd.Start(); err != nil {
 		if ignoreFailure {
@@ -1545,8 +1563,8 @@ func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, 
 	if len(args) == 0 {
 		return nil, errors.New("command parsed to empty")
 	}
-	umask := strings.TrimSpace(u.Config.Service.UMask)
-	limitNOFILE := strings.TrimSpace(u.Config.Service.LimitNOFILE)
+	umask := strings.TrimSpace(u.GetConfig().Service.UMask)
+	limitNOFILE := strings.TrimSpace(u.GetConfig().Service.LimitNOFILE)
 	var cmd *exec.Cmd
 	if umask != "" || limitNOFILE != "" {
 		setup := make([]string, 0, 2)
@@ -1572,7 +1590,7 @@ func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, 
 	if creds.set {
 		sysProcAttr.Credential = &syscall.Credential{Uid: creds.uid, Gid: creds.gid, Groups: creds.groups}
 	}
-	if rootDir := strings.TrimSpace(u.Config.Service.RootDirectory); rootDir != "" {
+	if rootDir := strings.TrimSpace(u.GetConfig().Service.RootDirectory); rootDir != "" {
 		sysProcAttr.Chroot = rootDir
 	}
 	cmd.SysProcAttr = sysProcAttr
@@ -1612,7 +1630,7 @@ func (u *Unit) configureCommand(cmd *exec.Cmd, envList []string, stdoutLogger, s
 }
 
 func (u *Unit) checkConditions() error {
-	for _, condition := range u.Config.ConditionPathExists {
+	for _, condition := range u.GetConfig().ConditionPathExists {
 		condition = strings.TrimSpace(condition)
 		if condition == "" {
 			continue
@@ -1632,7 +1650,7 @@ func (u *Unit) checkConditions() error {
 }
 
 func (u *Unit) killModeProcess() bool {
-	return strings.EqualFold(strings.TrimSpace(u.Config.Service.KillMode), "process")
+	return strings.EqualFold(strings.TrimSpace(u.GetConfig().Service.KillMode), "process")
 }
 
 func (u *Unit) killMainProcess(sig syscall.Signal) {
@@ -1679,7 +1697,7 @@ func (u *Unit) StopRequested() bool {
 }
 
 func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
-	return parseExitStatusSet(u.Config.Service.RestartPreventExitStatus)
+	return parseExitStatusSet(u.GetConfig().Service.RestartPreventExitStatus)
 }
 
 // remainAfterExit reports whether a clean oneshot exit should leave the unit
@@ -1688,10 +1706,10 @@ func (u *Unit) RestartPreventExitStatus() map[int]struct{} {
 // (not via canonicalServiceType) so probing never emits duplicate
 // "unsupported type" log lines on the exit path.
 func (u *Unit) remainAfterExit() bool {
-	if strings.ToLower(strings.TrimSpace(u.Config.Service.Type)) != "oneshot" {
+	if strings.ToLower(strings.TrimSpace(u.GetConfig().Service.Type)) != "oneshot" {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(u.Config.Service.RemainAfterExit)) {
+	switch strings.ToLower(strings.TrimSpace(u.GetConfig().Service.RemainAfterExit)) {
 	case "yes", "true", "1", "on":
 		return true
 	default:
@@ -1743,7 +1761,7 @@ var securityNotes = map[string]string{
 // Resource-control directives (MemoryMax, CPUQuota, ...) are intentionally
 // left out: they are inert accounting knobs, not promises of isolation.
 func (u *Unit) IgnoredSecurityNotes() []string {
-	return IgnoredSecurityNotes(u.Config.Ignored)
+	return IgnoredSecurityNotes(u.GetConfig().Ignored)
 }
 
 // IgnoredSecurityNotes renders warnings for a raw Ignored map without
@@ -1794,12 +1812,12 @@ func (u *Unit) SubState() State {
 // defaulting to systemd's 10s window with a burst of 5. An interval <= 0
 // disables rate limiting; a burst <= 0 means no cap inside the window.
 func (u *Unit) StartLimit() (time.Duration, int) {
-	interval := parseSystemdDuration(u.Config.StartLimitIntervalSec, 10*time.Second)
+	interval := parseSystemdDuration(u.GetConfig().StartLimitIntervalSec, 10*time.Second)
 	if interval <= 0 {
 		return 0, 0
 	}
 	burst := 5
-	if raw := strings.TrimSpace(u.Config.StartLimitBurst); raw != "" {
+	if raw := strings.TrimSpace(u.GetConfig().StartLimitBurst); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil {
 			burst = n
 		}
@@ -1829,7 +1847,7 @@ func (u *Unit) StartLimitIntervalUsec() uint64 {
 
 // restartBaseDelay is the RestartSec delay before any backoff growth.
 func (u *Unit) restartBaseDelay() time.Duration {
-	return parseSystemdDuration(u.Config.Service.RestartSec, 0)
+	return parseSystemdDuration(u.GetConfig().Service.RestartSec, 0)
 }
 
 // restartDelay returns the delay before restart attempt n (1-based): the
@@ -1841,12 +1859,12 @@ func (u *Unit) RestartDelay(attempt int) time.Duration {
 		return base
 	}
 	steps := 0
-	if raw := strings.TrimSpace(u.Config.Service.RestartSteps); raw != "" {
+	if raw := strings.TrimSpace(u.GetConfig().Service.RestartSteps); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
 			steps = n
 		}
 	}
-	maxDelay := parseSystemdDuration(u.Config.Service.RestartMaxDelaySec, base)
+	maxDelay := parseSystemdDuration(u.GetConfig().Service.RestartMaxDelaySec, base)
 	if maxDelay <= 0 {
 		maxDelay = base
 	}
@@ -1893,17 +1911,17 @@ func (u *Unit) ShouldRestart(mode string, exitCode int) bool {
 }
 
 func (u *Unit) StopTimeout() time.Duration {
-	raw := strings.TrimSpace(u.Config.Service.TimeoutStopSec)
+	raw := strings.TrimSpace(u.GetConfig().Service.TimeoutStopSec)
 	if raw == "" {
-		raw = strings.TrimSpace(u.Config.Service.TimeoutSec)
+		raw = strings.TrimSpace(u.GetConfig().Service.TimeoutSec)
 	}
 	return parseSystemdDuration(raw, 10*time.Second)
 }
 
 func (u *Unit) StartTimeout() time.Duration {
-	raw := strings.TrimSpace(u.Config.Service.TimeoutStartSec)
+	raw := strings.TrimSpace(u.GetConfig().Service.TimeoutStartSec)
 	if raw == "" {
-		raw = strings.TrimSpace(u.Config.Service.TimeoutSec)
+		raw = strings.TrimSpace(u.GetConfig().Service.TimeoutSec)
 	}
 	return parseSystemdDuration(raw, 30*time.Second)
 }
@@ -1942,7 +1960,7 @@ func (u *Unit) livePIDFilePID() int {
 }
 
 func (u *Unit) waitForLivePIDFile(timeout time.Duration, poll time.Duration) int {
-	if strings.TrimSpace(u.Config.Service.PIDFile) == "" {
+	if strings.TrimSpace(u.GetConfig().Service.PIDFile) == "" {
 		return 0
 	}
 	deadline := time.Now().Add(timeout)
@@ -2184,8 +2202,8 @@ func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error)
 	if rootOnly {
 		return credentialSpec{}, nil
 	}
-	userName := strings.TrimSpace(u.Config.Service.User)
-	groupName := strings.TrimSpace(u.Config.Service.Group)
+	userName := strings.TrimSpace(u.GetConfig().Service.User)
+	groupName := strings.TrimSpace(u.GetConfig().Service.Group)
 	if userName == "" && groupName == "" {
 		return credentialSpec{}, nil
 	}
@@ -2216,7 +2234,7 @@ func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error)
 		uid = uint32(os.Getuid())
 	}
 
-	groups, err := lookupSupplementaryGroups(u.Config.Service.SupplementaryGroups)
+	groups, err := lookupSupplementaryGroups(u.GetConfig().Service.SupplementaryGroups)
 	if err != nil {
 		return credentialSpec{}, err
 	}
@@ -2225,7 +2243,7 @@ func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error)
 }
 
 func (u *Unit) workingDirectory() string {
-	if dir := strings.TrimSpace(u.Config.Service.WorkingDirectory); dir != "" {
+	if dir := strings.TrimSpace(u.GetConfig().Service.WorkingDirectory); dir != "" {
 		return u.expandSpecifiers(dir)
 	}
 	// systemd defaults system services to the root directory when
@@ -2236,14 +2254,14 @@ func (u *Unit) workingDirectory() string {
 func (u *Unit) Description() string {
 	// Descriptions are literal (LSB headers may contain % or $). No
 	// specifier/env expansion here — that belongs to command lines only.
-	if u.Config.Description != "" {
-		return u.Config.Description
+	if u.GetConfig().Description != "" {
+		return u.GetConfig().Description
 	}
-	return u.Config.Name
+	return u.GetConfig().Name
 }
 
 func (u *Unit) SuccessExitStatus() map[int]struct{} {
-	return parseExitStatusSet(u.Config.Service.SuccessExitStatus)
+	return parseExitStatusSet(u.GetConfig().Service.SuccessExitStatus)
 }
 
 func lookupUser(name string) (uint32, uint32, error) {

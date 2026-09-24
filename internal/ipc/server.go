@@ -200,7 +200,7 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 				logLines = append(logLines, logging.FormatEntry(entry))
 			}
 			return Response{Success: true, Data: StatusData{
-				Name:                unit.Config.Name,
+				Name:                unit.GetConfig().Name,
 				Description:         unit.Description(),
 				State:               effState,
 				SubState:            string(unit.SubState()),
@@ -241,10 +241,10 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			// ListUnits holds *service.Unit; Config.Type is the unit type
 			// (simple/forking/...) — fall back to service type string.
 			utype := ""
-			if unit.Config != nil {
-				utype = unit.Config.Type
+			if unit.GetConfig() != nil {
+				utype = unit.GetConfig().Type
 			}
-			data = append(data, UnitData{Name: unit.Config.Name, Description: unit.Description(), State: effState, Type: utype})
+			data = append(data, UnitData{Name: unit.GetConfig().Name, Description: unit.Description(), State: effState, Type: utype})
 		}
 		for _, name := range manager.SocketUnitNames() {
 			state, _ := manager.SocketActiveState(name)
@@ -266,8 +266,8 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		data := make([]UnitFileData, 0, len(units))
 		for _, unit := range units {
-			state := manager.UnitFileState(unit.Config.Name)
-			data = append(data, UnitFileData{Name: unit.Config.Name, State: state, Path: unit.Path})
+			state := manager.UnitFileState(unit.GetConfig().Name)
+			data = append(data, UnitFileData{Name: unit.GetConfig().Name, State: state, Path: unit.Path})
 		}
 		return Response{Success: true, Data: data}
 	case "enable":

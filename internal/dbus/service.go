@@ -75,20 +75,57 @@ func isNotFoundErr(err error) bool {
 }
 
 // unitObjectPath converts a unit name to its D-Bus object path. systemd
-// escapes the unit name: '.' -> '_2e', '-' -> '_2d', '@' -> '_40' (and other
-// chars as _XX hex). We replicate the documented subset.
+// escapes the unit name per systemd bus-label rules (see dbusEscape).
 func unitObjectPath(name string) dbus.ObjectPath {
 	return dbus.ObjectPath(fmt.Sprintf("%s/%s", unitBasePathString, dbusEscape(name)))
 }
 
+// dbusEscape implements systemd's bus label escaping: '_' becomes '_5f'
+// first, then every byte outside [A-Za-z0-9] becomes _XX lowercase hex.
+// The old three-char table is a subset; the generic form also covers
+// ':', '/', ' ' and future unit types without colliding.
 func dbusEscape(name string) string {
-	repl := strings.NewReplacer(".", "_2e", "-", "_2d", "@", "_40")
-	return repl.Replace(name)
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteString(fmt.Sprintf("_%02x", c))
+	}
+	return b.String()
 }
 
 func dbusUnescape(escaped string) string {
-	repl := strings.NewReplacer("_2e", ".", "_2d", "-", "_40", "@")
-	return repl.Replace(escaped)
+	var b strings.Builder
+	i := 0
+	for i < len(escaped) {
+		if escaped[i] == '_' && i+2 < len(escaped) && isHex(escaped[i+1]) && isHex(escaped[i+2]) {
+			v := hexVal(escaped[i+1])<<4 | hexVal(escaped[i+2])
+			b.WriteByte(v)
+			i += 3
+			continue
+		}
+		b.WriteByte(escaped[i])
+		i++
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func hexVal(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
 }
 
 func unitNameFromPath(path string) (string, bool) {
@@ -270,27 +307,41 @@ type listUnitEntry struct {
 	JobPath     dbus.ObjectPath
 }
 
+
+// dbusSubState mirrors systemctl display: oneshot RemainAfterExit reports
+// exited, otherwise the effective state (so SysV-external shows active,
+// matching ipc list-units, instead of inactive from the raw snapshot).
+func dbusSubState(u interface {
+	SubState() sservice.State
+	RemainActive() bool
+}, eff sservice.State) sservice.State {
+	if u.RemainActive() {
+		return sservice.State("exited")
+	}
+	return eff
+}
+
 func (m *systemd1Manager) ListUnits() ([]listUnitEntry, *dbus.Error) {
 	mgr := m.primarySafe()
 	units := mgr.ListUnits()
 	result := make([]listUnitEntry, 0, len(units))
 	for _, u := range units {
-		snap := u.Snapshot()
+		effState, _ := u.EffectiveState()
 		desc := u.Description()
-		data, _ := managerUnitProps(mgr, u.Config.Name)
+		data, _ := managerUnitProps(mgr, u.GetConfig().Name)
 		if data != nil {
 			if d, ok := data["Description"]; ok && d != "" {
 				desc = d
 			}
 		}
 		result = append(result, listUnitEntry{
-			Name:        u.Config.Name,
+			Name:        u.GetConfig().Name,
 			Description: desc,
 			LoadState:   "loaded",
-			ActiveState: string(snap.State),
-			SubState:    string(snap.State),
+			ActiveState: string(effState),
+			SubState:    string(dbusSubState(u, effState)),
 			Followed:    "",
-			Path:        m.unitPathFor(u.Config.Name),
+			Path:        m.unitPathFor(u.GetConfig().Name),
 			JobId:       0,
 			JobType:     "",
 			JobPath:     "/",
@@ -677,22 +728,22 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 // fields are filled with their zero defaults.
 func buildServiceProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop {
 	cfg, err := mgr.FindUnit(name)
-	if err != nil || cfg == nil || cfg.Config == nil {
+	if err != nil || cfg == nil || cfg.GetConfig() == nil {
 		return nil
 	}
-	execStart := cfg.Config.Service.ExecStart
+	execStart := cfg.GetConfig().Service.ExecStart
 	argv := shellSplitExecStart(execStart)
 	execPath := ""
 	if len(argv) > 0 {
 		execPath = argv[0]
 	}
 	return map[string]*prop.Prop{
-		"Type":             {Value: cfg.Config.Service.Type, Writable: false, Emit: prop.EmitConst},
-		"WorkingDirectory": {Value: cfg.Config.Service.WorkingDirectory, Writable: false, Emit: prop.EmitConst},
+		"Type":             {Value: cfg.GetConfig().Service.Type, Writable: false, Emit: prop.EmitConst},
+		"WorkingDirectory": {Value: cfg.GetConfig().Service.WorkingDirectory, Writable: false, Emit: prop.EmitConst},
 		"ExecStart":        {Value: execStartCommands(execPath, argv), Writable: false, Emit: prop.EmitConst},
-		"Environment":      {Value: cfg.Config.Service.Environment, Writable: false, Emit: prop.EmitConst},
+		"Environment":      {Value: cfg.GetConfig().Service.Environment, Writable: false, Emit: prop.EmitConst},
 		// EnvironmentFiles is a(sb): one (path, ignore-missing) struct per file.
-		"EnvironmentFiles": {Value: envFileSpecs(cfg.Config.Service.EnvironmentFile), Writable: false, Emit: prop.EmitConst},
+		"EnvironmentFiles": {Value: envFileSpecs(cfg.GetConfig().Service.EnvironmentFile), Writable: false, Emit: prop.EmitConst},
 		// The initd unit parser does not track UnsetEnvironment; report empty.
 		"UnsetEnvironment": {Value: []string{}, Writable: false, Emit: prop.EmitConst},
 	}
