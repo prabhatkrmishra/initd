@@ -834,18 +834,37 @@ func (u *Unit) loadEnvironmentFile(entry string, envMap map[string]string) error
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 				continue
+			}
+			// Systemd allows `export KEY=val` and `KEY=val`; strip the
+			// export prefix so the key does not become "export FOO".
+			if rest, ok := strings.CutPrefix(line, "export "); ok {
+				line = strings.TrimSpace(rest)
+			} else if rest, ok := strings.CutPrefix(line, "export\t"); ok {
+				line = strings.TrimSpace(rest)
+			}
+			// Handle tab-separated export as well.
+			if fields := strings.Fields(line); len(fields) >= 2 && fields[0] == "export" {
+				line = strings.TrimSpace(strings.TrimPrefix(line, "export"))
+				line = strings.TrimSpace(line)
 			}
 			key, value, ok := strings.Cut(line, "=")
 			if !ok {
 				continue
 			}
+			key = strings.TrimSpace(key)
+			if key == "" || strings.ContainsAny(key, " \t") {
+				continue
+			}
 			value = strings.TrimSpace(value)
-			if unquoted, err := strconv.Unquote(value); err == nil {
+			if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+				// Single quotes are literal in systemd (no escapes).
+				value = value[1 : len(value)-1]
+			} else if unquoted, err := strconv.Unquote(value); err == nil {
 				value = unquoted
 			}
-			envMap[strings.TrimSpace(key)] = value
+			envMap[key] = value
 		}
 		if err := scanner.Err(); err != nil {
 			_ = file.Close()
@@ -1248,7 +1267,11 @@ func processAlive(pid int) bool {
 	// field after the parenthesised comm (which may contain spaces).
 	data, rerr := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if rerr != nil {
-		return true
+		// Kill succeeded but /proc vanished: the pid exited between the
+		// two checks. The one exception is EPERM from Kill, which means
+		// the process exists but belongs to another user — hidepid or a
+		// permission error reading /proc must not flip that to dead.
+		return err == syscall.EPERM
 	}
 	if idx := strings.LastIndexByte(string(data), ')'); idx >= 0 && idx+2 < len(data) {
 		return data[idx+2] != 'Z'
@@ -1366,9 +1389,8 @@ func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr strin
 				return fmt.Errorf("invalid directory name %q", name)
 			}
 		}
-		if clean != name {
-			return fmt.Errorf("invalid directory name %q", name)
-		}
+		// Accept harmless normalizations (trailing slash, ./x, x//y):
+		// validate `clean` and use it for the join.
 		path := filepath.Join(base, clean)
 		if err := os.MkdirAll(path, mode); err != nil {
 			return fmt.Errorf("create directory %s: %w", path, err)
@@ -2276,10 +2298,60 @@ func parseSystemdDuration(raw string, defaultValue time.Duration) time.Duration 
 	if parsed, err := time.ParseDuration(raw); err == nil {
 		return parsed
 	}
-	if seconds, err := time.ParseDuration(raw + "s"); err == nil {
-		return seconds
+	// Systemd accepts bare numbers (seconds) and a wider suffix table
+	// than Go: us/usec, ms/msec, s/sec, m/min, h/hr, d/day, w/week,
+	// M/month, y/year (plus plurals). Go already covered ns/us/ms/s/m/h
+	// above, so this handles the rest plus bare numbers without hiding
+	// typos behind the default.
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	// Split numeric prefix from unit suffix.
+	i := 0
+	for i < len(lower) && (lower[i] >= '0' && lower[i] <= '9' || lower[i] == '.' || lower[i] == '+' || lower[i] == '-') {
+		i++
 	}
-	return defaultValue
+	numPart := strings.TrimSpace(lower[:i])
+	unitPart := strings.TrimSpace(lower[i:])
+	if numPart == "" {
+		return defaultValue
+	}
+	val, err := strconv.ParseFloat(numPart, 64)
+	if err != nil {
+		return defaultValue
+	}
+	var mult time.Duration
+	switch unitPart {
+	case "", "s", "sec", "secs", "second", "seconds":
+		mult = time.Second
+	case "ns", "nsec", "nsecs", "nanosecond", "nanoseconds":
+		mult = time.Nanosecond
+	case "us", "usec", "usecs", "microsecond", "microseconds":
+		mult = time.Microsecond
+	case "ms", "msec", "msecs", "millisecond", "milliseconds":
+		mult = time.Millisecond
+	case "m", "min", "mins", "minute", "minutes":
+		mult = time.Minute
+	case "h", "hr", "hrs", "hour", "hours":
+		mult = time.Hour
+	case "d", "day", "days":
+		mult = 24 * time.Hour
+	case "w", "week", "weeks":
+		mult = 7 * 24 * time.Hour
+	case "month", "months":
+		// Systemd month = 30.44 days; use 30d like most parsers.
+		mult = 30 * 24 * time.Hour
+	case "y", "year", "years":
+		mult = 365 * 24 * time.Hour
+	default:
+		// Unknown suffix: do not guess, fall back so callers keep
+		// previous behaviour instead of failing open with 0.
+		return defaultValue
+	}
+	// Handle the "M" (month) vs "m" (minute) case-sensitivity lost by
+	// lower-casing: a raw trailing "M" means month.
+	if strings.HasSuffix(strings.TrimSpace(raw), "M") {
+		mult = 30 * 24 * time.Hour
+	}
+	return time.Duration(val * float64(mult))
 }
 
 func parseFileMode(raw string, defaultValue os.FileMode) (os.FileMode, error) {
