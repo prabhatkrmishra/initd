@@ -636,6 +636,10 @@ func parseArgs(args []string) (journalOpts, error) {
 			opts.noFull = true
 		case a == "-a" || a == "--all":
 			opts.all = true
+		case a == "-l" || a == "--full":
+			// Never truncated, so nothing to do (same family as
+			// -a/--no-full above).
+			opts.all = true
 		case a == "-x" || a == "--catalog":
 			opts.catalog = true
 		case a == "-q" || a == "--quiet":
@@ -904,6 +908,7 @@ func printHelp() {
 	fmt.Println("  -x, --catalog               Accepted (no catalog content to add)")
 	fmt.Println("  -W, --no-hostname           Suppress output of hostname field")
 	fmt.Println("  -a, --all                   Accepted (all fields always shown)")
+	fmt.Println("  -l, --full                  Accepted (entries are never truncated)")
 	fmt.Println("  -f, --follow                Follow the journal")
 	fmt.Println("      --no-tail               Show all lines, even in follow mode")
 	fmt.Println("  -q, --quiet                 Do not show info messages")

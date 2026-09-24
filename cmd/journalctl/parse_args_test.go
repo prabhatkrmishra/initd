@@ -52,4 +52,14 @@ func TestParseArgs(t *testing.T) {
 	if _, err := parseArgs([]string{"-M", "foo"}); err == nil {
 		t.Fatal("machine scoping should fail loudly")
 	}
+	// The exact flags from the field report: truncation no-ops must parse.
+	for _, flag := range []string{"-l", "--full"} {
+		opts, err := parseArgs([]string{"--user", "-u", "hermes-gateway", flag, "--since", "2 min ago"})
+		if err != nil {
+			t.Fatalf("parse %s: %v", flag, err)
+		}
+		if len(opts.units) != 1 || opts.units[0] != "hermes-gateway" || opts.since != "2 min ago" {
+			t.Fatalf("%s opts = %+v", flag, opts)
+		}
+	}
 }
