@@ -107,6 +107,11 @@ type Unit struct {
 	// membership question can be answered "no evidence" instead of "nobody is
 	// running" on a box where groups cannot be created.
 	cgroupLeaf bool
+	// invocationID identifies the current run and is exported to the child as
+	// INVOCATION_ID, which systemd guarantees to every service it starts. It is
+	// read by buildEnvironment under configMu, not mu, because a start mints it
+	// in the start goroutine while the environment is built by the caller.
+	invocationID string
 }
 
 type managedDirectories struct {
@@ -389,6 +394,11 @@ func (u *Unit) Start() (int, error) {
 	u.startToken++
 	u.stopRequested = false
 	token := u.startToken
+	// Mint this run's id here, before the environment is built: the child is
+	// told the same value in INVOCATION_ID, and the journal's
+	// _SYSTEMD_INVOCATION_ID is taken from it, so the two can never disagree
+	// about which run produced a log line.
+	u.invocationID = newInvocationID()
 	u.spawnResult = make(chan error, 1)
 	u.spawnResultToken = token
 	u.Runtime.State = StateActivating
@@ -648,8 +658,9 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	// Every start (including restarts) is a new invocation: lines logged
 	// from here on carry its id so journalctl -I/--invocation can isolate
-	// this run from earlier ones.
-	u.Logs.SetInvocation(newInvocationID())
+	// this run from earlier ones. Start() minted it before the environment was
+	// built, because the child is told the same id in INVOCATION_ID.
+	u.Logs.SetInvocation(u.invocationID)
 
 	// The group exists before anything runs, so every process this start makes
 	// - the helper scripts included - can be placed in it.
@@ -1326,6 +1337,25 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 		}
 	}
 
+	// INVOCATION_ID identifies this run of this unit, and systemd guarantees a
+	// fresh one to every service it starts. It is not cosmetic: a supervised
+	// daemon commonly uses it to recognise that IT is the manager's child, and
+	// without it such a daemon reads its own unit as a conflict, exits, and is
+	// started again by the restart policy - a loop where every attempt refuses
+	// the same way.
+	//
+	// Set unconditionally rather than only when absent. initd deliberately
+	// inherits the daemon's whole environment, so a daemon that was itself
+	// launched under a service manager (a session unit, a cron job, a nested
+	// supervisor) carries that manager's INVOCATION_ID in its own environment -
+	// and passing it down would hand one stale id to every unit it starts, the
+	// exact confusion this variable is supposed to prevent. Placed before
+	// EnvironmentFile=/Environment= so a unit that means to pin its own value
+	// still wins, as it does upstream.
+	u.mu.Lock()
+	envMap["INVOCATION_ID"] = u.invocationID
+	u.mu.Unlock()
+
 	for _, entry := range u.GetConfig().Service.EnvironmentFile {
 		if err := u.loadEnvironmentFile(entry, envMap); err != nil {
 			return nil, nil, err
@@ -1355,6 +1385,16 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 		}
 		delete(envMap, name)
 	}
+	// INVOCATION_ID identifies this run of this unit, and systemd guarantees it
+	// to every service it starts. It is not cosmetic: a supervised daemon
+	// commonly uses it to recognise that IT is the supervisor's child and must
+	// not refuse to start because a service manager already runs one. Without
+	// it such a daemon reads its own unit as a conflict, exits, and the restart
+	// policy starts it again - a loop where every attempt refuses the same way.
+	//
+	// A per-run value, minted like the journal's _SYSTEMD_INVOCATION_ID so the
+	// two agree, and applied before EnvironmentFile=/Environment= like every
+	// other manager-provided variable so a unit can still override it.
 	// Computed last, like systemd: the supervisor decides where a unit's
 	// RuntimeDirectory= and friends live, Environment= cannot redirect them.
 	u.mu.Lock()
