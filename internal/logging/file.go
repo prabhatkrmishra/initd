@@ -81,6 +81,10 @@ func NewFileWriter(dir, bootID, hostname string, maxBytes int64) (*FileWriter, e
 
 func (w *FileWriter) activePath() string { return filepath.Join(w.dir, w.bootID+".jsonl") }
 
+// ActivePath is the file the writer holds open. A vacuum must never unlink it:
+// the daemon would keep appending to an inode nobody can read.
+func (w *FileWriter) ActivePath() string { return w.activePath() }
+
 func (w *FileWriter) openLocked() error {
 	path := w.activePath()
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -104,6 +108,10 @@ func (w *FileWriter) openLocked() error {
 	w.file = f
 	w.buf = bufio.NewWriterSize(f, 64*1024)
 	w.lines = 0
+	// Forget the old generation's flush time: Append's "flush once a second"
+	// test is made against the previous file, and without this the first line
+	// of the new generation waits in the buffer for some later write.
+	w.syncedAt = time.Time{}
 	return nil
 }
 
@@ -242,6 +250,23 @@ func (w *FileWriter) Rotate() error {
 	return w.rotateLocked()
 }
 
+// RotateIfStale closes the active file into a dated generation when its last
+// write predates cutoff, so an age vacuum can reach a file the writer would
+// otherwise pin. An empty active file is left alone: rotating it would only
+// add another empty file.
+func (w *FileWriter) RotateIfStale(cutoff time.Time) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return false, nil
+	}
+	st, err := w.file.Stat()
+	if err != nil || st.Size() == 0 || !st.ModTime().Before(cutoff) {
+		return false, err
+	}
+	return true, w.rotateLocked()
+}
+
 // SetRetention caps the journal directory at roughly files files and
 // bytes total, enforced automatically after each rotation. Never deletes
 // the active file. Zero disables.
@@ -269,21 +294,15 @@ func (w *FileWriter) enforceRetentionLocked() {
 		return
 	}
 	active := w.activePath()
-	entries, err := os.ReadDir(w.dir)
-	if err != nil {
-		return
-	}
 	type generation struct {
 		path string
 		size int64
 	}
 	var gens []generation
 	var total int64
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-		full := filepath.Join(w.dir, e.Name())
+	// ListFiles orders by mtime: boot IDs are random UUIDs, so name order
+	// would delete this boot's newest history and keep an ancient boot's.
+	for _, full := range ListFiles(w.dir) {
 		if full == active {
 			continue
 		}
@@ -294,7 +313,6 @@ func (w *FileWriter) enforceRetentionLocked() {
 		gens = append(gens, generation{full, st.Size()})
 		total += st.Size()
 	}
-	sort.Slice(gens, func(i, j int) bool { return gens[i].path < gens[j].path })
 	kept := len(gens)
 	for _, g := range gens {
 		tooMany := w.retainFiles > 0 && kept > w.retainFiles

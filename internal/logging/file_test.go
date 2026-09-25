@@ -3,6 +3,7 @@ package logging
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -158,6 +159,136 @@ func TestRetentionOnRotate(t *testing.T) {
 		t.Fatalf("retention must leave readable history")
 	}
 	_ = w.Close()
+}
+
+// A rotation hands over a fresh buffer, so the first line written into it has
+// to reach disk on its own rather than wait for a later write to flush it.
+func TestFirstLineAfterRotateReachesDisk(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewFileWriter(dir, "boot-f", "h", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if err := w.Append(StoredEntry{Unit: "a.service", Message: "before the rotate"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append(StoredEntry{Unit: "a.service", Message: "after the rotate"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "boot-f.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "after the rotate") {
+		t.Fatalf("the first line of the new generation stayed in the buffer: %q", raw)
+	}
+}
+
+// Retention walks generations oldest-first. Boot IDs are random UUIDs, so
+// ordering by name instead of mtime would drop this boot's newest history and
+// keep a generation from a year ago.
+func TestRetentionTrimsOldestByTimeNotName(t *testing.T) {
+	dir := t.TempDir()
+	ancient := time.Now().AddDate(-2, 0, 0)
+	aged := filepath.Join(dir, "zzzzzzzz.jsonl") // sorts after this boot's name
+	if err := os.WriteFile(aged, []byte("{\"MESSAGE\":\"from last year\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(aged, ancient, ancient); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewFileWriter(dir, "aaaa-boot", "h", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.SetRetention(1, 0)
+	for i := 0; i < 8; i++ {
+		_ = w.Append(StoredEntry{Unit: "a.service", Message: "padding line to force rotation over the tiny cap xx"})
+	}
+	_ = w.Sync()
+
+	files := ListFiles(dir)
+	for _, f := range files {
+		if f == aged {
+			t.Fatalf("retention kept an ancient generation and deleted recent ones: %v", files)
+		}
+	}
+	var closed []string
+	for _, f := range files {
+		if filepath.Base(f) != filepath.Base(w.ActivePath()) {
+			closed = append(closed, f)
+		}
+	}
+	if len(files) != 2 || len(closed) != 1 {
+		t.Fatalf("files = %v, want one retained generation plus the active file", files)
+	}
+	if entries, _ := ReadAll(files); len(entries) == 0 {
+		t.Fatal("retention left no readable history")
+	}
+}
+
+// The writer pins its own file with the freshest mtime, so age expiry can only
+// reach history once that file has been closed into a generation.
+func TestRotateIfStaleClosesAgedHistory(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewFileWriter(dir, "boot-s", "h", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if err := w.Append(StoredEntry{Unit: "a.service", Message: "old news"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().AddDate(0, 0, -20)
+	if err := os.Chtimes(w.ActivePath(), stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -10)
+	rotated, err := w.RotateIfStale(cutoff)
+	if err != nil {
+		t.Fatalf("RotateIfStale: %v", err)
+	}
+	if !rotated {
+		t.Fatal("a file older than the cutoff should close into a generation")
+	}
+	if _, err := os.Stat(w.ActivePath()); err != nil {
+		t.Fatalf("the writer should have a fresh active file: %v", err)
+	}
+	entries, _ := ReadAll(ListFiles(dir))
+	if len(entries) != 1 || entries[0].Message != "old news" {
+		t.Fatalf("aged entry not preserved in the closed generation: %+v", entries)
+	}
+
+	// Still empty, so nothing to expire and no second generation to add.
+	if rotated, err := w.RotateIfStale(cutoff); rotated || err != nil {
+		t.Fatalf("an empty active file should not rotate: %v %v", rotated, err)
+	}
+
+	// Fresh data must not be dragged out by a stale-looking directory.
+	if err := w.Append(StoredEntry{Unit: "a.service", Message: "new news"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if rotated, err := w.RotateIfStale(cutoff); rotated || err != nil {
+		t.Fatalf("a freshly written active file should stay open: %v %v", rotated, err)
+	}
+	if n := len(ListFiles(dir)); n != 2 {
+		t.Fatalf("files = %d, want the aged generation plus the active file", n)
+	}
 }
 
 // TestListFilesOrdersByTimeNotName guards the tail query: files are named after

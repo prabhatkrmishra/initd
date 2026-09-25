@@ -165,19 +165,49 @@ func (m *Manager) VacuumJournal(maxBytes int64, maxFiles int, maxAgeDays int) er
 	if maxAgeDays <= 0 {
 		maxAgeDays = 14
 	}
+	cutoff := time.Now().AddDate(0, 0, -maxAgeDays)
+	m.mu.Lock()
+	w := m.journal
+	m.mu.Unlock()
+	// The active file always carries the freshest mtime, so age expiry could
+	// never reach it. Close it into a dated generation the pass can see.
+	if w != nil {
+		if _, err := w.RotateIfStale(cutoff); err != nil {
+			return err
+		}
+	}
 	files := m.JournalFiles()
 	if len(files) == 0 {
 		return nil
 	}
-	cutoff := time.Now().AddDate(0, 0, -maxAgeDays)
+	// Age pass. The writer's file and the newest one on disk are spared, so a
+	// vacuum never leaves an empty journal.
+	aged := map[string]bool{files[len(files)-1]: true}
+	if w != nil {
+		aged[w.ActivePath()] = true
+	}
+	remove := func(path string) {
+		_ = os.Remove(path)
+	}
+	for _, path := range files {
+		if aged[path] {
+			continue
+		}
+		if st, err := os.Stat(path); err == nil && st.ModTime().Before(cutoff) {
+			remove(path)
+		}
+	}
+	files = m.JournalFiles()
+	if len(files) == 0 {
+		return nil
+	}
 	// Never delete the newest file: the writer may hold it open.
 	keepNewest := files[len(files)-1]
 	// After a rotate the newest file is empty while the previous one
 	// holds all history. Deleting that previous file to satisfy a small
 	// --vacuum-size would wipe everything and leave 0B. Keep the newest
 	// non-empty file as well so size/file-count vacuums leave data
-	// behind instead of an empty active file. Age expiry still only
-	// protects the open file; old history expiring by age is intended.
+	// behind instead of an empty active file.
 	kept := map[string]bool{keepNewest: true}
 	if st, err := os.Stat(keepNewest); err == nil && st.Size() < 4096 && len(files) >= 2 {
 		for i := len(files) - 2; i >= 0; i-- {
@@ -192,22 +222,6 @@ func (m *Manager) VacuumJournal(maxBytes int64, maxFiles int, maxAgeDays int) er
 			kept[files[len(files)-2]] = true
 		}
 	}
-	var victims []string
-	for _, path := range files {
-		if kept[path] {
-			continue
-		}
-		if st, err := os.Stat(path); err == nil && st.ModTime().Before(cutoff) {
-			victims = append(victims, path)
-		}
-	}
-	remove := func(path string) {
-		_ = os.Remove(path)
-	}
-	for _, v := range victims {
-		remove(v)
-	}
-	files = m.JournalFiles()
 	for len(files) > maxFiles {
 		oldest := ""
 		for _, path := range files {
