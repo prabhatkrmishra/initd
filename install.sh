@@ -302,28 +302,99 @@ kill_initd_user() {
 }
 
 # --- (re)start the initd daemon as `initd --init` (starts enabled units) -------
+# Everything here runs while the previous daemon may still be alive, so nothing
+# may remove a socket the old daemon is still serving: that leaves it accepting
+# on an inode no client can name, and the user loses systemctl entirely while
+# their units keep running. The old daemon is stopped and *confirmed gone*
+# first, and the sockets are then cleared only through initd's own connection
+# check, which distinguishes a live listener from a leftover file.
 echo "Stopping any existing initd daemon for $RUN_USER ..."
-kill_initd_user TERM
-# Wait for the old daemon to actually exit before starting a new one. A stale
-# daemon that ignores SIGTERM would otherwise keep its sockets and lock, and a
-# second daemon would then split the supervisor in two (two listeners on the
-# same socket path, two competing restart loops). Escalate to SIGKILL after a
-# short grace period.
-for _ in $(seq 1 20); do
-  if ! pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
-    break
+OLD_INITD_PIDS="$(pgrep -u "$RUN_USER" -x initd 2>/dev/null | grep -v '^1$' || true)"
+if [ -n "$OLD_INITD_PIDS" ]; then
+  kill_initd_user TERM
+  # Wait for the old daemon to actually exit before touching its sockets. A
+  # stale daemon that ignores SIGTERM would otherwise still hold them, and a
+  # second daemon would split the supervisor in two (two listeners, two
+  # competing restart loops). Escalate to SIGKILL after a short grace period,
+  # then confirm again - SIGKILL is not instant, and a daemon still in the
+  # process of dying must not be treated as gone.
+  for _ in $(seq 1 20); do
+    still_up=""
+    for pid in $OLD_INITD_PIDS; do
+      kill -0 "$pid" 2>/dev/null && still_up="yes"
+    done
+    [ -z "$still_up" ] && break
+    sleep 0.25
+  done
+  still_up=""
+  for pid in $OLD_INITD_PIDS; do
+    kill -0 "$pid" 2>/dev/null && still_up="yes"
+  done
+  if [ -n "$still_up" ]; then
+    echo "initd did not exit on SIGTERM; sending SIGKILL." >&2
+    kill_initd_user KILL
+    for _ in $(seq 1 20); do
+      still_up=""
+      for pid in $OLD_INITD_PIDS; do
+        kill -0 "$pid" 2>/dev/null && still_up="yes"
+      done
+      [ -z "$still_up" ] && break
+      sleep 0.25
+    done
   fi
-  sleep 0.25
-done
-if pgrep -u "$RUN_USER" -x initd >/dev/null 2>&1; then
-  echo "initd did not exit on SIGTERM; sending SIGKILL." >&2
-  kill_initd_user KILL
-  sleep 0.5
+  if [ -n "$still_up" ]; then
+    # Refuse to continue: starting a second supervisor beside a live one is
+    # worse than not restarting, and clearing the sockets now would hide it.
+    echo "ERROR: initd (PID $(echo "$OLD_INITD_PIDS" | tr '\n' ' ')) is still running and could not be stopped." >&2
+    echo "       Not clearing its sockets and not starting a second daemon; resolve this by hand." >&2
+    exit 1
+  fi
 fi
-# clear any stale daemon sockets owned by this user
-rm -f "$XDG_RUNTIME_DIR/initd.sock" "$XDG_RUNTIME_DIR/initd.lock" \
-      "$XDG_RUNTIME_DIR/initd-system.sock" 2>/dev/null || true
-[ "$RUN_UID" -eq 0 ] && rm -f /run/initd.sock 2>/dev/null || true
+
+# Clear leftover sockets, but only ones nobody is serving. initd refuses to
+# replace a path with a live listener, and reports the rest; treating that as
+# fatal is deliberate, because it means something is serving this address that
+# this script does not know about.
+clear_stale_socket() {
+  local path="$1" what="$2"
+  [ -e "$path" ] || [ -S "$path" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$path" <<'PYEOF'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1.0)
+try:
+    s.connect(sys.argv[1])
+except Exception:
+    sys.exit(1)   # nothing listening: safe to clear
+finally:
+    s.close()
+sys.exit(0)       # a live listener holds this address
+PYEOF
+    then
+      echo "ERROR: $what ($path) is still being served by a live daemon; leaving it alone." >&2
+      return 1
+    fi
+  fi
+  rm -f "$path" 2>/dev/null || true
+  return 0
+}
+
+STALE_SOCKET=0
+clear_stale_socket "$XDG_RUNTIME_DIR/initd.sock" "user control socket" || STALE_SOCKET=1
+clear_stale_socket "$XDG_RUNTIME_DIR/initd-system.sock" "system control socket" || STALE_SOCKET=1
+if [ "$RUN_UID" -eq 0 ]; then
+  clear_stale_socket "/run/initd.sock" "system control socket" || STALE_SOCKET=1
+fi
+# The lock file is deliberately NOT removed. It carries no state a stale daemon
+# can leave behind - it is flocked, and the kernel drops the lock when the
+# holder dies - while deleting it destroys mutual exclusion for the window
+# before the new daemon starts.
+if [ "$STALE_SOCKET" -ne 0 ]; then
+  echo "ERROR: a control socket is still served by a daemon this script does not own." >&2
+  echo "       Not starting a second supervisor. Stop that daemon first, then re-run." >&2
+  exit 1
+fi
 
 # Start the daemon with a clean identity: drop any SUDO_USER* inherited from
 # the installer's invocation so the daemon's RealUID()/user-manager is the real
