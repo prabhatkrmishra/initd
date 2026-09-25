@@ -135,6 +135,15 @@ func main() {
 					return
 				default:
 				}
+				// Losing the bound path is not a failure to back off from: the
+				// address is still ours and the lock is still held, so Serve
+				// rebinds it immediately. Backing off would leave the control
+				// plane dark for up to 30s after a stray unlink.
+				if ipc.IsSocketPathLost(err) {
+					logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+						"control socket %s lost its path; rebinding", path)
+					continue
+				}
 				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 					"ipc server error on %s: %v (retrying in %s)", path, err, backoff)
 				select {

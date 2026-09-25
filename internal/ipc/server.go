@@ -2,12 +2,14 @@ package ipc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -162,6 +164,85 @@ func socketHasListener(path string) bool {
 	return true
 }
 
+// errSocketPathLost reports that the path this listener bound no longer names
+// its socket, so the listener is unreachable by name and has to be rebound.
+// Distinct from a generic bind failure because it is the caller's cue to retry
+// immediately rather than back off: nothing is wrong with the address, and the
+// daemon still holds the lock for it.
+var errSocketPathLost = errors.New("control socket path was removed")
+
+// IsSocketPathLost reports whether err means "rebind the same address now".
+func IsSocketPathLost(err error) bool { return errors.Is(err, errSocketPathLost) }
+
+// socketIdentity is the (device, inode) pair the filesystem handed a bound
+// socket. Comparing it is the only way to tell "the path is still mine" from
+// "something rebound this address": a listener keeps accepting on an unlinked
+// inode, so the socket looks healthy to its owner while every new client gets
+// ENOENT from the path.
+type socketIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+// lstatIdentity reads a path's identity without following symlinks, so a
+// symlink dropped at the socket path cannot be mistaken for the socket.
+func lstatIdentity(path string) (socketIdentity, bool) {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return socketIdentity{}, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return socketIdentity{}, false
+	}
+	return socketIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, true
+}
+
+// socketPathOwned reports whether path still resolves to want.
+func socketPathOwned(path string, want socketIdentity) bool {
+	got, ok := lstatIdentity(path)
+	return ok && got == want
+}
+
+// socketOwnershipCheckInterval is how often a live listener re-checks that the
+// path it bound still names its own socket. An lstat every couple of seconds is
+// free next to the supervisor's own polling, and it bounds an outage caused by
+// an unlink to seconds rather than until the next restart. A var so tests can
+// shrink it instead of sleeping through it.
+var socketOwnershipCheckInterval = 2 * time.Second
+
+// prepareControlSocketPath clears the way for a bind, or refuses.
+//
+// A path that already carries a live listener is left completely alone: its
+// owner is a supervisor that is still serving, and deleting the name would hide
+// it without stopping it. Everything else is a leftover from a daemon that is
+// gone, and replacing it is the only way to bind. A symlink is never followed
+// and never removed - the socket path is not ours to reinterpret - and neither
+// is anything that is not a socket or a regular file, so a stray directory or
+// fifo is reported instead of silently deleted.
+func prepareControlSocketPath(socketPath string, manager *supervisor.Manager) error {
+	fi, err := os.Lstat(socketPath)
+	if err != nil {
+		return nil // absent: nothing to clear
+	}
+	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("%s is a symlink, refusing to replace it", socketPath)
+	case fi.Mode()&os.ModeSocket != 0:
+		if socketHasListener(socketPath) {
+			return fmt.Errorf("%s is held by a live listener", socketPath)
+		}
+	case fi.Mode().IsRegular():
+		// A regular file here is debris from an interrupted start (or a stray
+		// marker); the bind needs the name, and the type says it is not a
+		// socket anybody is serving.
+	default:
+		return fmt.Errorf("%s exists and is neither a socket nor a regular file", socketPath)
+	}
+	_ = os.Remove(socketPath)
+	return nil
+}
+
 func Serve(socketPath string, manager *supervisor.Manager) error {
 	if strings.HasPrefix(socketPath, "@") {
 		addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(socketPath, "@"), Net: "unix"}
@@ -190,16 +271,9 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 			_ = os.MkdirAll(dir, perm)
 		}
 	}
-	if st, err := os.Stat(socketPath); err == nil && st.Mode()&os.ModeSocket != 0 && socketHasListener(socketPath) {
-		// Deleting the path here would hide a live supervisor without stopping
-		// it: the listener keeps working for already-connected clients while
-		// every new `systemctl` sees "no such file or directory". Leave the
-		// owner in place and let the caller's retry loop report it.
-		return fmt.Errorf("%s is held by a live listener", socketPath)
+	if err := prepareControlSocketPath(socketPath, manager); err != nil {
+		return err
 	}
-	// A stale socket (file present, nobody listening) must be removed or the
-	// bind below fails with EADDRINUSE forever.
-	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		if len(socketPath) > 90 && !strings.HasPrefix(socketPath, "@") {
@@ -225,9 +299,46 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 	// it owner-only so other users can't connect and issue commands.
 	_ = os.Chmod(socketPath, 0600)
 
+	// From here the daemon is serving, and the path is the only way in. Watch
+	// it: an unlink leaves this listener accepting on an inode no client can
+	// name, which reads to the operator as a dead daemon while its units keep
+	// running. Nobody else may rebind the address (the caller holds the lock),
+	// so losing the path means something outside the daemon removed it, and the
+	// only repair is to bind again.
+	own, haveOwn := lstatIdentity(socketPath)
+	lost := make(chan struct{})
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	if haveOwn {
+		go func() {
+			ticker := time.NewTicker(socketOwnershipCheckInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopWatch:
+					return
+				case <-ticker.C:
+					if socketPathOwned(socketPath, own) {
+						continue
+					}
+					// Closing the listener is what unblocks Accept; the error
+					// it produces is turned into errSocketPathLost below.
+					_ = listener.Close()
+					close(lost)
+					return
+				}
+			}
+		}()
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			select {
+			case <-lost:
+				return errSocketPathLost
+			default:
+			}
 			time.Sleep(acceptErrorDelay)
 			continue
 		}
