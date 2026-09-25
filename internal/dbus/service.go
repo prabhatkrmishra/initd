@@ -798,6 +798,7 @@ func buildServiceProps(mgr *supervisor.Manager, name string) map[string]*prop.Pr
 		// EnvironmentFiles is a(sb): one (path, ignore-missing) struct per file.
 		"EnvironmentFiles": {Value: envFileSpecs(cfg.GetConfig().Service.EnvironmentFile), Writable: false, Emit: prop.EmitConst},
 		"UnsetEnvironment": {Value: cfg.GetConfig().Service.UnsetEnvironment, Writable: false, Emit: prop.EmitConst},
+		"PassEnvironment":  {Value: cfg.GetConfig().Service.PassEnvironment, Writable: false, Emit: prop.EmitConst},
 	}
 }
 

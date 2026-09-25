@@ -156,7 +156,7 @@ func (m *Manager) loadSysVUnits(units map[string]*service.Unit, order *[]string)
 			desc = parseLSBDescription(string(raw))
 		}
 		cfg := sysvConfigFor(scriptPath, e.Name(), desc)
-		u := service.NewUnit(cfg, scriptPath)
+		u := m.newUnit(cfg, scriptPath)
 		if m.reaper != nil {
 			u.SetReaper(m.reaper)
 		}

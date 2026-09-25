@@ -287,6 +287,39 @@ Restart=on-failure
 	}
 }
 
+// PassEnvironment= is a list of names, so it behaves like the other list keys:
+// repeated lines accumulate and an empty one resets what came before.
+func TestParseUnitPassEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	unit, err := ParseUnit(writeFile(t, dir, "pass.service", `
+[Service]
+PassEnvironment=FOO BAR
+PassEnvironment=BAZ
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := unit.Service.PassEnvironment, []string{"FOO", "BAR", "BAZ"}; len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("PassEnvironment=%q, want %q", got, want)
+	}
+	if _, ignored := unit.Ignored["Service.PassEnvironment"]; ignored {
+		t.Error("PassEnvironment= is still reported as an unhandled directive")
+	}
+
+	unit, err = ParseUnit(writeFile(t, dir, "reset.service", `
+[Service]
+PassEnvironment=FOO
+PassEnvironment=
+PassEnvironment=LAST
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := unit.Service.PassEnvironment; len(got) != 1 || got[0] != "LAST" {
+		t.Errorf("PassEnvironment=%q, want the empty assignment to have reset the list to [LAST]", got)
+	}
+}
+
 func TestSplitList(t *testing.T) {
 	got := splitList("  a   b\tc  ")
 	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {

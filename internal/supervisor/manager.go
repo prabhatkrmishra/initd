@@ -105,6 +105,15 @@ func NewUserManager() *Manager {
 	}
 }
 
+// newUnit is the only way a manager should build a unit: rules that depend on
+// the manager's scope cannot be worked out from the process, which serves a
+// system and a user manager at the same time.
+func (m *Manager) newUnit(cfg *parser.Unit, path string) *service.Unit {
+	u := service.NewUnit(cfg, path)
+	u.SetUserMode(m.UserMode)
+	return u
+}
+
 func NewManagerWithMode(userMode bool) *Manager {
 	if userMode {
 		return NewUserManager()
@@ -189,7 +198,7 @@ func (m *Manager) LoadUnits() error {
 				old.SetOnFailureHandler(m.onFailureCallback(old.GetConfig().Name))
 				units[entry.Name()] = old
 			} else {
-				unit := service.NewUnit(unitConfig, path)
+				unit := m.newUnit(unitConfig, path)
 				if m.reaper != nil {
 					unit.SetReaper(m.reaper)
 				}
@@ -328,7 +337,7 @@ func (m *Manager) FindUnit(name string) (*service.Unit, error) {
 		tmplName, instance := parseTemplateInstance(name)
 		if tmpl, ok := m.Units[tmplName]; ok {
 			newConfig := cloneAndExpandTemplate(tmpl.GetConfig(), name, instance)
-			unit := service.NewUnit(newConfig, tmpl.Path)
+			unit := m.newUnit(newConfig, tmpl.Path)
 			if m.reaper != nil {
 				unit.SetReaper(m.reaper)
 			}
@@ -356,7 +365,7 @@ func (m *Manager) findUnitLocked(name string) (*service.Unit, error) {
 		tmplName, instance := parseTemplateInstance(name)
 		if tmpl, ok := m.Units[tmplName]; ok {
 			newConfig := cloneAndExpandTemplate(tmpl.GetConfig(), name, instance)
-			unit := service.NewUnit(newConfig, tmpl.Path)
+			unit := m.newUnit(newConfig, tmpl.Path)
 			if m.reaper != nil {
 				unit.SetReaper(m.reaper)
 			}
@@ -395,7 +404,7 @@ func (m *Manager) loadUnitFromDiskLocked(n string) *service.Unit {
 			continue
 		}
 		unitConfig.Name = n
-		unit := service.NewUnit(unitConfig, p)
+		unit := m.newUnit(unitConfig, p)
 		if m.reaper != nil {
 			unit.SetReaper(m.reaper)
 		}
@@ -1879,7 +1888,7 @@ func (m *Manager) ListUnitFiles() ([]*service.Unit, error) {
 		if p, ok := m.SocketPaths[name]; ok {
 			path = p
 		}
-		units = append(units, service.NewUnit(cfg, path))
+		units = append(units, m.newUnit(cfg, path))
 	}
 	return units, nil
 }

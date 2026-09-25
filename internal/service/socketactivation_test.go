@@ -47,6 +47,31 @@ func waitForActive(t *testing.T, u *Unit) int {
 	return pid
 }
 
+// waitForImage blocks until the pid runs the unit's own program (argv[0]
+// basename). A start through shell wraps is spawned before the last execve
+// lands, so /proc still shows the shell's environment and umask until then.
+func waitForImage(t *testing.T, pid int, argvBase string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var last string
+	for {
+		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+		if err != nil {
+			last = err.Error()
+		} else {
+			fields := strings.Split(string(data), "\x00")
+			if len(fields) > 0 && filepath.Base(fields[0]) == argvBase {
+				return
+			}
+			last = strings.Join(fields, " ")
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never became %s (cmdline %q)", pid, argvBase, last)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // The same unit with a shell: the wrap is what makes the start work, so the
 // guard above must not be what every socket-activated service hits. The child's
 // own environment is read back from /proc, because what the supervisor meant to
@@ -54,6 +79,7 @@ func waitForActive(t *testing.T, u *Unit) int {
 func TestSocketActivationExportsTheDaemonsOwnPID(t *testing.T) {
 	u := socketActivatedUnit(t, "zzsock2.service", sleepUnitContent())
 	pid := waitForActive(t, u)
+	waitForImage(t, pid, "sleep")
 	fields := childEnv(t, pid)
 	want := map[string]string{
 		"LISTEN_PID":     strconv.Itoa(pid),
@@ -124,6 +150,7 @@ func TestSocketActivationKeepsTheHardeningWrap(t *testing.T) {
 	u := socketActivatedUnit(t, "zzumask.service", sleepUnitContent("UMask=0077"))
 	pid := waitForActive(t, u)
 	defer func() { _ = u.Stop(5 * time.Second) }()
+	waitForImage(t, pid, "sleep")
 
 	if got := procField(t, pid, "Umask"); got != "0077" {
 		t.Errorf("child Umask=%q, want 0077 from the outer wrap", got)

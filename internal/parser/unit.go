@@ -74,6 +74,7 @@ type ServiceSection struct {
 	Environment              []string
 	EnvironmentFile          []string
 	UnsetEnvironment         []string
+	PassEnvironment          []string
 }
 
 type SocketSection struct {
@@ -510,6 +511,15 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				} else {
 					unit.Service.UnsetEnvironment = append(unit.Service.UnsetEnvironment, splitList(value)...)
 				}
+			case "PassEnvironment":
+				// Names, never assignments: systemd's PassEnvironment= is the list
+				// of manager variables a unit may inherit, and a variable that is
+				// not set in the manager is simply not passed.
+				if value == "" {
+					unit.Service.PassEnvironment = nil
+				} else {
+					unit.Service.PassEnvironment = append(unit.Service.PassEnvironment, splitList(value)...)
+				}
 			default:
 				unit.Ignored["Service."+key] = value
 			}
@@ -735,6 +745,9 @@ func mergeUnit(base, overlay *Unit) {
 	}
 	if len(overlay.Service.UnsetEnvironment) > 0 {
 		base.Service.UnsetEnvironment = append(base.Service.UnsetEnvironment, overlay.Service.UnsetEnvironment...)
+	}
+	if len(overlay.Service.PassEnvironment) > 0 {
+		base.Service.PassEnvironment = append(base.Service.PassEnvironment, overlay.Service.PassEnvironment...)
 	}
 	if len(overlay.Socket.ListenStream) > 0 {
 		base.Socket.ListenStream = append(base.Socket.ListenStream, overlay.Socket.ListenStream...)

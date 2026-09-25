@@ -52,6 +52,9 @@ func TestSocketActivationEnvironmentMatchesSystemd(t *testing.T) {
 	if pid <= 0 {
 		t.Fatal("the service never came up off the connection")
 	}
+	// The activation wrap is an extra execve after the spawn is reported, so
+	// /proc shows the shell's environment until the daemon's own image lands.
+	waitForImage(t, pid, "sleep")
 
 	env := procEnviron(t, pid)
 	if got := env["LISTEN_PID"]; got != strconv.Itoa(pid) {
@@ -62,6 +65,31 @@ func TestSocketActivationEnvironmentMatchesSystemd(t *testing.T) {
 	}
 	if got := env["LISTEN_FDNAMES"]; got != "env.socket" {
 		t.Errorf("child LISTEN_FDNAMES=%q, want the socket unit's name", got)
+	}
+}
+
+// waitForImage blocks until the pid runs the unit's own program (argv[0]
+// basename). A socket-activated start execs a shell wrap before the daemon, and
+// until that lands /proc shows the wrap's environment.
+func waitForImage(t *testing.T, pid int, argvBase string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var last string
+	for {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			last = err.Error()
+		} else {
+			fields := strings.Split(string(data), "\x00")
+			if len(fields) > 0 && filepath.Base(fields[0]) == argvBase {
+				return
+			}
+			last = strings.Join(fields, " ")
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never became %s (cmdline %q)", pid, argvBase, last)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

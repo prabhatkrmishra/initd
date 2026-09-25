@@ -85,6 +85,9 @@ type Unit struct {
 	spawnResultToken int
 	socketFiles      []*os.File
 	socketEnv        map[string]string
+	// managerUserMode is the scope of the manager that holds this unit, nil
+	// until one claims it (see inSystemScope).
+	managerUserMode  *bool
 	onFailureHandler func(string)
 	// managedDirs records what the last start created under
 	// RuntimeDirectory=/StateDirectory=/... so the stop can undo the /run
@@ -134,6 +137,14 @@ func NewUnit(config *parser.Unit, path string) *Unit {
 			State: StateInactive,
 		},
 	}
+}
+
+// SetUserMode records which manager owns the unit. Only a manager knows: the
+// same daemon process runs a system manager and a user manager side by side.
+func (u *Unit) SetUserMode(userMode bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.managerUserMode = &userMode
 }
 
 // GetConfig returns the parsed unit config. The pointer itself is swapped
@@ -1197,17 +1208,59 @@ func (u *Unit) runStopCommand(command string) error {
 	return u.runCommand(command, envMap, envList, commandOptions{rootOnly: u.GetConfig().Service.PermissionsStartOnly}, u.StopTimeout())
 }
 
+// inSystemScope reports the scope of the manager holding this unit rather than
+// the process uid, because one daemon serves both kinds at once. An unclaimed
+// unit falls back to the uid.
+func (u *Unit) inSystemScope() bool {
+	u.mu.Lock()
+	userMode := u.managerUserMode
+	u.mu.Unlock()
+	if userMode == nil {
+		return os.Geteuid() == 0
+	}
+	return !*userMode
+}
+
+// passEnvironmentHas reports whether a manager variable is on the unit's
+// PassEnvironment= list. An entry given in assignment form ("FOO=bar") counts
+// as its name, where upstream would match that string against nothing.
+func passEnvironmentHas(list []string, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, entry := range list {
+		entry = strings.TrimSpace(entry)
+		if key, _, cut := strings.Cut(entry, "="); cut {
+			entry = strings.TrimSpace(key)
+		}
+		if entry == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 	// Deliberate deviation from systemd's minimal default: every unit
 	// inherits the daemon's full environment (container/chroot sessions
 	// rely on PATH/HOME/proxy flowing through), with Environment= and
 	// EnvironmentFile= overlaying on top. Units opt out per-variable
 	// with UnsetEnvironment= (parsed above, applied last).
+	//
+	// PassEnvironment= is the opt-in at the other end, and only a system manager
+	// acts on it: a user manager gives every unit its whole environment either
+	// way. Naming variables filters the inheritance above down to that list - a
+	// name the manager lacks stays absent, an empty list keeps the inheritance.
+	// Unlike systemd, a filtered unit gets no default environment beyond those.
+	pass := u.GetConfig().Service.PassEnvironment
+	filterInherited := u.inSystemScope() && len(pass) > 0
 	envMap := map[string]string{}
 	for _, pair := range os.Environ() {
-		if key, value, ok := strings.Cut(pair, "="); ok {
-			envMap[key] = value
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || (filterInherited && !passEnvironmentHas(pass, key)) {
+			continue
 		}
+		envMap[key] = value
 	}
 
 	// systemd --user always exports XDG_RUNTIME_DIR to its units; a daemon
