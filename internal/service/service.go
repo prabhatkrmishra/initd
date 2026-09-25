@@ -728,6 +728,15 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// -------------------------------------------------
 	// Proper notify socket creation
 	// -------------------------------------------------
+	//
+	// The socket is created before the child exists, so every path that returns
+	// without handing it to a running unit has to release it. A superseded
+	// start (a stop or a newer start bumped the token while this one was
+	// exec'ing) used to kill the child and return with the socket still open:
+	// the unit's own handle is cleared by whoever superseded us, so nothing ever
+	// stopped it and the abstract name stayed in the kernel for the life of the
+	// daemon. The defer owns that, so a new early return cannot leak one.
+	var pendingNotify *notify.Server
 	if serviceType == "notify" {
 		server, err := notify.Start()
 		if err != nil {
@@ -738,12 +747,19 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 			return
 		}
 
+		pendingNotify = server
 		envList = append(envList, "NOTIFY_SOCKET="+server.Path)
 
 		u.mu.Lock()
 		u.notifyServer = server
 		u.mu.Unlock()
 	}
+	notifyHandedOff := false
+	defer func() {
+		if pendingNotify != nil && !notifyHandedOff {
+			u.releaseNotifyServer(pendingNotify)
+		}
+	}()
 
 	stdoutLogger := &logging.LineLogger{
 		Unit:   u.GetConfig().Name,
@@ -766,13 +782,6 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		closeSocketFiles()
 		u.recordExecFailure(err, ignoreFailure)
 		report(err)
-
-		u.mu.Lock()
-		if u.notifyServer != nil {
-			u.notifyServer.Stop()
-			u.notifyServer = nil
-		}
-		u.mu.Unlock()
 
 		return
 	}
@@ -805,6 +814,9 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		_ = cmd.Process.Kill()
 		return
 	}
+	// The unit owns the notify socket from here: waitNotify, Stop and the exit
+	// handler all release it, so the deferred cleanup above stands down.
+	notifyHandedOff = true
 
 	u.Cmd = cmd
 	u.Runtime.StartedAt = time.Now()
@@ -3180,6 +3192,26 @@ func (u *Unit) waitForNotifyMainPID(watchedPID int, timeout time.Duration, poll 
 		}
 		time.Sleep(poll)
 	}
+}
+
+// releaseNotifyServer stops a notify socket this start created and clears the
+// unit's handle, but only while that handle still names this exact server.
+//
+// A newer start may already have installed its own server, and a stop may have
+// taken this one out of the unit already; in both cases the socket is somebody
+// else's to close and clearing the handle would strand it. Passing the server
+// rather than closing u.notifyServer blindly is what makes the call safe from a
+// start that has already been superseded.
+func (u *Unit) releaseNotifyServer(srv *notify.Server) {
+	if srv == nil {
+		return
+	}
+	u.mu.Lock()
+	if u.notifyServer == srv {
+		u.notifyServer = nil
+	}
+	u.mu.Unlock()
+	srv.Stop()
 }
 
 func (u *Unit) notifyMainPID(cmd *exec.Cmd) int {
