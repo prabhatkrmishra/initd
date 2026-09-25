@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	gdbus "github.com/godbus/dbus/v5"
 	"initd/internal/boot"
 	"initd/internal/build"
 	"initd/internal/cgroup"
@@ -12,14 +13,14 @@ import (
 	"initd/internal/logging"
 	"initd/internal/supervisor"
 	"initd/internal/userpaths"
-	"io"
+
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -440,56 +441,110 @@ func removeOwnPidFile(path string) {
 	}
 }
 
-// startDBusServers registers org.freedesktop.systemd1 on the D-Bus session bus
-// (and the system bus when reachable) so that systemctl/system-scope probes and
-// D-Bus clients talk to initd instead of failing. It runs in goroutines and is
-// non-fatal: if a bus isn't available (no dbus-daemon, non-root for system bus),
-// it logs and moves on. The user/session bus is the important one for the VPS
-// case, since initd's own session bus already exists at $XDG_RUNTIME_DIR/bus.
-func startDBusServers(ctx context.Context, systemManager, userManager *supervisor.Manager) {
-	var mu sync.Mutex
-	var conns []io.Closer
-	defer func() {
-		// Release the bus names when the daemon shuts down so a
-		// replacement takes over cleanly instead of racing it.
-		go func() {
-			<-ctx.Done()
-			mu.Lock()
-			defer mu.Unlock()
-			for _, c := range conns {
-				_ = c.Close()
-			}
-		}()
-	}()
-	// User (session) bus — initd already owns org.freedesktop.DBus here, so we
-	// also own org.freedesktop.systemd1 and answer systemctl --user introspection.
-	// Retry briefly: the session bus may still be starting (install.sh or the
-	// autostart hook just forked dbus-daemon).
-	for i := 0; i < 5; i++ {
-		conn, err := dbus.ServeUserBus(ctx, userManager)
+// busLivenessPoll is how often a held bus connection is checked for having gone
+// away. Short enough that a restarted bus is re-advertised promptly, long
+// enough not to be a busy loop.
+const busLivenessPoll = 5 * time.Second
+
+// advertise keeps one D-Bus name registered for as long as the daemon lives.
+//
+// Registration is maintained state, not a one-shot event. The session bus is
+// often started by something else - profile.d/initd.sh forks dbus-daemon, or a
+// session starts without one - so a daemon that loses that race is invisible
+// to every D-Bus client from then on. That is not a cosmetic gap: a client
+// that finds the name unowned falls back to D-Bus service activation, and the
+// activation file's Exec cannot take the name either, so the client blocks
+// until service_start_timeout (120s) instead of getting an answer.
+//
+// So this retries until it succeeds or ctx is cancelled, holds the connection
+// rather than discarding it, and re-acquires if the bus goes away underneath
+// us. Backoff is capped and jittered so daemons started together do not
+// synchronise. Only a change of state is logged, so a bus that never appears
+// does not fill the log.
+func advertise(ctx context.Context, label string, register func(context.Context) (*gdbus.Conn, error)) {
+	const (
+		minBackoff = 100 * time.Millisecond
+		maxBackoff = 30 * time.Second
+	)
+	backoff := minBackoff
+	held := false
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, err := register(ctx)
 		if err == nil {
-			mu.Lock()
-			conns = append(conns, conn)
-			mu.Unlock()
-			break
-		} else if i == 4 {
+			if !held {
+				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+					"registered %s", label)
+			}
+			held = true
+			// Hold the connection. A bus that goes away takes the name with
+			// it, so re-acquire rather than pretending it is still ours.
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+				return
+			case <-time.After(busLivenessPoll):
+				if !dbus.ConnAlive(conn) {
+					_ = conn.Close()
+					logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+						"lost %s; re-acquiring", label)
+					held = false
+					backoff = minBackoff
+				}
+			}
+			continue
+		}
+		if held {
 			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-				"dbus user bus registration disabled: %v", err)
-		} else {
-			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+				"lost %s: %v", label, err)
+			held = false
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(jitter(backoff)):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
-	// System bus — allows /usr/bin/systemctl (system scope) to connect and get a
-	// verifiable answer. Non-fatal: fails for non-root or when no system
-	// dbus-daemon is running with a permissive systemd1 policy.
-	if conn, err := dbus.ServeSystemBus(ctx, systemManager, userManager); err != nil {
-		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-			"dbus system bus registration unavailable: %v", err)
-	} else {
-		mu.Lock()
-		conns = append(conns, conn)
-		mu.Unlock()
+}
+
+// jitter spreads a retry by +/-10% so daemons started together do not all retry
+// on the same tick.
+func jitter(d time.Duration) time.Duration {
+	spread := time.Duration(rand.Int63n(int64(d)/5+1)) - d/10
+	if out := d + spread; out > time.Millisecond {
+		return out
 	}
+	return time.Millisecond
+}
+
+// startDBusServers advertises org.freedesktop.systemd1 on the D-Bus session bus
+// (and the system bus when reachable) so that systemctl/system-scope probes and
+// third-party service managers talk to initd instead of failing. Neither bus is
+// required: a box with no dbus-daemon, or a non-root daemon with no system bus,
+// still supervises over its own socket. The user/session bus is the important
+// one, since that is where a user's tools look for a user manager.
+func startDBusServers(ctx context.Context, systemManager, userManager *supervisor.Manager) {
+	// The user (session) bus: initd already owns org.freedesktop.DBus there, so
+	// owning org.freedesktop.systemd1 too is what makes `systemctl --user` and
+	// third-party tooling answer from initd.
+	go advertise(ctx, "org.freedesktop.systemd1 on the user bus",
+		func(ctx context.Context) (*gdbus.Conn, error) {
+			return dbus.ServeUserBus(ctx, userManager)
+		})
+	// The system bus: lets a system-scope systemctl connect and get a
+	// verifiable answer. Non-fatal where there is no system bus.
+	go advertise(ctx, "org.freedesktop.systemd1 on the system bus",
+		func(ctx context.Context) (*gdbus.Conn, error) {
+			return dbus.ServeSystemBus(ctx, systemManager, userManager)
+		})
 }
 
 // daemonConfig carries the process-level options: where to listen, which

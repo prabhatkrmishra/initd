@@ -960,6 +960,20 @@ func ServeUserBus(ctx context.Context, mgr *supervisor.Manager) (*dbus.Conn, err
 	return conn, nil
 }
 
+// ConnAlive reports whether a bus connection is still usable.
+//
+// A held connection is not a reliable liveness signal on its own: when the bus
+// daemon dies the socket only fails on the next operation, so a supervisor that
+// merely kept the handle would believe it still owned the name. Cheapest honest
+// probe available without a round trip that could itself block: ask the
+// connection for its state, which fails once the transport is gone.
+func ConnAlive(conn *dbus.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	return conn.Connected()
+}
+
 // ServeSystemBus connects to the system bus. initd owns org.freedesktop.systemd1
 // on the system bus so that tools like /usr/bin/systemctl (system scope) get
 // verifiable answers instead of "Failed to connect to bus: Permission denied".
