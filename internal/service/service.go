@@ -1801,8 +1801,17 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, mainCode 
 			u.Runtime.State = StateActive
 			u.Runtime.MainPID = 0
 			u.Runtime.LastError = ""
-		} else if u.Runtime.State != StateActive {
+		} else {
+			// A clean exit with nothing left running is inactive (dead).
+			//
+			// This used to keep the previous Active when the unit was already
+			// active, which reported a unit whose process had gone as "active
+			// (running)" with MainPID=0. Nothing is running, and a client that
+			// polls for a live process - which is how every service manager is
+			// told a start finished - can never be satisfied by that, so the
+			// unit looked permanently one step behind its own restart.
 			u.Runtime.State = StateInactive
+			u.Runtime.MainPID = 0
 		}
 		u.Runtime.ExitCode = exitCode
 	}
