@@ -31,7 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 releases/
-build/
+# Anchored: `build/` also matched internal/build/, which hid the version
+# package from the index and left a fresh clone unable to compile.
+/build/
 /systemctl
 /initd
 /journalctl
