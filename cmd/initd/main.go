@@ -404,9 +404,16 @@ func shutdownDaemon(why string, stopServe chan struct{}, stopDBus context.Cancel
 	stopManagerBounded(systemManager, 2*time.Minute)
 	systemManager.CloseJournal()
 	userManager.CloseJournal()
-	_ = os.Remove(userSocket)
+	// Stop the listeners before the paths go, so nothing can accept a request
+	// this daemon will never answer, and so the identity check below is taken
+	// against a socket that is genuinely ours and not mid-rebind.
+	ipc.StopServing(userSocket)
 	if socketPath != userSocket {
-		_ = os.Remove(socketPath)
+		ipc.StopServing(socketPath)
+	}
+	ipc.RemoveIfOurs(userSocket)
+	if socketPath != userSocket {
+		ipc.RemoveIfOurs(socketPath)
 	}
 	removeOwnPidFile(pidFile)
 	if userLock != nil {

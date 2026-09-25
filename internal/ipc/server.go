@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -204,6 +205,77 @@ func socketPathOwned(path string, want socketIdentity) bool {
 	return ok && got == want
 }
 
+// boundSockets tracks the identity of every filesystem socket this process has
+// bound, and listeners holds the matching net.Listener, so shutdown can tell
+// its own paths from a successor's.
+//
+// The locks already make that mostly true - a successor cannot rebind while
+// this process holds the flock - but "mostly" is doing real work in
+// shutdownDaemon: the unlink is only safe because the lock is released after
+// it, and nothing records that ordering as a rule. A daemon that is slow to
+// stop, restarted twice, or serving an address a successor also wants, turns
+// that into a race where the loser's shutdown removes the winner's socket and
+// leaves a live supervisor unreachable by name. Recording the identity makes
+// the check explicit instead of positional.
+//
+// Keyed by path, because that is the name a client dials.
+var boundSockets = struct {
+	mu sync.Mutex
+	m  map[string]socketIdentity
+}{m: map[string]socketIdentity{}}
+
+// listeners holds the live listener for each bound path so StopServing can
+// close it and unblock Accept.
+var listeners = struct {
+	mu sync.Mutex
+	m  map[string]net.Listener
+}{m: map[string]net.Listener{}}
+
+func recordBoundSocket(path string, id socketIdentity) {
+	boundSockets.mu.Lock()
+	boundSockets.m[path] = id
+	boundSockets.mu.Unlock()
+}
+
+func forgetBoundSocket(path string) {
+	boundSockets.mu.Lock()
+	delete(boundSockets.m, path)
+	boundSockets.mu.Unlock()
+}
+
+// StopServing closes the listener bound at path, if this process bound one, so
+// shutdown can stop accepting before it removes the name.
+func StopServing(path string) {
+	listeners.mu.Lock()
+	listener, ours := listeners.m[path]
+	listeners.mu.Unlock()
+	if !ours {
+		return
+	}
+	_ = listener.Close()
+}
+
+// RemoveIfOurs deletes the socket at path only when this process is the one
+// that bound it. A path this process never bound, or one a successor has since
+// rebound, is left alone: removing it would hide a live supervisor exactly the
+// way an unlink does, except deliberately.
+func RemoveIfOurs(path string) {
+	boundSockets.mu.Lock()
+	id, ours := boundSockets.m[path]
+	boundSockets.mu.Unlock()
+	if !ours {
+		return
+	}
+	if !socketPathOwned(path, id) {
+		// Already replaced or unlinked; either way it is not ours to remove.
+		forgetBoundSocket(path)
+		return
+	}
+	if err := os.Remove(path); err == nil {
+		forgetBoundSocket(path)
+	}
+}
+
 // socketOwnershipCheckInterval is how often a live listener re-checks that the
 // path it bound still names its own socket. An lstat every couple of seconds is
 // free next to the supervisor's own polling, and it bounds an outage caused by
@@ -299,13 +371,27 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 	// it owner-only so other users can't connect and issue commands.
 	_ = os.Chmod(socketPath, 0600)
 
+	// Record what we bound before serving, so shutdownDaemon can prove the
+	// path is still ours before it removes the name. A rebind re-records.
+	own, haveOwn := lstatIdentity(socketPath)
+	if haveOwn {
+		recordBoundSocket(socketPath, own)
+		listeners.mu.Lock()
+		listeners.m[socketPath] = listener
+		listeners.mu.Unlock()
+		defer func() {
+			listeners.mu.Lock()
+			delete(listeners.m, socketPath)
+			listeners.mu.Unlock()
+		}()
+	}
+
 	// From here the daemon is serving, and the path is the only way in. Watch
 	// it: an unlink leaves this listener accepting on an inode no client can
 	// name, which reads to the operator as a dead daemon while its units keep
 	// running. Nobody else may rebind the address (the caller holds the lock),
 	// so losing the path means something outside the daemon removed it, and the
 	// only repair is to bind again.
-	own, haveOwn := lstatIdentity(socketPath)
 	lost := make(chan struct{})
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
