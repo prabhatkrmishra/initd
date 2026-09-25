@@ -587,8 +587,29 @@ func newInvocationID() string {
 	return fmt.Sprintf("%016x%016x", time.Now().UnixNano(), os.Getpid())
 }
 
+// socketWrapShell is the shell that hands a socket-activated daemon its own
+// pid in $LISTEN_PID. It is a variable for one reason: the honest thing to do
+// when there is no shell is fail the start, and the only way to test that is to
+// take a shell away.
+var socketWrapShell = "/bin/sh"
+
 func (u *Unit) runStartSequence(token int, args []string, envMap map[string]string, envList []string, ignoreFailure bool, argv0 string) {
+	// The sockets handed over for activation are claimed here, before anything
+	// can fail. They used to be taken further down, so a start that returned
+	// early left the dup'd descriptors in the unit - and the next trigger
+	// overwrote them without closing. A socket-activated unit with a failing
+	// pre-exec leaks a listening fd every 100ms the manager polls that socket,
+	// which is how it takes the whole daemon down with it.
+	socketFiles, socketEnv := u.takeSocketActivation()
+	closeSocketFiles := func() {
+		for _, f := range socketFiles {
+			_ = f.Close()
+		}
+		socketFiles = nil
+	}
+
 	if !u.isCurrentToken(token) {
+		closeSocketFiles()
 		return
 	}
 
@@ -598,11 +619,13 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	u.Logs.SetInvocation(newInvocationID())
 
 	if err := u.runExecStartPre(token, envMap, envList); err != nil {
+		closeSocketFiles()
 		u.markFailed(err, false)
 		u.reportSpawn(token, err)
 		return
 	}
 	if !u.isCurrentToken(token) {
+		closeSocketFiles()
 		return
 	}
 
@@ -620,37 +643,46 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	cmd, err := u.buildExecCommand(args, commandOptions{})
 	if err != nil {
+		closeSocketFiles()
 		u.recordExecFailure(err, ignoreFailure)
 		report(err)
 		return
 	}
-	// Socket activation: pass listening fds if present. The dup'd files
-	// are parent copies: close them after Start (the child has its own
-	// dups) and on every failure path so fds don't accumulate.
+	// Socket activation: the descriptors claimed at the top of this start go to
+	// the child, which gets its own dups. The parent copies are released after
+	// Start and on every failure path.
 	socketActivated := false
-	var socketFiles []*os.File
-	if files, env := u.takeSocketActivation(); len(files) > 0 {
-		socketFiles = files
-		cmd.ExtraFiles = files
-		for k, v := range env {
-			if k == "LISTEN_PID" {
-				continue
-			}
+	if len(socketFiles) > 0 {
+		for k, v := range socketEnv {
 			envList = append(envList, k+"="+v)
 		}
-		wrappedArgs := []string{"/bin/sh", "-c", `LISTEN_PID=$$ exec "$@"`, "_"}
+		// sd_listen_fds() returns nothing to a process whose pid does not match
+		// $LISTEN_PID, and that pid is only known once the child exists. The
+		// shell assigns its own $$ and execs over itself, so the number the
+		// daemon reads is the daemon.
+		wrappedArgs := []string{socketWrapShell, "-c", `LISTEN_PID=$$ exec "$@"`, "_"}
 		wrappedArgs = append(wrappedArgs, args...)
-		if wrappedCmd, werr := u.buildExecCommand(wrappedArgs, commandOptions{}); werr == nil {
-			wrappedCmd.ExtraFiles = files
-			cmd = wrappedCmd
-			socketActivated = true
+		wrappedCmd, werr := u.buildExecCommand(wrappedArgs, commandOptions{})
+		if werr != nil {
+			// Without the wrap there is no honest LISTEN_PID, and a daemon
+			// started with none sees an empty fd set: it comes up and never
+			// answers its socket, which reads as a working service. Fail the
+			// start instead.
+			wrapped := fmt.Errorf("socket activation handover failed: %w", werr)
+			closeSocketFiles()
+			u.recordExecFailure(wrapped, ignoreFailure)
+			report(wrapped)
+			return
 		}
-	}
-	closeSocketFiles := func() {
-		for _, f := range socketFiles {
-			_ = f.Close()
+		wrappedCmd.ExtraFiles = socketFiles
+		cmd = wrappedCmd
+		socketActivated = true
+		if argv0 != "" {
+			// The wrap passes argv through to exec, and there is no portable
+			// way to rename argv[0] through a shell, so an ExecStart=@… @name
+			// override is the one thing a socket-activated start gives up.
+			u.Log(logging.LevelInfo, "Warning: argv[0] override ignored for a socket-activated start")
 		}
-		socketFiles = nil
 	}
 	if argv0 != "" && !socketActivated {
 		cmd.Args[0] = argv0
@@ -2434,6 +2466,12 @@ func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, 
 func (u *Unit) SetSocketActivation(files []*os.File, env map[string]string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	// Whatever is already here was never claimed by a start, so this is the
+	// last place that can still close it: each trigger dups the listener's fd,
+	// and dropping the previous set on the floor is a descriptor per attempt.
+	for _, f := range u.socketFiles {
+		_ = f.Close()
+	}
 	u.socketFiles = files
 	u.socketEnv = env
 }

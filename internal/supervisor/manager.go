@@ -693,9 +693,20 @@ func (m *Manager) startWithSocketActivation(serviceName, socketName string, rt *
 		}
 	}
 	if len(files) > 0 {
+		// systemd names every handed-over fd after the socket unit that owns it
+		// - ".socket" suffix and all - because a daemon that picks its listener
+		// with sd_listen_fds_with_names() looks that string up. One entry per
+		// fd, in the order of ExtraFiles.
+		//
+		// LISTEN_PID is deliberately absent: it has to be the pid of the daemon
+		// that reads it, and only the exec path knows what that will be.
+		names := make([]string, len(files))
+		for i := range names {
+			names[i] = socketName
+		}
 		listenEnv := map[string]string{
-			"LISTEN_PID": "1",
-			"LISTEN_FDS": strconv.Itoa(len(files)),
+			"LISTEN_FDS":     strconv.Itoa(len(files)),
+			"LISTEN_FDNAMES": strings.Join(names, ":"),
 		}
 		unit.SetSocketActivation(files, listenEnv)
 	}
