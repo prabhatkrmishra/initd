@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -92,10 +93,26 @@ func TestPrintStatusHeaderMatchesSystemd(t *testing.T) {
 	if !strings.HasPrefix(lines[2], "     Active: active (running) since ") || !strings.HasSuffix(lines[2], "; 1min 30s ago") {
 		t.Errorf("active = %q", lines[2])
 	}
-	if !strings.Contains(lines[2], " UTC;") && !strings.Contains(lines[2], " MST;") {
+	// The stamp must be systemd's weekday-first form. The zone is whatever
+	// this machine is set to, so match the shape instead of naming one: "MST"
+	// in Go's layout is a placeholder for the zone abbreviation, not the
+	// literal text systemd prints, and asserting on it only passed on boxes
+	// running in UTC or a zone that happens to abbreviate to MST.
+	stamp := lines[2]
+	if i := strings.Index(stamp, "since "); i >= 0 {
+		stamp = stamp[i+len("since "):]
+	}
+	if j := strings.LastIndex(stamp, ";"); j >= 0 {
+		stamp = stamp[:j]
+	}
+	if !weekdayFirstStamp.MatchString(strings.TrimSpace(stamp)) {
 		t.Errorf("timestamp is not systemd's weekday-first form: %q", lines[2])
 	}
 }
+
+// weekdayFirstStamp matches "Sat 2026-09-26 00:52:46 IST": a three-letter
+// weekday, the date, the wall clock, then a zone abbreviation.
+var weekdayFirstStamp = regexp.MustCompile(`^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+$`)
 
 func TestPrintStatusInactiveAndFailed(t *testing.T) {
 	inactive := captureStatus(t, ipc.StatusData{
