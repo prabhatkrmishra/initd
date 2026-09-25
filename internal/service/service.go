@@ -90,6 +90,12 @@ type Unit struct {
 	// RuntimeDirectory=/StateDirectory=/... so the stop can undo the /run
 	// half and the exec path can export the same variables systemd does.
 	managedDirs managedDirectories
+	// uidMu guards the expectedUID memo, and is deliberately not mu: the memo
+	// is read from the stop and adoption scans, which release mu before walking
+	// /proc so that no pass over every PID on the box holds the unit lock.
+	uidMu        sync.Mutex
+	uidCacheUID  uint32
+	uidCacheName string
 	// keepDirsOnStop tells the next Stop that this unit is being restarted,
 	// not brought down, which is how RuntimeDirectoryPreserve=restart is
 	// distinguished from the default.
@@ -242,7 +248,8 @@ func (u *Unit) AllowFailureForward() bool {
 	return true
 }
 
-// processGroupAlive reports whether any process still runs in pgid.
+// processGroupAlive reports whether the unit still has one of its own
+// processes running in pgid.
 func (u *Unit) processGroupAlive(pgid int) bool {
 	if pgid <= 0 {
 		return false
@@ -262,6 +269,11 @@ func (u *Unit) processGroupAlive(pgid int) bool {
 // session, or PID reuse landing on the daemon), that group kill is skipped
 // and only the leader PID is signalled — taking the daemon down with the
 // unit is always the worse outcome.
+//
+// A group kill on the recorded starter group additionally requires that the
+// group still holds one of this unit's processes. The recording is a number,
+// and once our starter exits the kernel can hand that number to a new,
+// unrelated group; sweeping it then signals processes nothing here supervises.
 func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Signal) {
 	selfPGID := syscall.Getpgrp()
 	groupHasSelf := func(gid int) bool {
@@ -275,8 +287,12 @@ func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Sign
 		}
 		return false
 	}
+	sweepFallbackGroup := func() bool {
+		return fallbackPGID > 0 && !groupHasSelf(fallbackPGID) &&
+			groupHasOwnedMember(fallbackPGID, u.expectedUID())
+	}
 	if pid <= 0 {
-		if group && fallbackPGID > 0 && !groupHasSelf(fallbackPGID) {
+		if group && sweepFallbackGroup() {
 			_ = syscall.Kill(-fallbackPGID, sig)
 		}
 		return
@@ -291,7 +307,7 @@ func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Sign
 	_ = syscall.Kill(pid, sig)
 	if fallbackPGID > 0 {
 		if gid, err := syscall.Getpgid(pid); err != nil || gid != fallbackPGID {
-			if !groupHasSelf(fallbackPGID) {
+			if sweepFallbackGroup() {
 				_ = syscall.Kill(-fallbackPGID, sig)
 			}
 		}
@@ -431,10 +447,11 @@ const spawnResultTimeout = 10 * time.Second
 // serialised behind a single mutex.
 const oneshotWaitTimeout = 30 * time.Second
 
-// notifyWaitGrace is added to a notify job's wait so the readiness timer,
-// which fires at TimeoutStartSec and is what records Result=timeout, resolves
-// before StartAndWait gives up and reports a still-activating start as done.
-const notifyWaitGrace = 500 * time.Millisecond
+// startOutcomeGrace is added to a job's wait so the timer that decides the
+// outcome - notify's readiness deadline, forking's PIDFile poll - fires first.
+// Both resolve at exactly TimeoutStartSec, and a waiter that gives up in the
+// same instant reports success over a unit that failed a moment later.
+const startOutcomeGrace = 500 * time.Millisecond
 
 // reportSpawn delivers a start's main-process spawn outcome to a synchronous
 // waiter. Only the first outcome of the current token counts: a spawn that
@@ -527,7 +544,12 @@ func (u *Unit) StartAndWait(waitForJob bool) (int, error) {
 		// waitNotify's own timer is what turns a silent service into
 		// Result=timeout; it fires at StartTimeout, so wait a moment past it
 		// instead of returning success over a unit still in "activating".
-		budget += notifyWaitGrace
+		budget += startOutcomeGrace
+	} else if u.canonicalServiceType() == "forking" {
+		// Same race on the other side of the same deadline: resolveForkingMainPID
+		// stops polling at StartTimeout, so a start that never produced a
+		// daemon needs the grace to be seen failing.
+		budget += startOutcomeGrace
 	}
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
@@ -1278,8 +1300,11 @@ func (u *Unit) loadEnvironmentFile(entry string, envMap map[string]string) error
 func (u *Unit) waitForPIDFile(timeout time.Duration, poll time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		pid, err := u.readPIDFile()
-		if err == nil && pid > 0 && processAlive(pid) {
+		// livePIDFilePID, not readPIDFile+processAlive: a pid file left behind
+		// by a dead daemon points at a number the kernel may have handed to an
+		// unrelated process, and adopting that made the unit "active" over a
+		// process it cannot signal.
+		if pid := u.livePIDFilePID(); pid != 0 {
 			return pid, nil
 		}
 		time.Sleep(poll)
@@ -1823,30 +1848,14 @@ func stripPrefix(command string) (string, bool) {
 	}
 }
 
+// processAlive reports whether a PID is still a running process. It answers
+// false only when the process is certainly gone: a PID we cannot look at
+// (hidepid=2, another user) counts as alive, because a supervisor that called
+// it dead would report "stopped" over a process it could neither signal nor
+// watch. Callers that must not adopt an invisible process - external and
+// main-PID detection - ask procOwnedBy instead.
 func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err != nil && err != syscall.EPERM {
-		return false
-	}
-	// A zombie still passes kill(pid, 0) but is not a running process.
-	// Treat it as dead so a Type=notify process that exited before READY=1
-	// is not wrongly reported as active. /proc/<pid>/stat state is the
-	// field after the parenthesised comm (which may contain spaces).
-	data, rerr := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if rerr != nil {
-		// Kill succeeded but /proc vanished: the pid exited between the
-		// two checks. The one exception is EPERM from Kill, which means
-		// the process exists but belongs to another user — hidepid or a
-		// permission error reading /proc must not flip that to dead.
-		return err == syscall.EPERM
-	}
-	if idx := strings.LastIndexByte(string(data), ')'); idx >= 0 && idx+2 < len(data) {
-		return data[idx+2] != 'Z'
-	}
-	return true
+	return checkLiveness(pid).notDead()
 }
 
 func (u *Unit) canonicalServiceType() string {
@@ -2481,8 +2490,15 @@ func (u *Unit) checkConditions() bool {
 func (u *Unit) killModeProcess() bool {
 	mode := strings.ToLower(strings.TrimSpace(u.GetConfig().Service.KillMode))
 	// Only the group flavors take the whole process group. Everything else
-	// — process, mixed, none, unset — kills the main PID only; mixed's
-	// children are reaped by the ExecStopPost cgroup cleanup instead.
+	// — process, mixed, none, unset — kills the main PID only.
+	//
+	// That is deliberately not what upstream means by mixed: systemd sends
+	// SIGTERM to the main process and then SIGKILL to everything left in the
+	// unit's cgroup. With no cgroup there is no reliable set of leftovers to
+	// kill - the process group is not the same population, and sweeping it
+	// would signal processes the unit never owned - so the second half is
+	// skipped and a mixed unit's children outlive its main process until
+	// per-unit cgroups exist.
 	switch mode {
 	case "control-group", "controlgroup", "control_group":
 		return false
@@ -2867,9 +2883,27 @@ func commandExitStatus(status syscall.WaitStatus) int {
 	}
 }
 
+// livePIDFilePID reads PIDFile= and returns the number only if it can be this
+// unit's daemon. A pid file is a stale-number generator by nature: the daemon
+// that wrote it may be gone and the kernel may have handed its number to an
+// unrelated process, which must not be adopted as the main PID.
+//
+// Three answers reject it, and none of them is "is the owner the unit's user" -
+// a daemon that drops privileges after writing its file is still the daemon:
+//   - the process is gone;
+//   - the process exists but we cannot signal it (unknown liveness), so
+//     supervising it could never end in a stop;
+//   - the process began long after the file was last written, so it did not
+//     write it.
 func (u *Unit) livePIDFilePID() int {
 	pid, err := u.readPIDFile()
-	if err != nil || pid <= 0 || !processAlive(pid) {
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	if liveness := checkLiveness(pid); liveness != livenessAlive {
+		return 0
+	}
+	if pidFileNamesFreshProcess(strings.TrimSpace(u.GetConfig().Service.PIDFile), pid) {
 		return 0
 	}
 	return pid
@@ -2891,24 +2925,25 @@ func (u *Unit) waitForLivePIDFile(timeout time.Duration, poll time.Duration) int
 	}
 }
 
+// processGroupMemberPID returns a live process this unit owns that still sits
+// in process group pgid, excluding one PID. It is how a Type=forking start and
+// an adopted notify daemon find their main PID without cgroups, so the
+// ownership test is the point: a group number is only a number, and once our
+// starter is gone a recycled one belongs to somebody else's processes.
 func (u *Unit) processGroupMemberPID(pgid int, exclude int) int {
 	if pgid <= 0 {
 		return 0
 	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid <= 0 || pid == exclude {
+	uid := u.expectedUID()
+	for _, pid := range procPIDs() {
+		if pid == exclude {
 			continue
 		}
 		memberPGID, err := syscall.Getpgid(pid)
-		if err != nil || memberPGID != pgid || !processAlive(pid) {
+		if err != nil || memberPGID != pgid {
+			continue
+		}
+		if !procOwnedBy(pid, uid) || checkLiveness(pid) != livenessAlive {
 			continue
 		}
 		return pid

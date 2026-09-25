@@ -91,7 +91,10 @@ func execStartArgv(execStart string) []string {
 // FindExternalPID scans /proc for a live process whose argv0 basename matches
 // the unit's ExecStart binary. It returns the PID and full cmdline, or 0,""
 // when nothing matches. The calling unit's own MainPID is skipped so a stale
-// PID is never reported as external.
+// PID is never reported as external, and a process owned by any other UID is
+// skipped too: without that, one visible copy of a popular command (a shell
+// running the same binary as another user's service) could be handed over as
+// this unit's daemon, which we then cannot signal.
 func (u *Unit) FindExternalPID() (int, string) {
 	execStart := ""
 	selfPID := 0
@@ -119,17 +122,13 @@ func (u *Unit) FindExternalPID() (int, string) {
 		}
 	}
 
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, ""
-	}
+	uid := u.expectedUID()
 	self := os.Getpid()
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 1 || pid == self || pid == selfPID {
+	for _, pid := range procPIDs() {
+		if pid <= 1 || pid == self || pid == selfPID {
 			continue
 		}
-		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		cmdline, err := os.ReadFile(filepath.Join(procRoot(), strconv.Itoa(pid), "cmdline"))
 		if err != nil || len(cmdline) == 0 {
 			continue
 		}
@@ -156,6 +155,15 @@ func (u *Unit) FindExternalPID() (int, string) {
 			}
 		}
 		if !matched {
+			continue
+		}
+		// Ownership is asked for only once the command line matches: this walk
+		// covers every process on the box and the argv0 match throws away nearly
+		// all of it, so reading a second file per process would be pure cost. The
+		// answer still gates adoption - a process we do not own is not ours to
+		// supervise, and under hidepid=2 it is not even readable, which is why an
+		// unreadable owner rejects.
+		if !procOwnedBy(pid, uid) {
 			continue
 		}
 		// When ExecStart carries args (e.g. "sleep infinity" vs "sleep 10"),
@@ -188,12 +196,13 @@ func (u *Unit) FindExternalPID() (int, string) {
 // /etc/init.d or nohup outside initd supervision). It also returns
 // the external PID (0 when none).
 //
-// Matching is argv-based over a whole-/proc scan: a deliberately coarse
-// compatibility fallback. Two units with byte-identical commands can claim
-// the same process, and a hand-run copy of a command is indistinguishable
-// from the real daemon. Cgroup membership (process identity via controller,
-// not command line) would be the strong fix; initd has no cgroup tracking,
-// so treat external matches as advisory, never as supervision.
+// Matching is argv-based over the /proc entries this unit could own: a
+// deliberately coarse compatibility fallback. Two units with byte-identical
+// commands can still claim the same process, and a hand-run copy of a command
+// is indistinguishable from the real daemon. Cgroup membership (process
+// identity via controller, not command line) would be the strong fix; initd
+// has no cgroup tracking, so treat external matches as advisory, never as
+// supervision.
 func (u *Unit) EffectiveState() (State, int) {
 	snap := u.Snapshot()
 	if snap.State == StateActive || snap.State == StateActivating {
