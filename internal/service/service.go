@@ -897,7 +897,7 @@ func (u *Unit) waitForking(token int, envMap map[string]string, envList []string
 
 	// systemd waits for the PIDFile to appear for Type=forking; without cgroups
 	// we treat the PIDFile PID as the main process once it shows up.
-	pid, err := u.resolveForkingMainPID(timeout, poll)
+	pid, err := u.resolveForkingMainPID(token, timeout, poll)
 
 	if err != nil {
 		u.markFailed(err, ignoreFailure)
@@ -1421,15 +1421,25 @@ func (u *Unit) loadEnvironmentFile(entry string, envMap map[string]string) error
 	return nil
 }
 
-func (u *Unit) waitForPIDFile(timeout time.Duration, poll time.Duration) (int, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+func (u *Unit) waitForPIDFile(token int, timeout time.Duration, poll time.Duration) (int, error) {
+	// timeout <= 0 is systemd "infinity": poll without deadline until the
+	// pid file appears. The stop/token check lets an in-flight stop or
+	// restart cancel the wait so infinity never wedges the unit.
+	var deadline time.Time
+	infinite := timeout <= 0
+	if !infinite {
+		deadline = time.Now().Add(timeout)
+	}
+	for infinite || time.Now().Before(deadline) {
 		// livePIDFilePID, not readPIDFile+processAlive: a pid file left behind
 		// by a dead daemon points at a number the kernel may have handed to an
 		// unrelated process, and adopting that made the unit "active" over a
 		// process it cannot signal.
 		if pid := u.livePIDFilePID(); pid != 0 {
 			return pid, nil
+		}
+		if u.StopRequested() || !u.IsCurrentToken(token) {
+			return 0, errors.New("stop requested")
 		}
 		time.Sleep(poll)
 	}
@@ -1442,11 +1452,17 @@ func (u *Unit) waitForPIDFile(timeout time.Duration, poll time.Duration) (int, e
 // starter's own process group is the daemon. A daemon that setsid()s out of
 // the group without writing a pid file is invisible to both - which is why
 // SysV scripts on this box ship one.
-func (u *Unit) resolveForkingMainPID(timeout, poll time.Duration) (int, error) {
+func (u *Unit) resolveForkingMainPID(token int, timeout, poll time.Duration) (int, error) {
 	if strings.TrimSpace(u.GetConfig().Service.PIDFile) != "" {
-		return u.waitForPIDFile(timeout, poll)
+		return u.waitForPIDFile(token, timeout, poll)
 	}
-	deadline := time.Now().Add(timeout)
+	// timeout <= 0 is systemd "infinity": wait without deadline. The
+	// stop/token check lets an in-flight stop or restart cancel the wait.
+	var deadline time.Time
+	infinite := timeout <= 0
+	if !infinite {
+		deadline = time.Now().Add(timeout)
+	}
 	for {
 		u.mu.Lock()
 		starter, pgid := 0, u.pgid
@@ -1471,7 +1487,10 @@ func (u *Unit) resolveForkingMainPID(timeout, poll time.Duration) (int, error) {
 				return pid, nil
 			}
 		}
-		if time.Now().After(deadline) {
+		if u.StopRequested() || !u.IsCurrentToken(token) {
+			return 0, errors.New("stop requested")
+		}
+		if !infinite && time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(poll)
@@ -3182,8 +3201,15 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 		return
 	}
 
-	timer := time.NewTimer(u.StartTimeout())
-	defer timer.Stop()
+	// timeout <= 0 is systemd "infinity": wait without deadline. A nil
+	// channel blocks forever, so the select below waits only on READY
+	// and exit when infinity is configured (e.g. TimeoutSec=infinity).
+	var timerCh <-chan time.Time
+	if timeout := u.StartTimeout(); timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timerCh = timer.C
+	}
 
 	// Monitor process exit during the activating phase. Without this, a
 	// Type=notify process that dies before sending READY=1 is left as a
@@ -3256,7 +3282,7 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 		u.handleExit(token, err, ignoreFailure, true)
 		return
 
-	case <-timer.C:
+	case <-timerCh:
 		u.mu.Lock()
 		if u.startToken != token || u.stopRequested {
 			u.mu.Unlock()
