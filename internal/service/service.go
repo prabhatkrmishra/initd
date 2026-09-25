@@ -2123,6 +2123,22 @@ func (u *Unit) markTimeout(err error, ignoreFailure bool) {
 }
 
 func (u *Unit) markFailed(err error, ignoreFailure bool) {
+	u.markFailedStatus(err, ignoreFailure, 1, 0)
+}
+
+// markFailedStatus is markFailed with the exit status and wait code to publish
+// alongside the failed state.
+//
+// The two must be written in ONE critical section. recordExecFailure used to
+// call markFailed and only afterwards take the lock again to swap the generic
+// ExitCode=1 for the status systemd invents (200/CHDIR, 203/EXEC, 216/GROUP).
+// That published the unit as failed with a placeholder status, so a concurrent
+// reader - `systemctl show -p ExecMainStatus`, `systemctl status`, the D-Bus
+// Service property - could observe ExecMainStatus=1 for a unit whose binary
+// was missing, and a script keying on 203 read 1 instead. The follow-up write
+// also guarded on `State == StateFailed`, so any state change landing in the
+// window silently dropped the real status.
+func (u *Unit) markFailedStatus(err error, ignoreFailure bool, status, mainCode int) {
 	if ignoreFailure {
 		u.transitionState(StateInactive, "")
 		return
@@ -2131,7 +2147,8 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 	u.Runtime.State = StateFailed
 	u.Runtime.LastError = err.Error()
 	u.Runtime.Result = "exit-code"
-	u.Runtime.ExitCode = 1
+	u.Runtime.ExitCode = status
+	u.Runtime.MainCode = mainCode
 	u.Runtime.MainPID = 0
 	u.pgid = 0
 	u.Runtime.FinishedAt = time.Now()
@@ -2168,19 +2185,9 @@ func (u *Unit) execFailureStatus(err error) int {
 // recordExecFailure is markFailed for a main process that was never spawned,
 // carrying the manager-invented status instead of a generic 1.
 func (u *Unit) recordExecFailure(err error, ignoreFailure bool) {
-	status := u.execFailureStatus(err)
-	u.markFailed(err, ignoreFailure)
-	if ignoreFailure {
-		return
-	}
-	u.mu.Lock()
-	if u.Runtime.State == StateFailed {
-		u.Runtime.ExitCode = status
-		// systemd's helper process is the one that "exits" with the invented
-		// status, so the wait code is a plain exit.
-		u.Runtime.MainCode = 1
-	}
-	u.mu.Unlock()
+	// systemd's helper process is the one that "exits" with the invented
+	// status, so the wait code is a plain exit.
+	u.markFailedStatus(err, ignoreFailure, u.execFailureStatus(err), 1)
 }
 
 // directoryBases resolves Runtime/State/Cache/Logs/Configuration roots for
