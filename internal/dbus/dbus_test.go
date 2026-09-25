@@ -246,3 +246,28 @@ func TestBuildServicePropsMissing(t *testing.T) {
 		t.Fatalf("expected nil for missing unit, got %v", props)
 	}
 }
+
+func TestBuildServicePropsControlGroupInterface(t *testing.T) {
+	mgr := newTestManager(t)
+	searchDir := mgr.SearchPaths[0]
+	writeUnitForDBus(t, searchDir, "hello.service",
+		"[Unit]\nDescription=Hello\n[Service]\nType=simple\nExecStart=/bin/true\n")
+	if err := mgr.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	// Clients that ask the Service interface must not be told the property is
+	// unknown just because it also appears on Unit.
+	props := buildServiceProps(mgr, "hello.service")
+	if props == nil {
+		t.Fatalf("expected service props, got nil")
+	}
+	v, ok := props["ControlGroup"]
+	if !ok {
+		t.Fatalf("Service interface has no ControlGroup property")
+	}
+	if got, isStr := v.Value.(string); !isStr {
+		t.Fatalf("ControlGroup value type = %T, want string", v.Value)
+	} else if got != "" {
+		t.Fatalf("ControlGroup = %q for a unit that was never started, want empty", got)
+	}
+}

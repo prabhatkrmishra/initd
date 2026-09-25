@@ -1549,6 +1549,34 @@ func printStatus(status ipc.StatusData, enabled string, maxLines int) {
 		statusKey("Main PID", fmt.Sprintf("%d %s", status.ExecMainPID, ended))
 	}
 
+	if status.CGroup != "" {
+		statusKey("CGroup", status.CGroup)
+		// Upstream's tree is capped, and every line here costs a /proc read: a
+		// unit that forked a thousand ways would turn `status` into a thousand
+		// reads and a thousand lines. Say what was left out, do not hide it.
+		const maxTree = 20
+		shown, hidden := status.CGroupPIDs, 0
+		if len(shown) > maxTree {
+			hidden = len(shown) - maxTree
+			shown = shown[:maxTree]
+		}
+		for i, pid := range shown {
+			glyph := "├─"
+			if i == len(shown)-1 && hidden == 0 {
+				glyph = "└─"
+			}
+			line := strconv.Itoa(pid)
+			if name := processCommand(pid); name != "" {
+				line = fmt.Sprintf("%d (%s)", pid, name)
+			}
+			// Upstream hangs the tree under the value column of the CGroup line.
+			fmt.Printf("             %s %s\n", glyph, line)
+		}
+		if hidden > 0 {
+			fmt.Printf("             └─ %d more\n", hidden)
+		}
+	}
+
 	if status.LastError != "" && status.LastError != "external-process" {
 		fmt.Printf("   Error: %s\n", status.LastError)
 	}

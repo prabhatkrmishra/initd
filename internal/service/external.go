@@ -122,15 +122,10 @@ func (u *Unit) FindExternalPID() (int, string) {
 		}
 	}
 
-	uid := u.expectedUID()
-	self := os.Getpid()
-	for _, pid := range procPIDs() {
-		if pid <= 1 || pid == self || pid == selfPID {
-			continue
-		}
+	matches := func(pid int) (string, bool) {
 		cmdline, err := os.ReadFile(filepath.Join(procRoot(), strconv.Itoa(pid), "cmdline"))
 		if err != nil || len(cmdline) == 0 {
-			continue
+			return "", false
 		}
 		// cmdline is NUL-separated; argv0 is up to first NUL.
 		argv0 := string(cmdline)
@@ -139,7 +134,7 @@ func (u *Unit) FindExternalPID() (int, string) {
 		}
 		argv0 = strings.TrimSpace(argv0)
 		if argv0 == "" {
-			continue
+			return "", false
 		}
 		base := filepath.Base(argv0)
 		matched := false
@@ -155,16 +150,7 @@ func (u *Unit) FindExternalPID() (int, string) {
 			}
 		}
 		if !matched {
-			continue
-		}
-		// Ownership is asked for only once the command line matches: this walk
-		// covers every process on the box and the argv0 match throws away nearly
-		// all of it, so reading a second file per process would be pure cost. The
-		// answer still gates adoption - a process we do not own is not ours to
-		// supervise, and under hidepid=2 it is not even readable, which is why an
-		// unreadable owner rejects.
-		if !procOwnedBy(pid, uid) {
-			continue
+			return "", false
 		}
 		// When ExecStart carries args (e.g. "sleep infinity" vs "sleep 10"),
 		// require them: a basename-only match would let two units sharing
@@ -172,20 +158,47 @@ func (u *Unit) FindExternalPID() (int, string) {
 		if len(wantArgs) > 0 {
 			procArgv := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
 			if len(procArgv)-1 < len(wantArgs) {
-				continue
+				return "", false
 			}
-			ok := true
 			for i, wa := range wantArgs {
 				if procArgv[i+1] != wa {
-					ok = false
-					break
+					return "", false
 				}
 			}
-			if !ok {
-				continue
+		}
+		return strings.ReplaceAll(strings.TrimRight(string(cmdline), "\x00"), "\x00", " "), true
+	}
+	describe := func(pid int) (int, string, bool) {
+		if pid <= 1 || pid == os.Getpid() || pid == selfPID {
+			return 0, "", false
+		}
+		line, ok := matches(pid)
+		if !ok {
+			return 0, "", false
+		}
+		// A process we do not own is not ours to supervise, and under hidepid=2
+		// it is not even readable - so an unreadable owner rejects. Asked only
+		// after the command line matches, which throws away most of the box.
+		if !procOwnedBy(pid, u.expectedUID()) {
+			return 0, "", false
+		}
+		return pid, line, true
+	}
+
+	// A process the kernel already attributes to this unit beats a search: the
+	// scan below can only say "something runs this command line", which is not
+	// the same as "this is the daemon".
+	if members := u.cgroupMembers(); members != nil {
+		for _, pid := range members {
+			if found, line, ok := describe(pid); ok {
+				return found, line
 			}
 		}
-		return pid, strings.ReplaceAll(strings.TrimRight(string(cmdline), "\x00"), "\x00", " ")
+	}
+	for _, pid := range procPIDs() {
+		if found, line, ok := describe(pid); ok {
+			return found, line
+		}
 	}
 	return 0, ""
 }
@@ -196,12 +209,14 @@ func (u *Unit) FindExternalPID() (int, string) {
 // /etc/init.d or nohup outside initd supervision). It also returns
 // the external PID (0 when none).
 //
-// Matching is argv-based over the /proc entries this unit could own: a
-// deliberately coarse compatibility fallback. Two units with byte-identical
-// commands can still claim the same process, and a hand-run copy of a command
-// is indistinguishable from the real daemon. Cgroup membership (process
-// identity via controller, not command line) would be the strong fix; initd
-// has no cgroup tracking, so treat external matches as advisory, never as
+// Matching is argv-based over the /proc entries this unit could own, with the
+// unit's own cgroup consulted first where one exists: membership is process
+// identity rather than a command line that any other process may copy, so a
+// group's member is trusted and only a unit without a group falls back to the
+// scan. Where there is no group the scan stays a deliberately coarse
+// compatibility fallback - two units with byte-identical commands can still
+// claim the same process, and a hand-run copy of a command is indistinguishable
+// from the real daemon. Treat external matches as advisory, never as
 // supervision.
 func (u *Unit) EffectiveState() (State, int) {
 	snap := u.Snapshot()

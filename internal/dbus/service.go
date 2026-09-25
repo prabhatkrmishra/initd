@@ -193,13 +193,41 @@ func (m *systemd1Manager) LoadUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", name)}}
 }
 
+// GetUnitByPID answers from cgroup membership, which is the only honest source:
+// a unit's group lists the processes the kernel attributes to it. On a box
+// where initd could not create groups no unit has a group, and the answer stays
+// the same NoSuchUnit it was before cgroups existed here.
 func (m *systemd1Manager) GetUnitByPID(pid uint32) (dbus.ObjectPath, *dbus.Error) {
-	_ = pid
+	if pid == 0 {
+		return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"Not tracked"}}
+	}
+	for _, unit := range m.primarySafe().ListUnits() {
+		cfg := unit.GetConfig()
+		if cfg == nil {
+			continue
+		}
+		for _, member := range unit.CGroupPIDs() {
+			if uint32(member) == pid {
+				return m.unitPathFor(cfg.Name), nil
+			}
+		}
+	}
 	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"Not tracked"}}
 }
 
 func (m *systemd1Manager) GetUnitByControlGroup(cgroup string) (dbus.ObjectPath, *dbus.Error) {
-	_ = cgroup
+	if cgroup == "" {
+		return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"Not tracked"}}
+	}
+	for _, unit := range m.primarySafe().ListUnits() {
+		cfg := unit.GetConfig()
+		if cfg == nil {
+			continue
+		}
+		if unit.ControlGroup() == cgroup {
+			return m.unitPathFor(cfg.Name), nil
+		}
+	}
 	return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"Not tracked"}}
 }
 
@@ -750,6 +778,7 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 		"UnitFilePreset":         {Value: "disabled", Writable: false, Emit: prop.EmitConst},
 		"Result":                 {Value: result, Writable: false, Emit: prop.EmitTrue},
 		"FragmentPath":           {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
+		"ControlGroup":           {Value: data["ControlGroup"], Writable: false, Emit: prop.EmitConst},
 		"DropInPaths":            {Value: []string{}, Writable: false, Emit: prop.EmitConst},
 		"NeedDaemonReload":       {Value: mgr.NeedDaemonReload(), Writable: false, Emit: prop.EmitTrue},
 		"SourcePath":             {Value: "", Writable: false, Emit: prop.EmitConst},
@@ -790,8 +819,15 @@ func buildServiceProps(mgr *supervisor.Manager, name string) map[string]*prop.Pr
 	if len(argv) > 0 {
 		execPath = argv[0]
 	}
+	// Upstream hangs ControlGroup off the type interface rather than Unit, so
+	// clients that ask "which group does this service run in" go looking here.
+	cgroup := ""
+	if unit, err := mgr.FindUnit(name); err == nil {
+		cgroup = unit.ControlGroup()
+	}
 	return map[string]*prop.Prop{
 		"Type":             {Value: cfg.GetConfig().Service.Type, Writable: false, Emit: prop.EmitConst},
+		"ControlGroup":     {Value: cgroup, Writable: false, Emit: prop.EmitConst},
 		"WorkingDirectory": {Value: cfg.GetConfig().Service.WorkingDirectory, Writable: false, Emit: prop.EmitConst},
 		"ExecStart":        {Value: execStartCommands(execPath, argv), Writable: false, Emit: prop.EmitConst},
 		"Environment":      {Value: cfg.GetConfig().Service.Environment, Writable: false, Emit: prop.EmitConst},

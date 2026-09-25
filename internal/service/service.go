@@ -103,6 +103,10 @@ type Unit struct {
 	// not brought down, which is how RuntimeDirectoryPreserve=restart is
 	// distinguished from the default.
 	keepDirsOnStop bool
+	// cgroupLeaf records that this unit has a leaf cgroup, so every
+	// membership question can be answered "no evidence" instead of "nobody is
+	// running" on a box where groups cannot be created.
+	cgroupLeaf bool
 }
 
 type managedDirectories struct {
@@ -286,6 +290,17 @@ func (u *Unit) processGroupAlive(pgid int) bool {
 // and once our starter exits the kernel can hand that number to a new,
 // unrelated group; sweeping it then signals processes nothing here supervises.
 func (u *Unit) signalUnitPID(pid, fallbackPGID int, group bool, sig syscall.Signal) {
+	// Membership is added to the group path, never substituted for it: a process
+	// forked before the starter was moved in, and one adopted from a pid file,
+	// belong to the unit without being listed. A process may be signalled twice
+	// by that, which is the cheaper mistake than leaving one running.
+	if group {
+		for _, member := range u.cgroupMembers() {
+			if member > 0 && member != os.Getpid() {
+				_ = syscall.Kill(member, sig)
+			}
+		}
+	}
 	selfPGID := syscall.Getpgrp()
 	groupHasSelf := func(gid int) bool {
 		if gid <= 0 || gid != selfPGID {
@@ -335,6 +350,13 @@ func (u *Unit) unitGroupAlive(pid, fallbackPGID int, group bool) bool {
 	}
 	if !group {
 		return false
+	}
+	// The group answers exactly where a /proc scan can only guess, and answers
+	// on a box where hidepid hides the processes entirely. It can only ever say
+	// someone is alive: a group listing nobody is no evidence rather than proof
+	// of an idle unit, so the scan below still gets the last word.
+	if alive, known := u.cgroupAlive(); known && alive {
+		return true
 	}
 	if pid > 0 {
 		if gid, err := syscall.Getpgid(pid); err == nil && gid > 0 {
@@ -629,6 +651,10 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// this run from earlier ones.
 	u.Logs.SetInvocation(newInvocationID())
 
+	// The group exists before anything runs, so every process this start makes
+	// - the helper scripts included - can be placed in it.
+	u.prepareCgroup()
+
 	if err := u.runExecStartPre(token, envMap, envList); err != nil {
 		closeSocketFiles()
 		u.markFailed(err, false)
@@ -753,6 +779,11 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	// Child has its own dups now; release the parent copies.
 	closeSocketFiles()
+
+	// Claim the process for this unit's group before anything looks at it.
+	if cmd.Process != nil {
+		u.placeInCgroup(cmd.Process.Pid)
+	}
 
 	// Record the starter's OWN group, not its PID-as-group: children that
 	// share the daemon's session (common when the daemon was launched from
@@ -910,6 +941,11 @@ func (u *Unit) Stop(timeout time.Duration) error {
 	u.mu.Lock()
 	u.stopRequested = true
 	u.mu.Unlock()
+	// A release that was already on its way when this stop started may have just
+	// handed the leaf back, and every helper below is meant to run inside it -
+	// one with no group of its own lands in the daemon's, where it can see every
+	// process the supervisor has.
+	u.prepareCgroup()
 
 	runStopPost := true
 	defer func() {
@@ -923,6 +959,9 @@ func (u *Unit) Stop(timeout time.Duration) error {
 			_ = u.runExecStopPost()
 		}
 		u.removeManagedRuntimeDirectories()
+		// Last, because ExecStopPost runs inside the group: sweeping it before
+		// the script finished would kill the helper that was asked to clean up.
+		u.finishCgroupStop()
 	}()
 
 	stopCommand := strings.TrimSpace(u.GetConfig().Service.ExecStop)
@@ -1102,7 +1141,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 
 	waitUntilStopped := func() bool {
 		if serviceType == "forking" {
-			if pid == 0 && (!killProcessGroup || !u.processGroupAlive(pgid)) {
+			if pid == 0 && (!killProcessGroup || !u.unitGroupAlive(0, pgid, killProcessGroup)) {
 				u.transitionState(StateInactive, "")
 				return true
 			}
@@ -1422,6 +1461,12 @@ func (u *Unit) resolveForkingMainPID(timeout, poll time.Duration) (int, error) {
 		// gone: until then every member of the group might still be the
 		// starter itself.
 		if !processAlive(starter) {
+			// Membership first: the kernel says who is left in the unit. The
+			// process-group scan is the fallback for a box with no group, and
+			// for a daemon that escaped it.
+			if pid := u.cgroupMemberPID(starter); pid != 0 {
+				return pid, nil
+			}
 			if pid := u.processGroupMemberPID(pgid, starter); pid != 0 {
 				return pid, nil
 			}
@@ -1502,6 +1547,16 @@ func (u *Unit) handleExitStatusForPID(token int, watchedPID int, status syscall.
 }
 
 func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, mainCode int, err error, ignoreFailure bool, resetActive bool) {
+	defer func() {
+		// Every terminal write below is inline, not through transitionState, so
+		// this is where a unit that ended by itself hands its group back: nobody
+		// is running a stop, and nothing else would ever release the leaf. The
+		// branches that adopt a successor end up Active and are filtered here.
+		switch u.Snapshot().State {
+		case StateInactive, StateFailed:
+			u.releaseEmptyCgroup()
+		}
+	}()
 	serviceType := u.canonicalServiceType()
 	if serviceType == "notify" && watchedPID != 0 && !u.StopRequested() {
 		// Non-blocking adopt check only: the old code waited up to
@@ -1967,6 +2022,18 @@ func (u *Unit) canonicalServiceType() string {
 }
 
 func (u *Unit) transitionState(next State, reason string) {
+	u.applyStateTransition(next, reason)
+	// Every end of a unit's run passes through here, which is the only place
+	// that can notice a death nobody asked for: a stop releases the group, a
+	// crash released nothing, and the empty leaf outlived the process.
+	if next == StateInactive || next == StateFailed {
+		u.releaseEmptyCgroup()
+	}
+}
+
+// applyStateTransition is the locked half of transitionState. The group is
+// released after the lock is down, never under it.
+func (u *Unit) applyStateTransition(next State, reason string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	// Any path to inactive releases the PID. Previously only Active→Inactive
@@ -2012,20 +2079,28 @@ func (u *Unit) skipStart() {
 // markTimeout fails a unit whose start ran out of TimeoutStartSec. Upstream
 // keeps Result as a keyword and `systemctl start` renders it as "failed
 // because a timeout was exceeded", so reusing markFailed's exit-code default
-// would misreport why the job died.
+// would misreport why the job died. Every keyword is written with the state in
+// one critical section: this path kills the process, and a two-step write let
+// that exit land in between and rewrite Result back to exit-code.
 func (u *Unit) markTimeout(err error, ignoreFailure bool) {
-	u.markFailed(err, ignoreFailure)
 	if ignoreFailure {
+		u.transitionState(StateInactive, "")
 		return
 	}
 	u.mu.Lock()
+	u.Runtime.State = StateFailed
+	u.Runtime.LastError = err.Error()
 	u.Runtime.Result = "timeout"
-	// The timeout path terminates the process with the stop signal, so
-	// upstream reports it as a signaled death: code=killed with the signal as
-	// the status, not the generic exit-code=1 markFailed left behind.
+	// The timeout terminates the process with the stop signal, so upstream
+	// reports a signaled death: code=killed with the signal as the status.
 	u.Runtime.MainCode = 2
 	u.Runtime.ExitCode = int(u.stopSignal())
+	u.Runtime.MainPID = 0
+	u.pgid = 0
+	u.Runtime.FinishedAt = time.Now()
+	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 	u.mu.Unlock()
+	u.releaseEmptyCgroup()
 }
 
 func (u *Unit) markFailed(err error, ignoreFailure bool) {
@@ -2043,6 +2118,9 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 	u.Runtime.FinishedAt = time.Now()
 	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 	u.mu.Unlock()
+	// markFailed writes the state itself rather than through transitionState,
+	// so it owes the group back here as well.
+	u.releaseEmptyCgroup()
 }
 
 // execFailureStatus maps a spawn that never happened onto the exit status
@@ -2356,6 +2434,11 @@ func (u *Unit) runCommandStatus(command string, envMap map[string]string, envLis
 	}
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
+	// systemd runs ExecStartPre and ExecStopPost inside the unit's cgroup, so a
+	// KillMode that sweeps the group is meant to reach them too.
+	if cmd.Process != nil {
+		u.placeInCgroup(cmd.Process.Pid)
+	}
 	// Helpers honor the unit's start/stop timeout instead of waiting forever:
 	// a stuck ExecStartPre must fail the start, not wedge the unit in
 	// activating. timeout <= 0 means systemd "infinity" (wait unbounded).
@@ -2583,13 +2666,11 @@ func (u *Unit) killModeProcess() bool {
 	// Only the group flavors take the whole process group. Everything else
 	// — process, mixed, none, unset — kills the main PID only.
 	//
-	// That is deliberately not what upstream means by mixed: systemd sends
-	// SIGTERM to the main process and then SIGKILL to everything left in the
-	// unit's cgroup. With no cgroup there is no reliable set of leftovers to
-	// kill - the process group is not the same population, and sweeping it
-	// would signal processes the unit never owned - so the second half is
-	// skipped and a mixed unit's children outlive its main process until
-	// per-unit cgroups exist.
+	// mixed is the first half of what upstream means: SIGTERM to the main
+	// process now, and whatever is left in the unit's cgroup is killed by
+	// finishCgroupStop when the stop ends. With no cgroup on this box that
+	// second half has nothing to enumerate, so a mixed unit's children can
+	// still outlive its main process there.
 	switch mode {
 	case "control-group", "controlgroup", "control_group":
 		return false
@@ -3048,6 +3129,9 @@ func (u *Unit) adoptedNotifyPIDWithCurrent(watchedPID int, currentPID int) int {
 	}
 	if currentPID != 0 && currentPID != watchedPID && processAlive(currentPID) {
 		return currentPID
+	}
+	if memberPID := u.cgroupMemberPID(watchedPID); memberPID != 0 {
+		return memberPID
 	}
 	if memberPID := u.processGroupMemberPID(watchedPID, watchedPID); memberPID != 0 {
 		return memberPID

@@ -1739,6 +1739,9 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		"JobId":          "0",
 		"JobType":        "",
 		"JobPath":        "/",
+		// ControlGroup is empty wherever this box has no unit cgroups, which is
+		// how a client tells "not grouped" from "grouped and idle".
+		"ControlGroup": unit.ControlGroup(),
 	}
 	if notes := unit.IgnoredSecurityNotes(); len(notes) > 0 {
 		data["IgnoredDirectives"] = strings.Join(notes, "; ")

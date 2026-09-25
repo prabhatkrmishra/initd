@@ -112,8 +112,12 @@ func TestOrderUnitsByAfterCycle(t *testing.T) {
 
 func TestUnitStateAndIsFailed(t *testing.T) {
 	m, dir := newTestManager(t)
-	writeUnit(t, dir, "ok.service", "[Service]\nExecStart=/bin/true\n")
-	writeUnit(t, dir, "bad.service", "[Service]\nExecStart=/bin/true\n")
+	// A unit whose command nobody else runs: an inactive unit is upgraded to
+	// active when its ExecStart binary is found live in /proc, so a plain
+	// /bin/true here would be at the mercy of whatever the rest of the box was
+	// running at that instant.
+	writeUnit(t, dir, "ok.service", "[Service]\nExecStart=/bin/echo initd-state-ok\n")
+	writeUnit(t, dir, "bad.service", "[Service]\nExecStart=/bin/echo initd-state-bad\n")
 	if err := m.LoadUnits(); err != nil {
 		t.Fatalf("LoadUnits: %v", err)
 	}

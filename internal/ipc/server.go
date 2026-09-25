@@ -79,6 +79,11 @@ type StatusData struct {
 	// ExecStart is the unit's main command line, shown as the Process: line
 	// once it has run.
 	ExecStart string `json:"exec_start,omitempty"`
+	// CGroup is systemd's ControlGroup, and CGroupPIDs the processes the kernel
+	// puts in it. Both are empty where this box has no unit cgroups, so the
+	// status output simply has no CGroup stanza there.
+	CGroup     string `json:"cgroup,omitempty"`
+	CGroupPIDs []int  `json:"cgroup_pids,omitempty"`
 }
 
 // firstExecStart is the unit's main command line, which systemd echoes
@@ -363,6 +368,8 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 				ExitCode:            snapshot.ExitCode,
 				ExecMainPID:         snapshot.ExecMainPID,
 				ExecStart:           firstExecStart(unit),
+				CGroup:              unit.ControlGroup(),
+				CGroupPIDs:          unit.CGroupPIDs(),
 			}}
 		}
 		if _, err := manager.FindSocketUnit(req.Unit); err == nil {

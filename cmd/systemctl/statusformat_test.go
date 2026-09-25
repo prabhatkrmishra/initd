@@ -183,3 +183,39 @@ func TestPrintStatusKilledProcess(t *testing.T) {
 		t.Errorf("process = %q", lines[3])
 	}
 }
+
+// The cgroup stanza is where `status` answers who the kernel says runs for this
+// unit. It is capped, because every line is a /proc read and a unit that forked
+// a thousand ways would otherwise make `status` do exactly that.
+func TestPrintStatusCGroupTree(t *testing.T) {
+	mk := func(n int) []int {
+		pids := make([]int, 0, n)
+		for i := 0; i < n; i++ {
+			pids = append(pids, 400000+i)
+		}
+		return pids
+	}
+	lines := captureStatus(t, ipc.StatusData{
+		Name: "app.service", Description: "App", State: service.StateActive,
+		SubState: "running", CGroup: "/initd/app.service", CGroupPIDs: mk(3),
+	}, "static")
+	if !strings.Contains(strings.Join(lines, "\n"),
+		"     CGroup: /initd/app.service\n             ├─ 400000\n             ├─ 400001\n             └─ 400002") {
+		t.Errorf("tree:\n%s", strings.Join(lines, "\n"))
+	}
+
+	capped := captureStatus(t, ipc.StatusData{
+		Name: "app.service", Description: "App", State: service.StateActive,
+		SubState: "running", CGroup: "/initd/app.service", CGroupPIDs: mk(25),
+	}, "static")
+	body := strings.Join(capped, "\n")
+	if strings.Contains(body, "400020") {
+		t.Errorf("the tree showed a process past the cap:\n%s", body)
+	}
+	if !strings.HasSuffix(capped[len(capped)-1], "└─ 5 more") {
+		t.Errorf("last line = %q, want the count left out", capped[len(capped)-1])
+	}
+	if got := strings.Count(body, "4000"); got != 20 {
+		t.Errorf("tree rendered %d members, want 20", got)
+	}
+}

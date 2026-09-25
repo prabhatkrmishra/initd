@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"initd/internal/boot"
 	"initd/internal/build"
+	"initd/internal/cgroup"
 	"initd/internal/dbus"
 	"initd/internal/ipc"
 	"initd/internal/logging"
@@ -92,6 +93,13 @@ func main() {
 	}
 	if err := userManager.OpenJournal(); err != nil {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "user journal unavailable: %v", err)
+	}
+
+	// One line for the box, not one per unit: whether the kernel can tell this
+	// daemon's processes from a stranger's is decided here, once.
+	if tree := cgroup.Default(); !tree.Available() {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"unit cgroups unavailable (%s); stops fall back to process groups", tree.Reason())
 	}
 
 	// Fallback for non-root: /run/initd.sock not writable
