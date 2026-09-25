@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	gdbus "github.com/godbus/dbus/v5"
@@ -19,8 +20,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -32,6 +35,14 @@ func main() {
 	if err != nil {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "%v", err)
 		os.Exit(1)
+	}
+	if cfg.showStatus {
+		printStatus(cfg.asJSON)
+		return
+	}
+	if cfg.showPaths {
+		printPaths(cfg.asJSON)
+		return
 	}
 	socketPath := cfg.socketPath
 	initMode := cfg.initMode
@@ -216,6 +227,14 @@ func main() {
 		primaryServes = startSystemManager(socketPath, systemManager)
 	}
 	userSocket := userpaths.UserSocketPath()
+	setTransportState("unix:primary", transportState{
+		Transport: "unix", Scope: "system", Address: socketPath, State: "listening",
+	})
+	if userSocket != socketPath {
+		setTransportState("unix:user", transportState{
+			Transport: "unix", Scope: "user", Address: userSocket, State: "listening",
+		})
+	}
 	if !primaryIsUser && userSocket != socketPath {
 		// A system daemon also serves its own uid's user socket; losing that
 		// race is not fatal - that uid's own daemon keeps running.
@@ -446,6 +465,50 @@ func removeOwnPidFile(path string) {
 // enough not to be a busy loop.
 const busLivenessPoll = 5 * time.Second
 
+// transportState is what a client needs in order to trust (or distrust) a
+// route to this daemon without inferring it from a timeout.
+type transportState struct {
+	Transport string `json:"transport"` // "unix" or "dbus"
+	Scope     string `json:"scope"`     // "user" or "system"
+	Address   string `json:"address"`
+	State     string `json:"state"` // listening | owned | retrying | unavailable
+	Detail    string `json:"detail,omitempty"`
+	Since     string `json:"since,omitempty"`
+}
+
+// statusState is the snapshot `initd --status` prints. Third-party tooling has
+// no other supported way to learn whether the manager is reachable: probing and
+// interpreting a timeout is what it falls back to today, and a D-Bus client that
+// finds no name waits out service_start_timeout (120s) before it finds out.
+var statusState = struct {
+	mu    sync.Mutex
+	items map[string]*transportState
+}{items: map[string]*transportState{}}
+
+func setTransportState(key string, st transportState) {
+	statusState.mu.Lock()
+	defer statusState.mu.Unlock()
+	copied := st
+	copied.Since = time.Now().Format(time.RFC3339)
+	statusState.items[key] = &copied
+}
+
+func snapshotTransportState() []transportState {
+	statusState.mu.Lock()
+	defer statusState.mu.Unlock()
+	out := make([]transportState, 0, len(statusState.items))
+	for _, v := range statusState.items {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Transport != out[j].Transport {
+			return out[i].Transport < out[j].Transport
+		}
+		return out[i].Scope < out[j].Scope
+	})
+	return out
+}
+
 // advertise keeps one D-Bus name registered for as long as the daemon lives.
 //
 // Registration is maintained state, not a one-shot event. The session bus is
@@ -461,13 +524,20 @@ const busLivenessPoll = 5 * time.Second
 // us. Backoff is capped and jittered so daemons started together do not
 // synchronise. Only a change of state is logged, so a bus that never appears
 // does not fill the log.
-func advertise(ctx context.Context, label string, register func(context.Context) (*gdbus.Conn, error)) {
+func advertise(ctx context.Context, key, label, scope, address string, register func(context.Context) (*gdbus.Conn, error)) {
 	const (
 		minBackoff = 100 * time.Millisecond
 		maxBackoff = 30 * time.Second
 	)
 	backoff := minBackoff
 	held := false
+	report := func(state, detail string) {
+		setTransportState(key, transportState{
+			Transport: "dbus", Scope: scope, Address: address,
+			State: state, Detail: detail,
+		})
+	}
+	report("retrying", "not registered yet")
 	for {
 		if ctx.Err() != nil {
 			return
@@ -479,6 +549,7 @@ func advertise(ctx context.Context, label string, register func(context.Context)
 					"registered %s", label)
 			}
 			held = true
+			report("owned", "")
 			// Hold the connection. A bus that goes away takes the name with
 			// it, so re-acquire rather than pretending it is still ours.
 			select {
@@ -492,6 +563,7 @@ func advertise(ctx context.Context, label string, register func(context.Context)
 						"lost %s; re-acquiring", label)
 					held = false
 					backoff = minBackoff
+					report("retrying", "bus connection lost")
 				}
 			}
 			continue
@@ -501,6 +573,7 @@ func advertise(ctx context.Context, label string, register func(context.Context)
 				"lost %s: %v", label, err)
 			held = false
 		}
+		report("retrying", err.Error())
 		select {
 		case <-ctx.Done():
 			return
@@ -535,21 +608,100 @@ func startDBusServers(ctx context.Context, systemManager, userManager *superviso
 	// The user (session) bus: initd already owns org.freedesktop.DBus there, so
 	// owning org.freedesktop.systemd1 too is what makes `systemctl --user` and
 	// third-party tooling answer from initd.
-	go advertise(ctx, "org.freedesktop.systemd1 on the user bus",
+	go advertise(ctx, "dbus:user", "org.freedesktop.systemd1 on the user bus",
+		"user", userBusAddress(),
 		func(ctx context.Context) (*gdbus.Conn, error) {
 			return dbus.ServeUserBus(ctx, userManager)
 		})
 	// The system bus: lets a system-scope systemctl connect and get a
 	// verifiable answer. Non-fatal where there is no system bus.
-	go advertise(ctx, "org.freedesktop.systemd1 on the system bus",
+	go advertise(ctx, "dbus:system", "org.freedesktop.systemd1 on the system bus",
+		"system", "/var/run/dbus/system_bus_socket",
 		func(ctx context.Context) (*gdbus.Conn, error) {
 			return dbus.ServeSystemBus(ctx, systemManager, userManager)
 		})
 }
 
+// userBusAddress is the session bus initd advertises on, for --status. Reported
+// rather than derived by the reader, so a client never has to guess it.
+func userBusAddress() string {
+	if a := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); a != "" {
+		return a
+	}
+	return "unix:path=" + filepath.Join(userpaths.UserRuntimeDir(), "bus")
+}
+
+// printStatus reports every route to this daemon and whether it is live.
+//
+// This exists because there was no supported way to ask. A client that cannot
+// find org.freedesktop.systemd1 on the bus does not learn that the manager is
+// unreachable; it falls through to D-Bus service activation and blocks for
+// service_start_timeout. Being able to see "user dbus: retrying" turns a
+// two-minute stall into an answer.
+func printStatus(asJSON bool) {
+	states := snapshotTransportState()
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]interface{}{
+			"pid":        os.Getpid(),
+			"transports": states,
+		})
+		return
+	}
+	fmt.Printf("initd %s (pid %d)\n", build.String(), os.Getpid())
+	if len(states) == 0 {
+		fmt.Println("  no transports advertised (daemon not serving yet)")
+		return
+	}
+	for _, s := range states {
+		detail := ""
+		if s.Detail != "" {
+			detail = "  (" + s.Detail + ")"
+		}
+		fmt.Printf("  %-6s %-6s %-9s %s%s\n", s.Transport, s.Scope, s.State, s.Address, detail)
+	}
+}
+
+// printPaths reports the addresses this daemon uses, for a tool that needs to
+// dial one directly instead of going through systemctl. userpaths already
+// centralises the resolution (including the /tmp fallbacks), so exposing it is
+// cheaper than every consumer reimplementing the rules and getting them subtly
+// different.
+func printPaths(asJSON bool) {
+	paths := map[string]string{
+		"user_socket":    userpaths.UserSocketPath(),
+		"system_socket":  userpaths.SystemSocketPath(),
+		"user_runtime":   userpaths.UserRuntimeDir(),
+		"user_state":     userpaths.UserStateDir(),
+		"user_journal":   userpaths.UserJournalDir(),
+		"system_journal": userpaths.SystemJournalDir(),
+		"user_bus":       userBusAddress(),
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(paths)
+		return
+	}
+	keys := make([]string, 0, len(paths))
+	for k := range paths {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("%-16s %s\n", k, paths[k])
+	}
+}
+
 // daemonConfig carries the process-level options: where to listen, which
 // mode to run, and (for --daemonize) where to record the detached PID.
 type daemonConfig struct {
+	// showStatus / showPaths answer and exit: they are discovery for tooling,
+	// not a mode of running the daemon.
+	showStatus bool
+	showPaths  bool
+	asJSON     bool
 	socketPath string
 	initMode   bool
 	daemonize  bool
@@ -750,6 +902,12 @@ func parseArgs(args []string) (daemonConfig, error) {
 		case arg == "-V" || arg == "--version":
 			printVersion()
 			os.Exit(0)
+		case arg == "--status":
+			cfg.showStatus = true
+		case arg == "--print-paths":
+			cfg.showPaths = true
+		case arg == "--json":
+			cfg.asJSON = true
 		case arg == "--init":
 			cfg.initMode = true
 		case arg == "--daemonize":
@@ -833,6 +991,11 @@ Options:
                        Implied by --daemonize.
   --log-file[=PATH]    Append daemon output here when detaching
                        (default $XDG_RUNTIME_DIR/initd-daemon.log).
+  --status             Report every route to this daemon (unix sockets, D-Bus names) and
+                       whether each is live, then exit. --json for machine-readable.
+  --print-paths        Report the socket, runtime, state and journal paths in use, then
+                       exit. --json for machine-readable.
+  --json               With --status or --print-paths, emit JSON.
   -h, --help           Show this help.
   -V, --version        Show version.
 

@@ -37,7 +37,7 @@ func TestAdvertiseKeepsTryingUntilTheBusAppears(t *testing.T) {
 		return nil, errHeldForTest
 	}
 
-	go advertise(ctx, "test bus", register)
+	go advertise(ctx, "dbus:test", "test bus", "user", "test", register)
 
 	select {
 	case <-registered:
@@ -66,7 +66,7 @@ func TestAdvertiseBacksOffWhenTheBusNeverAppears(t *testing.T) {
 		atomic.AddInt32(&attempts, 1)
 		return nil, errors.New("no bus")
 	}
-	go advertise(ctx, "absent bus", register)
+	go advertise(ctx, "dbus:absent", "absent bus", "user", "test", register)
 
 	time.Sleep(1500 * time.Millisecond)
 	got := atomic.LoadInt32(&attempts)
@@ -91,7 +91,7 @@ func TestAdvertiseStopsOnContextCancel(t *testing.T) {
 		return nil, errors.New("no bus")
 	}
 	go func() {
-		advertise(ctx, "test bus", register)
+		advertise(ctx, "dbus:test", "test bus", "user", "test", register)
 		close(done)
 	}()
 
