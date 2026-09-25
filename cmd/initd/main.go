@@ -292,6 +292,7 @@ func main() {
 	// but is non-fatal: if initd is not root or no system dbus-daemon is
 	// reachable, we simply skip it and rely on the user bus instead.
 	dbusCtx, stopDBus := context.WithCancel(context.Background())
+	installTransportsProvider()
 	go startDBusServers(dbusCtx, systemManager, userManager)
 
 	if initMode {
@@ -493,6 +494,32 @@ func setTransportState(key string, st transportState) {
 	statusState.items[key] = &copied
 }
 
+// installTransportsProvider publishes this daemon's transport state to the
+// control socket, so `initd --status` can ask the process that actually holds
+// the sockets and bus names rather than reporting its own empty view.
+func installTransportsProvider() {
+	ipc.TransportsProvider = func() []map[string]string {
+		states := snapshotTransportState()
+		out := make([]map[string]string, 0, len(states))
+		for _, s := range states {
+			row := map[string]string{
+				"transport": s.Transport,
+				"scope":     s.Scope,
+				"address":   s.Address,
+				"state":     s.State,
+			}
+			if s.Detail != "" {
+				row["detail"] = s.Detail
+			}
+			if s.Since != "" {
+				row["since"] = s.Since
+			}
+			out = append(out, row)
+		}
+		return out
+	}
+}
+
 func snapshotTransportState() []transportState {
 	statusState.mu.Lock()
 	defer statusState.mu.Unlock()
@@ -631,27 +658,41 @@ func userBusAddress() string {
 	return "unix:path=" + filepath.Join(userpaths.UserRuntimeDir(), "bus")
 }
 
-// printStatus reports every route to this daemon and whether it is live.
+// printStatus reports every route to the running daemon and whether it is live.
 //
 // This exists because there was no supported way to ask. A client that cannot
 // find org.freedesktop.systemd1 on the bus does not learn that the manager is
 // unreachable; it falls through to D-Bus service activation and blocks for
 // service_start_timeout. Being able to see "user dbus: retrying" turns a
 // two-minute stall into an answer.
-func printStatus(asJSON bool) {
-	states := snapshotTransportState()
+//
+// The state is the daemon's, not ours: this command is a separate process, so
+// it asks over the control socket rather than reporting its own (necessarily
+// empty) idea of what is running. When no daemon answers, the addresses are
+// still resolved locally and reported as unreachable, which is the useful
+// answer - it names the socket to look at.
+func printStatus(asJSON bool) { printStatusAt(ipcSocketPath(), asJSON) }
+
+func printStatusAt(sock string, asJSON bool) {
+	states, daemonPID, reachable := queryTransportsAt(sock)
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(map[string]interface{}{
-			"pid":        os.Getpid(),
+			"daemon_pid": daemonPID,
+			"reachable":  reachable,
 			"transports": states,
 		})
 		return
 	}
-	fmt.Printf("initd %s (pid %d)\n", build.String(), os.Getpid())
+	if reachable {
+		fmt.Printf("initd %s (daemon pid %d)\n", build.String(), daemonPID)
+	} else {
+		fmt.Printf("initd %s - no daemon reachable on %s\n",
+			build.String(), userpaths.SystemSocketPath())
+	}
 	if len(states) == 0 {
-		fmt.Println("  no transports advertised (daemon not serving yet)")
+		fmt.Println("  no transports advertised")
 		return
 	}
 	for _, s := range states {
@@ -659,8 +700,73 @@ func printStatus(asJSON bool) {
 		if s.Detail != "" {
 			detail = "  (" + s.Detail + ")"
 		}
-		fmt.Printf("  %-6s %-6s %-9s %s%s\n", s.Transport, s.Scope, s.State, s.Address, detail)
+		fmt.Printf("  %-6s %-6s %-11s %s%s\n",
+			s.Transport, s.Scope, s.State, s.Address, detail)
 	}
+}
+
+// queryTransports asks the running daemon which routes it holds. On failure it
+// falls back to the addresses this process resolved, marked unreachable, so the
+// output still names the socket to investigate.
+func queryTransportsAt(sock string) ([]transportState, int, bool) {
+	client := ipc.Client{SocketPath: sock}
+	resp, err := client.Do(ipc.Request{Action: "transports"})
+	if err != nil || !resp.Success {
+		return []transportState{{
+			Transport: "unix", Scope: "system",
+			Address: sock, State: "unreachable",
+			Detail: errReason(err),
+		}}, 0, false
+	}
+	raw, _ := resp.Data.([]interface{})
+	states := make([]transportState, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		s := transportState{}
+		s.Transport, _ = m["transport"].(string)
+		s.Scope, _ = m["scope"].(string)
+		s.Address, _ = m["address"].(string)
+		s.State, _ = m["state"].(string)
+		s.Detail, _ = m["detail"].(string)
+		s.Since, _ = m["since"].(string)
+		states = append(states, s)
+	}
+	sort.Slice(states, func(i, j int) bool {
+		if states[i].Transport != states[j].Transport {
+			return states[i].Transport < states[j].Transport
+		}
+		return states[i].Scope < states[j].Scope
+	})
+	return states, readPidFileInt(), true
+}
+
+// ipcSocketPath is the socket a status query dials: the one this daemon would
+// serve, resolved by the same userpaths rules, so a caller never has to know
+// whether it is talking to a root daemon or a user one.
+func ipcSocketPath() string { return userpaths.SystemSocketPath() }
+
+func errReason(err error) string {
+	if err == nil {
+		return "daemon did not answer"
+	}
+	return err.Error()
+}
+
+// readPidFileInt reports the daemon pid for --status, or 0 when unknown.
+func readPidFileInt() int {
+	path := filepath.Join(userpaths.UserRuntimeDir(), "initd.pid")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0
+	}
+	return pid
 }
 
 // printPaths reports the addresses this daemon uses, for a tool that needs to

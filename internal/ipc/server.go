@@ -135,6 +135,13 @@ const (
 // daemon serves (filesystem + abstract fallback share it).
 var ipcConnSem = make(chan struct{}, maxIPCConns)
 
+// TransportsProvider reports the daemon's live transports (unix sockets and
+// owned D-Bus names) for the "transports" action. The daemon installs it,
+// because only the daemon knows which sockets it bound and which bus names it
+// currently holds. A client cannot derive this: the process asking is not the
+// process serving.
+var TransportsProvider func() []map[string]string
+
 // serveConn admits one accepted connection with bounded concurrency. When
 // saturated the connection is closed immediately without a reply or a new
 // goroutine: answering inline would stall the accept loop behind a peer
@@ -707,6 +714,14 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		return Response{Success: true}
 	case "is-system-running":
 		return Response{Success: true, Data: manager.SystemState()}
+	case "transports":
+		// What route a client has to this daemon, and whether it is live.
+		// The daemon owns this state - it is the process holding the sockets
+		// and the bus names - so a client asking has to be told, not to guess.
+		if TransportsProvider == nil {
+			return Response{Success: true, Data: []map[string]string{}}
+		}
+		return Response{Success: true, Data: TransportsProvider()}
 	case "daemon-reload":
 		if err := manager.Reload(); err != nil {
 			return Response{Success: false, Message: err.Error()}
