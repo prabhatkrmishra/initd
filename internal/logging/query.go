@@ -12,26 +12,26 @@ import (
 // entries with Priority <= max (0=emerg .. 7=debug); Cursor/CursorAfter
 // resume from an opaque cursor token.
 type JournalFilter struct {
-	Units       []string
-	BootID      string
-	SinceUsec   int64
-	UntilUsec   int64
-	PriorityMax int
-	PrioritySet bool
-	Grep        string
+	Units         []string
+	BootID        string
+	SinceUsec     int64
+	UntilUsec     int64
+	PriorityMax   int
+	PrioritySet   bool
+	Grep          string
 	CaseSensitive bool
-	Identifier  string
+	Identifier    string
 	// Invocation keeps only one run (_SYSTEMD_INVOCATION_ID exact match).
 	// ExcludeIdentifier hides one syslog identifier. LatestInvocation keeps
 	// only the newest run per unit (or globally without a unit filter).
 	Invocation        string
 	ExcludeIdentifier string
 	LatestInvocation  bool
-	Cursor      string
-	CursorAfter bool
-	Lines       int
-	LinesPlus   bool
-	Reverse     bool
+	Cursor            string
+	CursorAfter       bool
+	Lines             int
+	LinesPlus         bool
+	Reverse           bool
 }
 
 // QueryJournal filters entries in (realtime, seq) order. Lines>0 keeps the

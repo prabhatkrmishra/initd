@@ -11,10 +11,11 @@ import (
 	"strconv"
 	"strings"
 
+	"initd/internal/build"
 	"initd/internal/userpaths"
 )
 
-const loginctlVersion = "1.1.0"
+var loginctlVersion = build.String()
 
 func main() {
 	args := os.Args[1:]

@@ -29,8 +29,8 @@ func runOffline(opts journalOpts) int {
 		Identifier: opts.identifier, Cursor: opts.cursor,
 		Invocation: opts.invocation, ExcludeIdentifier: opts.excludeIdentifier,
 		LatestInvocation: opts.latestInvocation,
-		CursorAfter: opts.afterCursor != "",
-		Lines: opts.lines, LinesPlus: opts.linesPlus, Reverse: opts.reverse,
+		CursorAfter:      opts.afterCursor != "",
+		Lines:            opts.lines, LinesPlus: opts.linesPlus, Reverse: opts.reverse,
 	}
 	if opts.afterCursor != "" && opts.cursor == "" {
 		req.Cursor = opts.afterCursor

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"initd/internal/build"
 	"initd/internal/logging"
 	"initd/internal/parser"
 	"initd/internal/service"
@@ -429,7 +431,7 @@ func (m *Manager) StartUnit(name string) error {
 
 	started := map[string]struct{}{}
 	stack := map[string]struct{}{}
-	return m.startUnitWithDependencies(name, started, stack)
+	return m.startUnitWithDependencies(name, started, stack, true)
 }
 
 // expandSocketPath resolves systemd specifiers in a socket ListenStream /
@@ -701,7 +703,7 @@ func (m *Manager) startWithSocketActivation(serviceName, socketName string, rt *
 	defer m.startMu.Unlock()
 	started := map[string]struct{}{}
 	stack := map[string]struct{}{}
-	return m.startUnitWithDependencies(serviceName, started, stack)
+	return m.startUnitWithDependencies(serviceName, started, stack, false)
 }
 
 func (m *Manager) stopSocketUnit(name string) error {
@@ -749,7 +751,7 @@ func (m *Manager) IsSocketActive(name string) bool {
 	return false
 }
 
-func (m *Manager) startUnitWithDependencies(name string, started map[string]struct{}, stack map[string]struct{}) error {
+func (m *Manager) startUnitWithDependencies(name string, started map[string]struct{}, stack map[string]struct{}, waitForJob bool) error {
 	if _, ok := started[name]; ok {
 		return nil
 	}
@@ -808,14 +810,18 @@ func (m *Manager) startUnitWithDependencies(name string, started map[string]stru
 	}
 
 	deps := m.collectDependencies(unit)
-	if err := m.startDependencies(unit, deps, started, stack); err != nil {
+	if err := m.startDependencies(unit, deps, started, stack, waitForJob); err != nil {
 		unit.MarkFailed(err.Error())
 		delete(stack, name)
 		return err
 	}
 
-	token, err := unit.Start()
+	token, err := unit.StartAndWait(waitForJob)
 	if err != nil {
+		// The failure was previously visible only asynchronously, so the
+		// restart policy still has to be armed: Restart=on-failure must keep
+		// retrying a unit whose exec was refused, exactly as before.
+		m.applyRestartPolicy(unit, token)
 		delete(stack, name)
 		return err
 	}
@@ -849,7 +855,7 @@ func (m *Manager) StartEnabledUnits() error {
 	ordered := m.orderUnitsByAfter(units)
 	started := map[string]struct{}{}
 	for _, unit := range ordered {
-		if err := m.startUnitWithDependencies(unit.GetConfig().Name, started, map[string]struct{}{}); err != nil {
+		if err := m.startUnitWithDependencies(unit.GetConfig().Name, started, map[string]struct{}{}, false); err != nil {
 			unit.Log(logging.LevelError, fmt.Sprintf("Failed to start enabled unit: %v", err))
 		}
 	}
@@ -893,7 +899,7 @@ func (m *Manager) collectDependencies(unit *service.Unit) []dependency {
 	return deps
 }
 
-func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, started map[string]struct{}, stack map[string]struct{}) error {
+func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, started map[string]struct{}, stack map[string]struct{}, waitForJob bool) error {
 	if len(deps) == 0 {
 		return nil
 	}
@@ -937,7 +943,7 @@ func (m *Manager) startDependencies(unit *service.Unit, deps []dependency, start
 	ordered := m.orderUnitsByAfter(depUnits)
 	for _, depUnit := range ordered {
 		meta := depMeta[depUnit.GetConfig().Name]
-		if err := m.startUnitWithDependencies(depUnit.GetConfig().Name, started, stack); err != nil {
+		if err := m.startUnitWithDependencies(depUnit.GetConfig().Name, started, stack, waitForJob); err != nil {
 			if meta.required {
 				return fmt.Errorf("required unit %s failed: %w", depUnit.GetConfig().Name, err)
 			}
@@ -1088,12 +1094,13 @@ func (m *Manager) RestartUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	if err := unit.Stop(unit.StopTimeout()); err != nil {
+	if err := unit.AdmitStart(); err != nil {
 		return err
 	}
-	// Restarts consume the same StartLimit budget as starts; otherwise
-	// repeated `systemctl restart` bypasses the storm guard entirely.
-	if err := unit.AdmitStart(); err != nil {
+	// Tell the stop that it is part of a restart, so a unit with
+	// RuntimeDirectoryPreserve=restart keeps its /run directory.
+	unit.KeepDirectoriesForRestart()
+	if err := unit.Stop(unit.StopTimeout()); err != nil {
 		return err
 	}
 	_, err = unit.Start()
@@ -1117,6 +1124,42 @@ func (m *Manager) ListUnits() []*service.Unit {
 		units = append(units, unit)
 	}
 	return units
+}
+
+// ManagerProperties answers a unitless `systemctl show`, which reports the
+// supervisor itself rather than a unit: systemd's manager object carries
+// Version/UnitPath/NNames/... and no unit state at all. Only facts this
+// process can vouch for are included. UnitPath is the search path actually
+// used to load units, space separated like upstream, so a caller that scans
+// it finds exactly the directories this manager reads.
+func (m *Manager) ManagerProperties() map[string]string {
+	names := m.ListAllUnitNames()
+	failed := 0
+	for _, unit := range m.ListUnits() {
+		if unit.Snapshot().State == service.StateFailed {
+			failed++
+		}
+	}
+	arch := runtime.GOARCH
+	if arch == "arm64" {
+		arch = "aarch64"
+	}
+	if arch == "amd64" {
+		arch = "x86-64"
+	}
+	return map[string]string{
+		"Version":               build.String(),
+		"Architecture":          arch,
+		"UnitPath":              strings.Join(m.SearchPaths, " "),
+		"NNames":                strconv.Itoa(len(names)),
+		"NFailedUnits":          strconv.Itoa(failed),
+		"NJobs":                 "0",
+		"LogLevel":              "info",
+		"LogTarget":             "journal",
+		"DefaultStandardOutput": "journal",
+		"DefaultStandardError":  "inherit",
+		"SystemState":           m.SystemState(),
+	}
 }
 
 func (m *Manager) ListAllUnitNames() []string {
@@ -1254,6 +1297,7 @@ func (m *Manager) applyRestartPolicy(unit *service.Unit, token int) {
 				unit.Log(logging.LevelError, fmt.Sprintf("Restart failed: %v", err))
 				return
 			}
+			unit.NoteRestart()
 			token = newToken
 		}
 	}()
@@ -1610,6 +1654,17 @@ func (m *Manager) KillUnit(name string, sigStr string) error {
 	return unit.Kill(sig)
 }
 
+// canReload reports systemd's CanReload: a unit is reloadable when it defines
+// ExecReload, since that is the only command initd could run for it.
+func canReload(cfg *parser.Unit) string {
+	for _, cmd := range cfg.Service.ExecReload {
+		if strings.TrimSpace(cmd) != "" {
+			return "yes"
+		}
+	}
+	return "no"
+}
+
 func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 	unit, err := m.FindUnit(name)
 	if err != nil {
@@ -1617,20 +1672,21 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 	}
 	snap := unit.Snapshot()
 	effState, effPID := unit.EffectiveState()
+	activeStr, subStr := service.StatePair(effState, unit.RemainActive())
 	cfg := unit.GetConfig()
 	data := map[string]string{
 		"Id":                    cfg.Name,
 		"Names":                 cfg.Name,
 		"Description":           unit.Description(),
 		"LoadState":             "loaded",
-		"ActiveState":           string(effState),
-		"SubState":              string(effState),
+		"ActiveState":           activeStr,
+		"SubState":              subStr,
 		"FragmentPath":          unit.Path,
 		"UnitFileState":         m.UnitFileState(cfg.Name),
 		"MainPID":               fmt.Sprintf("%d", effPID),
-		"ExecMainPID":           fmt.Sprintf("%d", effPID),
+		"ExecMainPID":           fmt.Sprintf("%d", snap.ExecMainPID),
 		"ExitCode":              fmt.Sprintf("%d", snap.ExitCode),
-		"Result":                snap.LastError,
+		"Result":                snap.Result,
 		"Type":                  cfg.Service.Type,
 		"RemainAfterExit":       cfg.Service.RemainAfterExit,
 		"SourcePath":            cfg.GeneratedFrom,
@@ -1649,22 +1705,34 @@ func (m *Manager) ShowUnit(name string) (map[string]string, error) {
 		"RestartSec":            cfg.Service.RestartSec,
 		"StartLimitIntervalSec": cfg.StartLimitIntervalSec,
 		"StartLimitBurst":       cfg.StartLimitBurst,
+		// Clients probe capability before issuing an action; omitting these
+		// makes them guess, so report them like systemd does.
+		"CanStart":       "yes",
+		"CanStop":        "yes",
+		"CanRestart":     "yes",
+		"CanReload":      canReload(cfg),
+		"CanFreeze":      "yes",
+		"NRestarts":      fmt.Sprintf("%d", unit.NRestarts()),
+		"ExecMainStatus": fmt.Sprintf("%d", snap.ExitCode),
+		"ExecMainCode":   fmt.Sprintf("%d", snap.MainCode),
+		"Following":      "",
+		"JobId":          "0",
+		"JobType":        "",
+		"JobPath":        "/",
 	}
 	if notes := unit.IgnoredSecurityNotes(); len(notes) > 0 {
 		data["IgnoredDirectives"] = strings.Join(notes, "; ")
+	}
+	if data["Result"] == "" {
+		data["Result"] = "success"
 	}
 	if effState == service.StateActive && snap.State != service.StateActive && effPID > 0 {
 		// Externally started (SysV / nohup / manual). Keep Result for
 		// compat but surface the external PID so `systemctl status`
 		// shows Main PID instead of a misleading inactive.
-		if data["Result"] == "" {
+		if data["Result"] == "success" {
 			data["Result"] = "external-process"
 		}
-	}
-	if unit.RemainActive() {
-		// Oneshot with RemainAfterExit: systemd reports SubState=exited
-		// to distinguish "active (exited)" from a running process.
-		data["SubState"] = string(unit.SubState())
 	}
 	if !snap.StartedAt.IsZero() {
 		data["ActiveEnterTimestamp"] = snap.StartedAt.Format(time.RFC3339)
@@ -1697,7 +1765,49 @@ func (m *Manager) UnitFileState(name string) string {
 	if enabled {
 		return "enabled"
 	}
+	// systemd calls a unit without an [Install] section "static": there is no
+	// symlink that could turn it on, it only runs because something pulls it
+	// in. Reporting "disabled" for it advertised an enablement that can never
+	// succeed, and `is-enabled` even exits 0 for those.
+	if !m.unitHasInstallSection(name) {
+		return "static"
+	}
 	return "disabled"
+}
+
+// IsEnabledState is the `is-enabled` answer for any name, including one with
+// no fragment anywhere: systemd reports that as the state "not-found" on
+// stdout (and exits 4), not as an error. An existing unit reports its normal
+// UnitFileState.
+func (m *Manager) IsEnabledState(name string) string {
+	if _, err := m.IsEnabled(name); err != nil {
+		return "not-found"
+	}
+	return m.UnitFileState(name)
+}
+
+// unitHasInstallSection looks for enablement information in the loaded unit,
+// falling back to the fragment on disk for a unit that was never loaded.
+func (m *Manager) unitHasInstallSection(name string) bool {
+	m.mu.Lock()
+	unit := m.Units[name]
+	m.mu.Unlock()
+	if unit != nil {
+		install := unit.GetConfig().Install
+		return len(install.WantedBy) > 0 || len(install.Alias) > 0
+	}
+	for _, dir := range m.SearchPaths {
+		path := filepath.Join(dir, name)
+		if fi, err := os.Stat(path); err != nil || fi.IsDir() {
+			continue
+		}
+		config, err := parser.ParseUnit(path)
+		if err != nil {
+			return false
+		}
+		return len(config.Install.WantedBy) > 0 || len(config.Install.Alias) > 0
+	}
+	return false
 }
 
 func parseKillSignal(raw string) syscall.Signal {
@@ -1851,8 +1961,10 @@ func (m *Manager) ShowSocketUnit(name string) (map[string]string, error) {
 		return nil, fmt.Errorf("unit %s not found", name)
 	}
 	activeState := "inactive"
+	subState := "inactive"
 	if hasRt && rt.active {
 		activeState = "active"
+		subState = "listening"
 	}
 	data := map[string]string{
 		"Id":             cfg.Name,
@@ -1860,7 +1972,7 @@ func (m *Manager) ShowSocketUnit(name string) (map[string]string, error) {
 		"Description":    cfg.Description,
 		"LoadState":      "loaded",
 		"ActiveState":    activeState,
-		"SubState":       activeState,
+		"SubState":       subState,
 		"FragmentPath":   path,
 		"UnitFileState":  m.UnitFileState(cfg.Name),
 		"Type":           "socket",

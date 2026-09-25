@@ -20,30 +20,30 @@ import (
 )
 
 type Request struct {
-	Action string `json:"action"`
-	Unit   string `json:"unit,omitempty"`
-	Signal string `json:"signal,omitempty"`
-	Now    bool   `json:"now,omitempty"`
-	Lines  int    `json:"lines,omitempty"`
-	LinesPlus bool `json:"lines_plus,omitempty"`
-	Units  []string `json:"units,omitempty"`
-	Boot   string   `json:"boot,omitempty"`
-	Since  int64    `json:"since,omitempty"`
-	Until  int64    `json:"until,omitempty"`
-	Priority int  `json:"priority,omitempty"`
-	PrioritySet bool `json:"priority_set,omitempty"`
-	Grep   string   `json:"grep,omitempty"`
-	CaseSensitive bool `json:"case_sensitive,omitempty"`
-	Identifier string `json:"identifier,omitempty"`
-	Invocation string `json:"invocation,omitempty"`
-	ExcludeIdentifier string `json:"exclude_identifier,omitempty"`
-	LatestInvocation bool `json:"latest_invocation,omitempty"`
-	Cursor string   `json:"cursor,omitempty"`
-	CursorAfter bool `json:"cursor_after,omitempty"`
-	Reverse bool    `json:"reverse,omitempty"`
-	MaxBytes int64 `json:"max_bytes,omitempty"`
-	MaxFiles int   `json:"max_files,omitempty"`
-	MaxDays  int   `json:"max_days,omitempty"`
+	Action            string   `json:"action"`
+	Unit              string   `json:"unit,omitempty"`
+	Signal            string   `json:"signal,omitempty"`
+	Now               bool     `json:"now,omitempty"`
+	Lines             int      `json:"lines,omitempty"`
+	LinesPlus         bool     `json:"lines_plus,omitempty"`
+	Units             []string `json:"units,omitempty"`
+	Boot              string   `json:"boot,omitempty"`
+	Since             int64    `json:"since,omitempty"`
+	Until             int64    `json:"until,omitempty"`
+	Priority          int      `json:"priority,omitempty"`
+	PrioritySet       bool     `json:"priority_set,omitempty"`
+	Grep              string   `json:"grep,omitempty"`
+	CaseSensitive     bool     `json:"case_sensitive,omitempty"`
+	Identifier        string   `json:"identifier,omitempty"`
+	Invocation        string   `json:"invocation,omitempty"`
+	ExcludeIdentifier string   `json:"exclude_identifier,omitempty"`
+	LatestInvocation  bool     `json:"latest_invocation,omitempty"`
+	Cursor            string   `json:"cursor,omitempty"`
+	CursorAfter       bool     `json:"cursor_after,omitempty"`
+	Reverse           bool     `json:"reverse,omitempty"`
+	MaxBytes          int64    `json:"max_bytes,omitempty"`
+	MaxFiles          int      `json:"max_files,omitempty"`
+	MaxDays           int      `json:"max_days,omitempty"`
 }
 
 type Response struct {
@@ -65,13 +65,40 @@ type StatusData struct {
 	LastError           string        `json:"last_error"`
 	Warnings            []string      `json:"warnings,omitempty"`
 	Logs                []string      `json:"logs"`
+	// FragmentPath is where the unit was loaded from, empty for a transient
+	// unit. `systemctl status` prints it inside the Loaded: line.
+	FragmentPath string `json:"fragment_path,omitempty"`
+	// Result, MainCode and ExitCode are systemd's Result, ExecMainCode and
+	// ExecMainStatus, which the failed/inactive status lines are built from.
+	Result   string `json:"result,omitempty"`
+	MainCode int    `json:"main_code,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
+	// ExecMainPID is the PID the main process had. MainPID is zero once it
+	// was reaped; systemd keeps showing this one in the Process: line.
+	ExecMainPID int `json:"exec_main_pid,omitempty"`
+	// ExecStart is the unit's main command line, shown as the Process: line
+	// once it has run.
+	ExecStart string `json:"exec_start,omitempty"`
+}
+
+// firstExecStart is the unit's main command line, which systemd echoes
+// verbatim in the Process: status line.
+func firstExecStart(unit *service.Unit) string {
+	config := unit.GetConfig()
+	if config == nil {
+		return ""
+	}
+	return config.Service.ExecStart
 }
 
 type UnitData struct {
 	Name        string        `json:"name"`
 	Description string        `json:"description"`
 	State       service.State `json:"state"`
-	Type        string        `json:"type"`
+	// SubState is systemd's second state axis (running/exited/dead/...),
+	// which `list-units` prints as its own column and filters match on.
+	SubState string `json:"sub_state,omitempty"`
+	Type     string `json:"type"`
 }
 
 type UnitFileData struct {
@@ -117,6 +144,19 @@ func serveConn(conn net.Conn, manager *supervisor.Manager) {
 	}
 }
 
+// socketHasListener reports whether a live supervisor is accepting
+// connections at path. connect(2) on AF_UNIX succeeds against a listening
+// socket without exchanging a byte, and fails immediately for a leftover
+// file whose owner is gone.
+func socketHasListener(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 250*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func Serve(socketPath string, manager *supervisor.Manager) error {
 	if strings.HasPrefix(socketPath, "@") {
 		addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(socketPath, "@"), Net: "unix"}
@@ -145,6 +185,15 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 			_ = os.MkdirAll(dir, perm)
 		}
 	}
+	if st, err := os.Stat(socketPath); err == nil && st.Mode()&os.ModeSocket != 0 && socketHasListener(socketPath) {
+		// Deleting the path here would hide a live supervisor without stopping
+		// it: the listener keeps working for already-connected clients while
+		// every new `systemctl` sees "no such file or directory". Leave the
+		// owner in place and let the caller's retry loop report it.
+		return fmt.Errorf("%s is held by a live listener", socketPath)
+	}
+	// A stale socket (file present, nobody listening) must be removed or the
+	// bind below fails with EADDRINUSE forever.
 	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -308,6 +357,12 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 				LastError:           lastErr,
 				Warnings:            unit.IgnoredSecurityNotes(),
 				Logs:                logLines,
+				FragmentPath:        unit.Path,
+				Result:              snapshot.Result,
+				MainCode:            snapshot.MainCode,
+				ExitCode:            snapshot.ExitCode,
+				ExecMainPID:         snapshot.ExecMainPID,
+				ExecStart:           firstExecStart(unit),
 			}}
 		}
 		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
@@ -340,7 +395,8 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 			if unit.GetConfig() != nil {
 				utype = unit.GetConfig().Type
 			}
-			data = append(data, UnitData{Name: unit.GetConfig().Name, Description: unit.Description(), State: effState, Type: utype})
+			_, sub := service.StatePair(effState, unit.RemainActive())
+			data = append(data, UnitData{Name: unit.GetConfig().Name, Description: unit.Description(), State: effState, SubState: sub, Type: utype})
 		}
 		for _, name := range manager.SocketUnitNames() {
 			state, _ := manager.SocketActiveState(name)
@@ -352,7 +408,11 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 					desc = name
 				}
 			}
-			data = append(data, UnitData{Name: name, Description: desc, State: service.State(state), Type: "socket"})
+			sub := "inactive"
+			if state == "active" {
+				sub = "listening"
+			}
+			data = append(data, UnitData{Name: name, Description: desc, State: service.State(state), SubState: sub, Type: "socket"})
 		}
 		return Response{Success: true, Data: data}
 	case "list-unit-files":
@@ -389,17 +449,9 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "is-enabled":
-		if manager.IsMasked(req.Unit) {
-			return Response{Success: true, Data: "masked"}
-		}
-		enabled, err := manager.IsEnabled(req.Unit)
-		if err != nil {
-			return Response{Success: false, Message: err.Error()}
-		}
-		if enabled {
-			return Response{Success: true, Data: "enabled"}
-		}
-		return Response{Success: true, Data: "disabled"}
+		// systemd answers with a state (including "not-found") rather than an
+		// error, and lets the client turn "not-found" into exit code 4.
+		return Response{Success: true, Data: manager.IsEnabledState(req.Unit)}
 	case "is-failed":
 		state, err := manager.UnitState(req.Unit)
 		if err != nil {
@@ -412,6 +464,13 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "show":
+		// A unitless show is the manager's own property set. Answering it with
+		// "unit not found" made `systemctl show -p UnitPath` fail against a
+		// live supervisor, so callers that locate unit files through the load
+		// path gave up instead of finding nothing.
+		if strings.TrimSpace(req.Unit) == "" {
+			return Response{Success: true, Data: manager.ManagerProperties()}
+		}
 		if data, err := manager.ShowUnit(req.Unit); err == nil {
 			return Response{Success: true, Data: data}
 		}
@@ -457,22 +516,22 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 	case "journal":
 		filter := logging.JournalFilter{
 			Units:             req.Units,
-			BootID:           req.Boot,
-			SinceUsec:        req.Since,
-			UntilUsec:        req.Until,
-			PriorityMax:      req.Priority,
-			PrioritySet:      req.PrioritySet,
-			Grep:             req.Grep,
-			CaseSensitive:    req.CaseSensitive,
-			Identifier:       req.Identifier,
-			Invocation:       req.Invocation,
+			BootID:            req.Boot,
+			SinceUsec:         req.Since,
+			UntilUsec:         req.Until,
+			PriorityMax:       req.Priority,
+			PrioritySet:       req.PrioritySet,
+			Grep:              req.Grep,
+			CaseSensitive:     req.CaseSensitive,
+			Identifier:        req.Identifier,
+			Invocation:        req.Invocation,
 			ExcludeIdentifier: req.ExcludeIdentifier,
 			LatestInvocation:  req.LatestInvocation,
-			Cursor:           req.Cursor,
-			CursorAfter:      req.CursorAfter,
+			Cursor:            req.Cursor,
+			CursorAfter:       req.CursorAfter,
 			Lines:             req.Lines,
 			LinesPlus:         req.LinesPlus,
-			Reverse:          req.Reverse,
+			Reverse:           req.Reverse,
 		}
 		// Bounded head-after-cursor queries stream file-by-file and stop
 		// at the limit, so listing a huge journal never loads it whole.

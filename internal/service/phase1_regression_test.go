@@ -65,7 +65,7 @@ func TestRuntimeDirectoryTrailingSlash(t *testing.T) {
 	u := NewUnit(&parser.Unit{Name: "x.service"}, "")
 	for _, n := range []string{"foo/", "./bar", "a//b", "trailing-slash-test-xyz/"} {
 		base := t.TempDir()
-		if err := u.ensureNamedDirectories(base, []string{n}, "0755"); err != nil {
+		if _, err := u.ensureNamedDirectories(base, []string{n}, "0755"); err != nil {
 			t.Fatalf("harmless form %q should be accepted, got %v", n, err)
 		}
 	}

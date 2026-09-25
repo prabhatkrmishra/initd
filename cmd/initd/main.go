@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"initd/internal/boot"
+	"initd/internal/build"
 	"initd/internal/dbus"
 	"initd/internal/ipc"
 	"initd/internal/logging"
@@ -22,7 +23,7 @@ import (
 	"time"
 )
 
-const initdVersion = "1.1.0"
+var initdVersion = build.String()
 
 func main() {
 	cfg, err := parseArgs(os.Args[1:])
@@ -56,12 +57,9 @@ func main() {
 		}
 		os.Exit(0)
 	}
-	if cfg.pidFile != "" {
-		if err := writePidFile(cfg.pidFile); err != nil {
-			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "pid file %s: %v", cfg.pidFile, err)
-			os.Exit(1)
-		}
-	}
+	// The pid file is written once this process has won the singleton race
+	// (see below): writing it here let a losing instance repoint the file at
+	// a process that supervises nothing.
 
 	signals := make(chan os.Signal, 16)
 
@@ -150,59 +148,92 @@ func main() {
 	}
 
 	// Singleton for the user manager: same user logging in many times must
-	// not create duplicate daemons/sockets. Use a flock on a per-user lock
-	// file and probe the socket to handle stale files.
+	// not create duplicate daemons/sockets.
+	//
+	// The flock is the only authority. LOCK_EX|LOCK_NB is released by the
+	// kernel the instant its holder dies, so a refused acquisition always
+	// means a *live* daemon owns this uid - and that instance has to stand
+	// down rather than supervise a second copy of the same units. Probing
+	// the socket instead (and deleting it when the probe failed) used to
+	// unlink a listening peer's path during a restart, leaving the uid with
+	// no reachable supervisor while its units kept running under a daemon
+	// nobody could talk to.
 	var userLock *os.File
-	startUserManager := func(path string, mgr *supervisor.Manager) {
-		if lock, err := userpaths.AcquireUserLock(); err == nil {
-			userLock = lock
-			go serveManager(path, mgr)
-			return
-		}
-		if userpaths.IsUserDaemonRunning() {
+	startUserManager := func(path string, mgr *supervisor.Manager) bool {
+		lock, err := userpaths.AcquireUserLock()
+		if err != nil {
 			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-				"user daemon already running at %s - skipping", path)
-			return
+				"user daemon already owns %s (%v) - not starting a second supervisor", path, err)
+			return false
 		}
-		// Stale socket/lock - clean up and try once more.
-		_ = os.Remove(path)
-		if lock, err := userpaths.AcquireUserLock(); err == nil {
-			userLock = lock
-			go serveManager(path, mgr)
-		} else {
-			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-				"failed to acquire user lock for %s: %v", path, err)
-		}
+		userLock = lock
+		go serveManager(path, mgr)
+		return true
 	}
 
 	// Singleton for the system manager too — two concurrent `initd --init`
 	// invocations (e.g. two logins racing) must not both bind /run/initd.sock.
 	var systemLock *os.File
-	startSystemManager := func(path string, mgr *supervisor.Manager) {
-		if lock, err := userpaths.AcquireSystemLock(); err == nil {
-			systemLock = lock
-			go serveManager(path, mgr)
-			return
-		}
-		if userpaths.IsSystemDaemonRunning() {
+	startSystemManager := func(path string, mgr *supervisor.Manager) bool {
+		lock, err := userpaths.AcquireSystemLock()
+		if err != nil {
 			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-				"system daemon already running at %s - skipping", path)
-			return
+				"system daemon already owns %s (%v) - not starting a second supervisor", path, err)
+			return false
 		}
-		_ = os.Remove(path)
-		if lock, err := userpaths.AcquireSystemLock(); err == nil {
-			systemLock = lock
-			go serveManager(path, mgr)
-		} else {
-			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-				"failed to acquire system lock for %s: %v", path, err)
-		}
+		systemLock = lock
+		go serveManager(path, mgr)
+		return true
 	}
 
-	startSystemManager(socketPath, systemManager)
+	// Which manager owns the requested socket is decided by the socket's
+	// identity: binding systemManager at the user socket answered user-scope
+	// requests from the system unit dirs while the D-Bus path served user
+	// units - one daemon giving two different answers per transport.
+	primaryIsUser := primaryIsUserSocket(socketPath)
+	primaryServes := false
+	if primaryIsUser {
+		primaryServes = startUserManager(socketPath, userManager)
+	} else {
+		primaryServes = startSystemManager(socketPath, systemManager)
+	}
 	userSocket := userpaths.UserSocketPath()
-	if userSocket != socketPath {
+	if !primaryIsUser && userSocket != socketPath {
+		// A system daemon also serves its own uid's user socket; losing that
+		// race is not fatal - that uid's own daemon keeps running.
 		startUserManager(userSocket, userManager)
+	}
+	if !primaryServes && os.Getpid() != 1 {
+		// Another daemon owns the transport this instance was asked to
+		// serve. Staying alive would mean a second supervisor plus an idle
+		// process that outlives its socket, so hand the uid back to the
+		// daemon that already has it. PID 1 must never exit here.
+		if userLock != nil {
+			_ = userLock.Close()
+		}
+		if systemLock != nil {
+			_ = systemLock.Close()
+		}
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"leaving %s to the daemon that already owns it", socketPath)
+		// exitHandedOff is the private signal `--daemonize` uses to tell its
+		// launcher that the supervisor the caller asked for is already up;
+		// an interactive invocation just exits 0 like any idempotent start.
+		if os.Getenv("INITD_DAEMONIZED") == "1" {
+			os.Exit(exitHandedOff)
+		}
+		os.Exit(0)
+	}
+	// The pid file names the daemon a restart script signals, so it is only
+	// written once this process has won the singleton race: an instance that
+	// is about to exit must not overwrite the live supervisor's pid file.
+	if cfg.pidFile != "" {
+		if err := writePidFile(cfg.pidFile); err != nil {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "pid file %s: %v", cfg.pidFile, err)
+			if os.Getpid() != 1 {
+				os.Exit(1)
+			}
+		}
 	}
 	// Hold the locks for the lifetime of the daemon.
 	if userLock != nil {
@@ -308,6 +339,14 @@ func main() {
 		shutdownDaemon(sigName(sig), stopServe, stopDBus, socketPath, userSocket, userLock, systemLock, systemManager, userManager, cfg.pidFile)
 	}
 
+}
+
+// primaryIsUserSocket reports whether the daemon's requested socket is the one
+// `systemctl --user` connects to. That socket must carry the user manager:
+// binding the system manager there made user-scope requests answer from the
+// system unit dirs while the D-Bus path answered from user units.
+func primaryIsUserSocket(socketPath string) bool {
+	return socketPath == userpaths.UserSocketPath()
 }
 
 // sigName renders a signal for shutdown logging.
@@ -455,6 +494,11 @@ func runtimeDir() string {
 func defaultPidFile() string { return filepath.Join(runtimeDir(), "initd.pid") }
 func defaultLogFile() string { return filepath.Join(runtimeDir(), "initd-daemon.log") }
 
+// exitHandedOff is the status a --daemonize child exits with when another
+// daemon already owns the socket it was asked to serve: the launcher's goal
+// (a supervisor running for this uid) is already met.
+const exitHandedOff = 3
+
 // spawnDetached re-executes this binary without --daemonize in a new session
 // (setsid) with stdio wired to the log file, then waits for the child to
 // record its pid file. The parent exits 0 once the child is up; startup
@@ -487,11 +531,18 @@ func spawnDetached(cfg daemonConfig) error {
 		}
 		childArgs = append(childArgs, a)
 	}
-	// The child starts with Dir=/, where a relative argv[0] no longer
-	// resolves. Anchor it so detaching works from any cwd.
-	bin := os.Args[0]
-	if abs, err := filepath.Abs(bin); err == nil {
-		bin = abs
+	// The child starts with Dir=/, so a bare argv[0] must be resolved before
+	// the exec. /proc/self/exe is authoritative; resolving "initd" against the
+	// login cwd instead can name an unrelated file (the source tree at
+	// ~/initd) and fail --daemonize with EACCES.
+	bin, err := os.Executable()
+	if err != nil {
+		bin = os.Args[0]
+		if found, lookErr := exec.LookPath(bin); lookErr == nil {
+			bin = found
+		} else if abs, absErr := filepath.Abs(bin); absErr == nil {
+			bin = abs
+		}
 	}
 	cmd := exec.Command(bin, childArgs...)
 	cmd.Env = append(os.Environ(), "INITD_DAEMONIZED=1")
@@ -514,14 +565,32 @@ func spawnDetached(cfg daemonConfig) error {
 		if childWrotePidFile(pidPath, cmd.Process.Pid) {
 			return nil
 		}
-		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			return fmt.Errorf("child exited before writing %s", pidPath)
+		if status, exited := pollChildExit(cmd.Process.Pid); exited {
+			if status == exitHandedOff {
+				// The socket belongs to a daemon that is already running, so
+				// the state --daemonize was asked to produce holds.
+				return nil
+			}
+			return fmt.Errorf("child exited with status %d before writing %s", status, pidPath)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for %s", pidPath)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// pollChildExit reaps the detached child when it has already exited and
+// reports its status. kill(pid,0) still succeeds on the zombie, so checking
+// for liveness alone kept the launcher polling for the whole deadline after an
+// instance that handed the socket over.
+func pollChildExit(pid int) (int, bool) {
+	var ws syscall.WaitStatus
+	done, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+	if err != nil || done != pid {
+		return 0, false
+	}
+	return ws.ExitStatus(), true
 }
 
 // dirModeFor keeps per-user runtime dirs private: /run/user/* and the

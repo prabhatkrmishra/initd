@@ -75,19 +75,19 @@ func formatOne(e logging.StoredEntry, prev *logging.StoredEntry, mode string, ut
 	case "short-delta":
 		return fmt.Sprintf("[%s%s] %s[%d]: %s", monoString(e), deltaString(prev, e), e.Identifier, e.PID, e.Message)
 	case "short-precise":
-			return fmt.Sprintf("%s %s[%d]: %s", wallString(e, utc, true), e.Identifier, e.PID, e.Message)
+		return fmt.Sprintf("%s %s[%d]: %s", wallString(e, utc, true), e.Identifier, e.PID, e.Message)
 	case "short-iso", "short-iso-precise":
-			return fmt.Sprintf("%s %s[%d]: %s", isoString(e, utc), e.Identifier, e.PID, e.Message)
+		return fmt.Sprintf("%s %s[%d]: %s", isoString(e, utc), e.Identifier, e.PID, e.Message)
 	case "short-full":
-			return fmt.Sprintf("%s %s %s[%d]: %s", wallString(e, utc, false), hostString(e, noHostname), e.Identifier, e.PID, e.Message)
+		return fmt.Sprintf("%s %s %s[%d]: %s", wallString(e, utc, false), hostString(e, noHostname), e.Identifier, e.PID, e.Message)
 	case "with-unit":
-			return fmt.Sprintf("%s %s[%d]: %s (%s)", wallString(e, utc, false), e.Identifier, e.PID, e.Message, e.Unit)
+		return fmt.Sprintf("%s %s[%d]: %s (%s)", wallString(e, utc, false), e.Identifier, e.PID, e.Message, e.Unit)
 	case "verbose":
-			return verboseBlock(e, want, utc)
+		return verboseBlock(e, want, utc)
 	case "export":
-			return exportBlock(e, want)
+		return exportBlock(e, want)
 	case "json", "json-sse", "json-seq":
-			return jsonLine(e, want, false)
+		return jsonLine(e, want, false)
 	case "json-pretty":
 		return jsonLine(e, want, true)
 	default: // short
@@ -191,17 +191,17 @@ func hostString(e logging.StoredEntry, noHostname bool) string {
 // entryMap exposes the journal field names for verbose/export/json.
 func entryMap(e logging.StoredEntry) map[string]string {
 	return map[string]string{
-		"__CURSOR":            e.Cursor,
-		"__REALTIME_TIMESTAMP": fmt.Sprintf("%d", e.RealtimeUsec),
-		"_MONOTONIC_USEC":     fmt.Sprintf("%d", e.MonotonicUsec),
-		"_BOOT_ID":            e.BootID,
-		"_SYSTEMD_UNIT":       e.Unit,
-		"_PID":                fmt.Sprintf("%d", e.PID),
-		"PRIORITY":            fmt.Sprintf("%d", e.Priority),
-		"SYSLOG_IDENTIFIER":   e.Identifier,
+		"__CURSOR":               e.Cursor,
+		"__REALTIME_TIMESTAMP":   fmt.Sprintf("%d", e.RealtimeUsec),
+		"_MONOTONIC_USEC":        fmt.Sprintf("%d", e.MonotonicUsec),
+		"_BOOT_ID":               e.BootID,
+		"_SYSTEMD_UNIT":          e.Unit,
+		"_PID":                   fmt.Sprintf("%d", e.PID),
+		"PRIORITY":               fmt.Sprintf("%d", e.Priority),
+		"SYSLOG_IDENTIFIER":      e.Identifier,
 		"_SYSTEMD_INVOCATION_ID": e.InvocationID,
-		"_HOSTNAME":           e.Hostname,
-		"MESSAGE":             e.Message,
+		"_HOSTNAME":              e.Hostname,
+		"MESSAGE":                e.Message,
 	}
 }
 

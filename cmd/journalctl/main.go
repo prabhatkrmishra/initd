@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"initd/internal/build"
 	"initd/internal/ipc"
 	"initd/internal/logging"
 	"initd/internal/userpaths"
@@ -19,7 +20,7 @@ import (
 	"github.com/google/shlex"
 )
 
-const journalctlVersion = "1.1.0"
+var journalctlVersion = build.String()
 
 func main() {
 	if wantsHelp(os.Args[1:]) {
@@ -67,21 +68,21 @@ func main() {
 		os.Exit(1)
 	}
 	req := ipc.Request{
-		Action:      "journal",
-		Units:       append(append([]string{}, opts.units...), opts.userUnits...),
-		Boot:        boot,
-		Priority:    opts.priority,
-		PrioritySet: opts.prioritySet,
-		Grep:        opts.grep,
-		CaseSensitive: opts.caseSensitive,
-		Identifier:    opts.identifier,
-		Invocation:    opts.invocation,
+		Action:            "journal",
+		Units:             append(append([]string{}, opts.units...), opts.userUnits...),
+		Boot:              boot,
+		Priority:          opts.priority,
+		PrioritySet:       opts.prioritySet,
+		Grep:              opts.grep,
+		CaseSensitive:     opts.caseSensitive,
+		Identifier:        opts.identifier,
+		Invocation:        opts.invocation,
 		ExcludeIdentifier: opts.excludeIdentifier,
-		LatestInvocation: opts.latestInvocation,
-		Cursor:        opts.cursor,
-		Lines:         opts.lines,
-		LinesPlus:     opts.linesPlus,
-		Reverse:       opts.reverse,
+		LatestInvocation:  opts.latestInvocation,
+		Cursor:            opts.cursor,
+		Lines:             opts.lines,
+		LinesPlus:         opts.linesPlus,
+		Reverse:           opts.reverse,
 	}
 	if opts.afterCursor != "" {
 		req.Cursor, req.CursorAfter = opts.afterCursor, true
@@ -374,65 +375,65 @@ func streamUnbounded(req ipc.Request, opts journalOpts, fetch func(ipc.Request) 
 }
 
 type journalOpts struct {
-	units           []string
-	userUnits       []string
-	lines           int
-	linesPlus       bool
-	user            bool
-	system          bool
-	merge           bool
-	socket          string
-	directory       string
-	file            string
-	root            string
-	since           string
-	until           string
-	cursor          string
-	afterCursor     string
-	cursorFile      string
-	showCursor      bool
-	boot            string
-	bootSet         bool
-	bootFailed      bool
-	identifier      string
+	units             []string
+	userUnits         []string
+	lines             int
+	linesPlus         bool
+	user              bool
+	system            bool
+	merge             bool
+	socket            string
+	directory         string
+	file              string
+	root              string
+	since             string
+	until             string
+	cursor            string
+	afterCursor       string
+	cursorFile        string
+	showCursor        bool
+	boot              string
+	bootSet           bool
+	bootFailed        bool
+	identifier        string
 	excludeIdentifier string
-	invocation      string
-	latestInvocation bool
-	priority        int
-	prioritySet     bool
-	priorityRaw     string
-	grep            string
-	caseSensitive   bool
-	caseSet         bool
-	output          string
-	outputFields    string
-	reverse         bool
-	utc             bool
-	noHostname      bool
-	noFull          bool
-	all             bool
-	catalog         bool
-	quiet           bool
-	noPager         bool
-	pagerEnd        bool
-	follow          bool
-	noTail          bool
-	truncateNewline bool
-	dmesg           bool
-	listBoots       bool
-	diskUsage       bool
-	vacuumSize      string
-	vacuumFiles     string
-	vacuumTime      string
-	verify          bool
-	sync            bool
-	flush           bool
-	rotate          bool
-	header          bool
-	listFields      bool
-	field           string
-	listInvocations bool
-	listNamespaces  bool
+	invocation        string
+	latestInvocation  bool
+	priority          int
+	prioritySet       bool
+	priorityRaw       string
+	grep              string
+	caseSensitive     bool
+	caseSet           bool
+	output            string
+	outputFields      string
+	reverse           bool
+	utc               bool
+	noHostname        bool
+	noFull            bool
+	all               bool
+	catalog           bool
+	quiet             bool
+	noPager           bool
+	pagerEnd          bool
+	follow            bool
+	noTail            bool
+	truncateNewline   bool
+	dmesg             bool
+	listBoots         bool
+	diskUsage         bool
+	vacuumSize        string
+	vacuumFiles       string
+	vacuumTime        string
+	verify            bool
+	sync              bool
+	flush             bool
+	rotate            bool
+	header            bool
+	listFields        bool
+	field             string
+	listInvocations   bool
+	listNamespaces    bool
 }
 
 // parseArgs handles the journalctl surface initd supports. Anything outside

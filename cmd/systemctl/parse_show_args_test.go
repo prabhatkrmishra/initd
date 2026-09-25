@@ -4,46 +4,46 @@ import "testing"
 
 func TestParseShowArgs(t *testing.T) {
 	cases := []struct {
-		in            string
-		args          []string
-		wantProps     []string
-		wantValue     bool
-		wantUnits     []string
+		in        string
+		args      []string
+		wantProps []string
+		wantValue bool
+		wantUnits []string
 	}{
 		{
-			in:  "openclaw form: show --property=LoadState --value UNIT",
-			args: []string{"--property=LoadState", "--value", "openclaw-gateway.service"},
-			wantProps:    []string{"LoadState"},
-			wantValue:    true,
-			wantUnits:    []string{"openclaw-gateway.service"},
+			in:        "openclaw form: show --property=LoadState --value UNIT",
+			args:      []string{"--property=LoadState", "--value", "openclaw-gateway.service"},
+			wantProps: []string{"LoadState"},
+			wantValue: true,
+			wantUnits: []string{"openclaw-gateway.service"},
 		},
 		{
-			in:  "no flags",
-			args: []string{"foo.service"},
-			wantProps:    nil,
-			wantValue:    false,
-			wantUnits:    []string{"foo.service"},
+			in:        "no flags",
+			args:      []string{"foo.service"},
+			wantProps: nil,
+			wantValue: false,
+			wantUnits: []string{"foo.service"},
 		},
 		{
-			in:  "comma-separated properties",
-			args: []string{"--property=Id,ActiveState,SubState", "--value", "foo.service"},
-			wantProps:    []string{"Id", "ActiveState", "SubState"},
-			wantValue:    true,
-			wantUnits:    []string{"foo.service"},
+			in:        "comma-separated properties",
+			args:      []string{"--property=Id,ActiveState,SubState", "--value", "foo.service"},
+			wantProps: []string{"Id", "ActiveState", "SubState"},
+			wantValue: true,
+			wantUnits: []string{"foo.service"},
 		},
 		{
-			in:  "unknown flag ignored",
-			args: []string{"--no-pager", "--property=LoadState", "foo.service"},
-			wantProps:    []string{"LoadState"},
-			wantValue:    false,
-			wantUnits:    []string{"foo.service"},
+			in:        "unknown flag ignored",
+			args:      []string{"--no-pager", "--property=LoadState", "foo.service"},
+			wantProps: []string{"LoadState"},
+			wantValue: false,
+			wantUnits: []string{"foo.service"},
 		},
 		{
-			in:  "empty",
-			args: []string{},
-			wantProps:    nil,
-			wantValue:    false,
-			wantUnits:    nil,
+			in:        "empty",
+			args:      []string{},
+			wantProps: nil,
+			wantValue: false,
+			wantUnits: nil,
 		},
 	}
 	for _, c := range cases {

@@ -143,6 +143,33 @@ func UserCacheDir() string {
 	return filepath.Join(UserRuntimeDir(), "cache")
 }
 
+// UserStateBase and UserCacheBase are the roots a *unit's* StateDirectory=,
+// CacheDirectory= and %S/%C/%L specifiers hang off. They deliberately carry
+// no initd segment: systemd puts those directly at $XDG_STATE_HOME/<name>,
+// and a unit that moves from systemd to initd (or runs beside it) must find
+// the state it already wrote.
+func UserStateBase() string {
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return xdg
+	}
+	home := RealHome()
+	if home != "" && home != "/tmp" {
+		return filepath.Join(home, ".local", "state")
+	}
+	return UserRuntimeDir()
+}
+
+func UserCacheBase() string {
+	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
+		return xdg
+	}
+	home := RealHome()
+	if home != "" && home != "/tmp" {
+		return filepath.Join(home, ".cache")
+	}
+	return UserRuntimeDir()
+}
+
 // UserStateDir follows XDG ($XDG_STATE_HOME or ~/.local/state), falling back
 // to the runtime dir when HOME is unavailable (minimal chroots).
 func UserStateDir() string {

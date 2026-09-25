@@ -33,10 +33,20 @@ const (
 )
 
 type Runtime struct {
-	State               State
-	MainPID             int
-	ExitCode            int
-	LastError           string
+	State     State
+	MainPID   int
+	ExitCode  int
+	LastError string
+	// MainCode is systemd's ExecMainCode: 0 never ran, 1 exited, 2 killed by
+	// a signal, 3 dumped core.
+	MainCode int
+	// Result mirrors systemd's unit Result property: a keyword ("success",
+	// "exit-code", "timeout") that scripts read, never the message.
+	Result string
+	// ExecMainPID is systemd's ExecMainPID: the PID the main process *had*.
+	// MainPID goes to 0 the moment the process is reaped so nothing tries to
+	// signal it; this stays for the status lines that report how it ended.
+	ExecMainPID         int
 	StartedAt           time.Time
 	FinishedAt          time.Time
 	StartedAtMonotonic  time.Duration
@@ -59,14 +69,39 @@ type Unit struct {
 	pgid int
 	// failFwdHistory bounds OnFailure forwarding storms (see
 	// allowFailureForward); independent from restartHistory.
-	failFwdHistory   []time.Time
-	startToken       int
-	stopRequested    bool
-	reaper           ExitReaper
-	notifyServer     *notify.Server
+	failFwdHistory []time.Time
+	startToken     int
+	stopRequested  bool
+	// nRestarts counts automatic restarts performed by the manager; manual
+	// starts do not count. Exposed as systemd's NRestarts.
+	nRestarts    int
+	reaper       ExitReaper
+	notifyServer *notify.Server
+	// spawnResult receives the main-process spawn outcome of the start
+	// tagged spawnResultToken, so a synchronous starter (systemctl start)
+	// learns about a refused exec instead of reporting success for a unit
+	// that never ran. nil once the outcome has been delivered.
+	spawnResult      chan error
+	spawnResultToken int
 	socketFiles      []*os.File
 	socketEnv        map[string]string
 	onFailureHandler func(string)
+	// managedDirs records what the last start created under
+	// RuntimeDirectory=/StateDirectory=/... so the stop can undo the /run
+	// half and the exec path can export the same variables systemd does.
+	managedDirs managedDirectories
+	// keepDirsOnStop tells the next Stop that this unit is being restarted,
+	// not brought down, which is how RuntimeDirectoryPreserve=restart is
+	// distinguished from the default.
+	keepDirsOnStop bool
+}
+
+type managedDirectories struct {
+	// runtime lists the absolute RuntimeDirectory= paths to remove on stop.
+	runtime []string
+	// env holds the computed RUNTIME/STATE/CACHE/LOGS/CONFIGURATION_DIRECTORY
+	// assignments in systemd's KEY=value form.
+	env []string
 }
 
 type ExitReaper interface {
@@ -141,6 +176,21 @@ func (u *Unit) supervisedPGID() int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.pgid
+}
+
+// NRestarts reports how many automatic restarts the manager has performed,
+// matching systemd's NRestarts property (manual starts are not counted).
+func (u *Unit) NRestarts() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.nRestarts
+}
+
+// NoteRestart records one performed automatic restart.
+func (u *Unit) NoteRestart() {
+	u.mu.Lock()
+	u.nRestarts++
+	u.mu.Unlock()
 }
 
 // AdmitStart enforces StartLimitBurst for every Manager-driven start path
@@ -290,26 +340,34 @@ func (u *Unit) Start() (int, error) {
 	u.startToken++
 	u.stopRequested = false
 	token := u.startToken
+	u.spawnResult = make(chan error, 1)
+	u.spawnResultToken = token
 	u.Runtime.State = StateActivating
 	u.Runtime.LastError = ""
+	u.Runtime.Result = ""
+	u.Runtime.MainCode = 0
 	u.Runtime.ExitCode = 0
 	u.Runtime.FinishedAt = time.Time{}
 	u.Runtime.FinishedAtMonotonic = 0
 	u.Runtime.StartedAtMonotonic = 0
 	u.Runtime.MainPID = 0
+	u.Runtime.ExecMainPID = 0
 	u.pgid = 0
 	u.mu.Unlock()
 
-	if err := u.checkConditions(); err != nil {
-		u.markFailed(err, false)
-		return token, err
+	if u.checkConditions() {
+		// An unmet Condition= skips the start upstream and the job still
+		// succeeds: failing it here turned a deliberately conditional unit
+		// into a red "failed" entry in status and is-failed.
+		u.skipStart()
+		return token, nil
 	}
 
 	if status, err := u.runExecCondition(); err != nil {
 		u.markFailed(err, false)
 		return token, err
 	} else if status == "skip" {
-		u.transitionState(StateInactive, "")
+		u.skipStart()
 		return token, nil
 	}
 
@@ -362,6 +420,140 @@ func (u *Unit) Start() (int, error) {
 	return token, nil
 }
 
+// spawnResultTimeout bounds how long StartAndWait waits for the spawn
+// outcome. A child either forks/executes within milliseconds or the start is
+// stuck behind a slow ExecStartPre, in which case waiting longer buys nothing
+// that the asynchronous path did not already leave unanswered.
+const spawnResultTimeout = 10 * time.Second
+
+// oneshotWaitTimeout bounds waiting for a oneshot to finish inside
+// StartAndWait, tighter than TimeoutStartSec because manager starts are
+// serialised behind a single mutex.
+const oneshotWaitTimeout = 30 * time.Second
+
+// notifyWaitGrace is added to a notify job's wait so the readiness timer,
+// which fires at TimeoutStartSec and is what records Result=timeout, resolves
+// before StartAndWait gives up and reports a still-activating start as done.
+const notifyWaitGrace = 500 * time.Millisecond
+
+// reportSpawn delivers a start's main-process spawn outcome to a synchronous
+// waiter. Only the first outcome of the current token counts: a spawn that
+// succeeded and later failed on ExecStartPost was already reported as
+// started, exactly as an asynchronous caller observed it before.
+func (u *Unit) reportSpawn(token int, err error) {
+	u.mu.Lock()
+	if u.spawnResult != nil && u.spawnResultToken == token {
+		select {
+		case u.spawnResult <- err:
+		default:
+		}
+		u.spawnResult = nil
+	}
+	u.mu.Unlock()
+}
+
+// StartAndWait starts a unit and reports the outcome the way systemd's start
+// job would:
+//
+//   - Type=simple/idle: the job is complete as soon as the child is forked, so
+//     upstream `systemctl start` answers success even when the exec then fails
+//     with status=203/EXEC. Do the same; the failure still lands in the unit
+//     state, Result and exit status.
+//   - Type=oneshot: the job waits for the process to exit, so a refused exec
+//     AND a non-zero exit are both reported.
+//   - Type=forking/notify/exec: the job waits for activation to begin, which
+//     can never happen after a refused exec, so that is reported.
+//
+// Every wait is bounded: a unit still activating past the window is reported
+// as started, matching the asynchronous path this replaces.
+// StartAndWait starts the unit and, for the service types whose job is not
+// finished at fork+exec, waits for how it ended. waitForJob is false on the
+// paths nobody is watching the answer for - boot and socket activation: a
+// unit with a large TimeoutStartSec would otherwise hold up every start behind
+// the manager's serialising mutex.
+func (u *Unit) StartAndWait(waitForJob bool) (int, error) {
+	token, err := u.Start()
+	if err != nil {
+		return token, err
+	}
+	waitSpawnOutcome := true
+	waitCompletion := false
+	switch u.canonicalServiceType() {
+	case "simple", "idle":
+		waitSpawnOutcome = false
+	case "oneshot", "notify":
+		waitCompletion = true
+	case "forking":
+		// The job is not done when ExecStart returns - only when the daemon
+		// it forked has been adopted (or the guess gave up), so `start` does
+		// not report success over a unit still in "activating" with no PID.
+		waitCompletion = true
+	}
+	if !waitForJob {
+		waitSpawnOutcome, waitCompletion = false, false
+	}
+	if !waitSpawnOutcome {
+		return token, nil
+	}
+	u.mu.Lock()
+	ch, chToken := u.spawnResult, u.spawnResultToken
+	u.mu.Unlock()
+	if ch == nil || chToken != token {
+		return token, nil
+	}
+	select {
+	case spawnErr := <-ch:
+		if spawnErr != nil {
+			// Upstream reports a failed job, not the errno: the reason
+			// belongs to the unit state (LastError / status / journal), and
+			// scripts parse this sentence.
+			return token, u.jobFailureError()
+		}
+	case <-time.After(spawnResultTimeout):
+		return token, nil
+	}
+	if !waitCompletion {
+		return token, nil
+	}
+	// The child ran; a oneshot job is only done once it is gone, and a
+	// notify job once the service says READY. Cap the wait below
+	// TimeoutStartSec because the manager serialises starts behind one
+	// mutex, and one long unit must not freeze `start`.
+	budget := oneshotWaitTimeout
+	if to := u.StartTimeout(); to > 0 && to < budget {
+		budget = to
+	}
+	if u.canonicalServiceType() == "notify" {
+		// waitNotify's own timer is what turns a silent service into
+		// Result=timeout; it fires at StartTimeout, so wait a moment past it
+		// instead of returning success over a unit still in "activating".
+		budget += notifyWaitGrace
+	}
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		switch snap := u.Snapshot(); snap.State {
+		case StateFailed:
+			return token, u.jobFailureError()
+		case StateActive, StateInactive:
+			return token, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return token, nil
+}
+
+// jobFailureError is the sentence upstream `systemctl start` prints when a
+// start job ends failed. The wording keys on the unit's Result keyword: a
+// start that ran out of TimeoutStartSec blames the timeout, everything else
+// blames the control process.
+func (u *Unit) jobFailureError() error {
+	name := u.GetConfig().Name
+	if u.Snapshot().Result == "timeout" {
+		return fmt.Errorf("Job for %s failed because a timeout was exceeded.", name)
+	}
+	return fmt.Errorf("Job for %s failed because the control process exited with error code.", name)
+}
+
 // newInvocationID mints a 128-bit run id like systemd's invocation ids:
 // the kernel uuid when available, else time plus pid (unique per host).
 func newInvocationID() string {
@@ -385,6 +577,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	if err := u.runExecStartPre(token, envMap, envList); err != nil {
 		u.markFailed(err, false)
+		u.reportSpawn(token, err)
 		return
 	}
 	if !u.isCurrentToken(token) {
@@ -393,9 +586,20 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	serviceType := u.canonicalServiceType()
 
+	// A tolerated ("-prefixed") ExecStart failure is not a failed start: the
+	// waiter must see success, as upstream `systemctl start` reports.
+	report := func(err error) {
+		if ignoreFailure {
+			u.reportSpawn(token, nil)
+			return
+		}
+		u.reportSpawn(token, err)
+	}
+
 	cmd, err := u.buildExecCommand(args, commandOptions{})
 	if err != nil {
-		u.markFailed(err, ignoreFailure)
+		u.recordExecFailure(err, ignoreFailure)
+		report(err)
 		return
 	}
 	// Socket activation: pass listening fds if present. The dup'd files
@@ -437,7 +641,9 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 		server, err := notify.Start()
 		if err != nil {
 			closeSocketFiles()
-			u.markFailed(fmt.Errorf("notify socket create failed: %w", err), ignoreFailure)
+			wrapped := fmt.Errorf("notify socket create failed: %w", err)
+			u.markFailed(wrapped, ignoreFailure)
+			report(wrapped)
 			return
 		}
 
@@ -467,7 +673,8 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 
 	if err := cmd.Start(); err != nil {
 		closeSocketFiles()
-		u.markFailed(err, ignoreFailure)
+		u.recordExecFailure(err, ignoreFailure)
+		report(err)
 
 		u.mu.Lock()
 		if u.notifyServer != nil {
@@ -508,6 +715,10 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	u.Runtime.StartedAtMonotonic = logging.MonotonicNow()
 	stdoutLogger.PID = cmd.Process.Pid
 	stderrLogger.PID = cmd.Process.Pid
+	// systemd records ExecMainPID the moment it forks, before the type is
+	// confirmed, so a unit that dies in "activating" still reports how its
+	// process ended. MainPID stays zero until the type is known to be up.
+	u.Runtime.ExecMainPID = cmd.Process.Pid
 
 	if serviceType == "simple" {
 		u.Runtime.State = StateActive
@@ -515,6 +726,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	}
 
 	u.mu.Unlock()
+	report(nil)
 
 	// -------------------------------------------------
 	// Register reaper first (avoid race)
@@ -589,7 +801,7 @@ func (u *Unit) waitForking(token int, envMap map[string]string, envList []string
 
 	// systemd waits for the PIDFile to appear for Type=forking; without cgroups
 	// we treat the PIDFile PID as the main process once it shows up.
-	pid, err := u.waitForPIDFile(timeout, poll)
+	pid, err := u.resolveForkingMainPID(timeout, poll)
 
 	if err != nil {
 		u.markFailed(err, ignoreFailure)
@@ -603,6 +815,7 @@ func (u *Unit) waitForking(token int, envMap map[string]string, envList []string
 	}
 	u.Runtime.State = StateActive
 	u.Runtime.MainPID = pid
+	u.Runtime.ExecMainPID = pid
 	u.Runtime.StartedAt = startedAt
 	u.Runtime.StartedAtMonotonic = startedAtMonotonic
 	u.mu.Unlock()
@@ -644,6 +857,7 @@ func (u *Unit) Stop(timeout time.Duration) error {
 		if runStopPost {
 			_ = u.runExecStopPost()
 		}
+		u.removeManagedRuntimeDirectories()
 	}()
 
 	stopCommand := strings.TrimSpace(u.GetConfig().Service.ExecStop)
@@ -942,6 +1156,18 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 		}
 	}
 
+	// systemd --user always exports XDG_RUNTIME_DIR to its units; a daemon
+	// started outside a login shell (no profile.d run, service launcher,
+	// container init) has no such variable to inherit, and unit commands
+	// then see an empty ${XDG_RUNTIME_DIR}. Guarantee it for the user scope
+	// only: system units do not get it upstream. Applied before
+	// EnvironmentFile=/Environment= so an explicit assignment still wins.
+	if os.Geteuid() != 0 {
+		if envMap["XDG_RUNTIME_DIR"] == "" {
+			envMap["XDG_RUNTIME_DIR"] = userpaths.UserRuntimeDir()
+		}
+	}
+
 	for _, entry := range u.GetConfig().Service.EnvironmentFile {
 		if err := u.loadEnvironmentFile(entry, envMap); err != nil {
 			return nil, nil, err
@@ -970,6 +1196,16 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 			name = strings.TrimSpace(key)
 		}
 		delete(envMap, name)
+	}
+	// Computed last, like systemd: the supervisor decides where a unit's
+	// RuntimeDirectory= and friends live, Environment= cannot redirect them.
+	u.mu.Lock()
+	dirEnv := u.managedDirs.env
+	u.mu.Unlock()
+	for _, assignment := range dirEnv {
+		if key, value, ok := strings.Cut(assignment, "="); ok {
+			envMap[key] = value
+		}
 	}
 	envList := make([]string, 0, len(envMap))
 	for key, value := range envMap {
@@ -1051,6 +1287,43 @@ func (u *Unit) waitForPIDFile(timeout time.Duration, poll time.Duration) (int, e
 	return 0, errors.New("PIDFile not found or process not running")
 }
 
+// resolveForkingMainPID decides which process a Type=forking start left
+// behind. systemd reads it from the unit cgroup; without one, a configured
+// PIDFile is authoritative, and failing that the surviving member of the
+// starter's own process group is the daemon. A daemon that setsid()s out of
+// the group without writing a pid file is invisible to both - which is why
+// SysV scripts on this box ship one.
+func (u *Unit) resolveForkingMainPID(timeout, poll time.Duration) (int, error) {
+	if strings.TrimSpace(u.GetConfig().Service.PIDFile) != "" {
+		return u.waitForPIDFile(timeout, poll)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		u.mu.Lock()
+		starter, pgid := 0, u.pgid
+		if u.Cmd != nil && u.Cmd.Process != nil {
+			starter = u.Cmd.Process.Pid
+		}
+		u.mu.Unlock()
+		if starter == 0 {
+			break
+		}
+		// The daemon is only identifiable once the process that forked it is
+		// gone: until then every member of the group might still be the
+		// starter itself.
+		if !processAlive(starter) {
+			if pid := u.processGroupMemberPID(pgid, starter); pid != 0 {
+				return pid, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(poll)
+	}
+	return 0, errors.New("no process left after the forking start")
+}
+
 func (u *Unit) readPIDFile() (int, error) {
 	path := strings.TrimSpace(u.GetConfig().Service.PIDFile)
 	if path == "" {
@@ -1064,17 +1337,35 @@ func (u *Unit) readPIDFile() (int, error) {
 	return strconv.Atoi(pidStr)
 }
 
+// waitStatusCode maps a wait status onto systemd's ExecMainCode property:
+// 1 = the process exited, 2 = it was killed by a signal, 3 = it dumped core.
+func waitStatusCode(status syscall.WaitStatus) int {
+	switch {
+	case status.CoreDump():
+		return 3
+	case status.Signaled():
+		return 2
+	case status.Exited():
+		return 1
+	}
+	return 0
+}
+
 func (u *Unit) handleExit(token int, err error, ignoreFailure bool, resetActive bool) {
-	exitCode := 0
-	if err != nil {
-		exitCode = 1
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				exitCode = status.ExitStatus()
-			}
+	// A signaled death still arrives here as an *exec.ExitError, and
+	// status.ExitStatus() is -1 for those: route through the wait status so
+	// the signal is reported as 128+sig/killed instead of a bogus -1.
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			u.handleExitStatusForPID(token, 0, status, ignoreFailure, resetActive)
+			return
 		}
 	}
-	u.handleExitCode(token, 0, exitCode, err, ignoreFailure, resetActive)
+	exitCode, mainCode := 0, 0
+	if err != nil {
+		exitCode, mainCode = 1, 1
+	}
+	u.handleExitCode(token, 0, exitCode, mainCode, err, ignoreFailure, resetActive)
 }
 
 func (u *Unit) handleExitStatus(token int, status syscall.WaitStatus, ignoreFailure bool, resetActive bool) {
@@ -1097,10 +1388,10 @@ func (u *Unit) handleExitStatusForPID(token int, watchedPID int, status syscall.
 		err = fmt.Errorf("process exited")
 		exitCode = 1
 	}
-	u.handleExitCode(token, watchedPID, exitCode, err, ignoreFailure, resetActive)
+	u.handleExitCode(token, watchedPID, exitCode, waitStatusCode(status), err, ignoreFailure, resetActive)
 }
 
-func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error, ignoreFailure bool, resetActive bool) {
+func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, mainCode int, err error, ignoreFailure bool, resetActive bool) {
 	serviceType := u.canonicalServiceType()
 	if serviceType == "notify" && watchedPID != 0 && !u.StopRequested() {
 		// Non-blocking adopt check only: the old code waited up to
@@ -1117,6 +1408,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 				}
 				u.Runtime.State = StateActive
 				u.Runtime.MainPID = adoptedPID
+				u.Runtime.ExecMainPID = adoptedPID
 				u.Runtime.ExitCode = 0
 				u.Runtime.LastError = ""
 			}
@@ -1140,6 +1432,11 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		return
 	}
 
+	// Every branch below records how this invocation ended, so the wait code
+	// (exited / killed / dumped) belongs with it: systemd renders the pair as
+	// "code=exited, status=N" and `show -p ExecMainCode` reads it.
+	u.Runtime.MainCode = mainCode
+
 	if u.Runtime.State == StateStopping || u.stopRequested {
 		if u.notifyServer != nil {
 			u.notifyServer.Stop()
@@ -1148,9 +1445,14 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		if resetActive {
 			u.Runtime.MainPID = 0
 		}
+		// A unit that was stopped, rather than one that died, leaves no
+		// execution trace behind: upstream zeroes ExecMainPID/Code/Status on a
+		// clean stop so `show` reads success for an inactive unit.
 		u.Runtime.State = StateInactive
 		u.Runtime.LastError = ""
-		u.Runtime.ExitCode = exitCode
+		u.Runtime.ExitCode = 0
+		u.Runtime.MainCode = 0
+		u.Runtime.ExecMainPID = 0
 		u.Runtime.FinishedAt = time.Now()
 		u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 		u.mu.Unlock()
@@ -1165,6 +1467,7 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 			}
 			u.Runtime.State = StateActive
 			u.Runtime.MainPID = adoptedPID
+			u.Runtime.ExecMainPID = adoptedPID
 			u.Runtime.ExitCode = 0
 			u.Runtime.LastError = ""
 			u.mu.Unlock()
@@ -1236,6 +1539,11 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 				u.Runtime.State = StateInactive
 			}
 			u.Runtime.LastError = ""
+			// A tolerated ("-") failure leaves no trace in the properties:
+			// upstream reads ExecMainCode=0 ExecMainStatus=0 for `-/bin/false`,
+			// not the process's real exit status.
+			exitCode = 0
+			u.Runtime.MainCode = 0
 		} else if u.Runtime.State == StateActive && resetActive {
 			// Simple service that exited with failure -> mark failed so OnFailure triggers
 			u.Runtime.State = StateFailed
@@ -1263,6 +1571,14 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, err error
 		u.Runtime.ExitCode = exitCode
 	}
 
+	// A process that ran and left a non-zero status is an exit-code result;
+	// everything else this point reaches (clean exit, tolerated failure,
+	// RemainAfterExit) reads as success, matching upstream's Result keyword.
+	if err != nil && !ignoreFailure {
+		u.Runtime.Result = "exit-code"
+	} else {
+		u.Runtime.Result = "success"
+	}
 	u.Runtime.FinishedAt = time.Now()
 	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
 
@@ -1358,13 +1674,80 @@ func (u *Unit) Kill(sig syscall.Signal) error {
 	return nil
 }
 
+// expandWithEnv applies systemd's Exec* variable substitution: only a plain
+// $NAME or ${NAME} is a variable, and an unset one expands to the empty
+// string. Anything else - shell constructs like ${NAME:-fallback}, positional
+// parameters, bare dollars - is passed through untouched so the child shell
+// still sees what the unit author wrote. os.Expand used to swallow
+// `${VAR:-default}` whole (its "name" is the entire brace body), which
+// silently deleted default values from unit command lines.
+//
+// $$ is systemd's escape for a literal dollar, matching upstream.
 func expandWithEnv(input string, envMap map[string]string) string {
-	return os.Expand(input, func(key string) string {
-		if value, ok := envMap[key]; ok {
-			return value
+	var out strings.Builder
+	for i := 0; i < len(input); {
+		if input[i] != '$' {
+			out.WriteByte(input[i])
+			i++
+			continue
 		}
-		return ""
-	})
+		if i+1 < len(input) && input[i+1] == '$' {
+			out.WriteByte('$')
+			i += 2
+			continue
+		}
+		if i+1 < len(input) && input[i+1] == '{' {
+			if end := strings.IndexByte(input[i+2:], '}'); end >= 0 {
+				name := input[i+2 : i+2+end]
+				width := end + 3
+				if isEnvVarName(name) {
+					out.WriteString(envMap[name])
+				} else {
+					// Not a plain variable reference: hand it to the shell.
+					out.WriteString(input[i : i+width])
+				}
+				i += width
+				continue
+			}
+			out.WriteString(input[i:])
+			return out.String()
+		}
+		j := i + 1
+		for j < len(input) && isEnvVarByte(input[j], j == i+1) {
+			j++
+		}
+		if j == i+1 {
+			// A lone '$' (or "$/" and friends): not a reference.
+			out.WriteByte('$')
+			i++
+			continue
+		}
+		out.WriteString(envMap[input[i+1:j]])
+		i = j
+	}
+	return out.String()
+}
+
+func isEnvVarByte(c byte, first bool) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c == '_':
+		return true
+	case c >= '0' && c <= '9':
+		return !first
+	}
+	return false
+}
+
+func isEnvVarName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isEnvVarByte(name[i], i == 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func (u *Unit) expandSpecifiers(s string) string {
@@ -1386,6 +1769,9 @@ func (u *Unit) expandSpecifiers(s string) string {
 	}
 	nameWithoutSuffix := strings.TrimSuffix(fullName, ".service")
 	nameWithoutSuffix = strings.TrimSuffix(nameWithoutSuffix, ".socket")
+	// %p is the template prefix: for a non-instanced unit that is the name
+	// without its suffix, which is %N (verified against systemd 259).
+	prefix = strings.TrimSuffix(strings.TrimSuffix(prefix, ".service"), ".socket")
 	// user and home for %u/%h
 	userName := ""
 	homeDir := ""
@@ -1401,6 +1787,14 @@ func (u *Unit) expandSpecifiers(s string) string {
 	s = strings.ReplaceAll(s, "%I", instance)
 	s = strings.ReplaceAll(s, "%u", userName)
 	s = strings.ReplaceAll(s, "%h", homeDir)
+	// Directory specifiers follow the same scope rule as the managed
+	// directories: the daemon's uid decides the base, so %t under a user
+	// manager is /run/user/<uid> and /run under a system one.
+	runBase, stateBase, cacheBase, logsBase, _ := u.directoryBases()
+	s = strings.ReplaceAll(s, "%t", runBase)
+	s = strings.ReplaceAll(s, "%S", stateBase)
+	s = strings.ReplaceAll(s, "%C", cacheBase)
+	s = strings.ReplaceAll(s, "%L", logsBase)
 	s = strings.ReplaceAll(s, "\x00", "%")
 	return s
 }
@@ -1492,8 +1886,52 @@ func (u *Unit) transitionState(next State, reason string) {
 	if reason != "" {
 		u.Runtime.LastError = reason
 	}
+	switch next {
+	case StateFailed:
+		// Upstream keeps Result a keyword; "terminated after timeout" is the
+		// only failure this path invents and it maps to a distinct keyword.
+		if strings.Contains(reason, "timeout") {
+			u.Runtime.Result = "timeout"
+		} else {
+			u.Runtime.Result = "exit-code"
+		}
+	case StateActive:
+		u.Runtime.Result = "success"
+	}
 	u.Runtime.FinishedAt = time.Now()
 	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+}
+
+// skipStart parks a unit that a Condition= or ExecCondition= decided not to
+// run: inactive, no error, and a success result, so it reads the same as a
+// unit that was simply never started rather than as one that failed.
+func (u *Unit) skipStart() {
+	u.transitionState(StateInactive, "")
+	u.mu.Lock()
+	u.Runtime.LastError = ""
+	u.Runtime.Result = "success"
+	u.Runtime.FinishedAt = time.Now()
+	u.Runtime.FinishedAtMonotonic = logging.MonotonicNow()
+	u.mu.Unlock()
+}
+
+// markTimeout fails a unit whose start ran out of TimeoutStartSec. Upstream
+// keeps Result as a keyword and `systemctl start` renders it as "failed
+// because a timeout was exceeded", so reusing markFailed's exit-code default
+// would misreport why the job died.
+func (u *Unit) markTimeout(err error, ignoreFailure bool) {
+	u.markFailed(err, ignoreFailure)
+	if ignoreFailure {
+		return
+	}
+	u.mu.Lock()
+	u.Runtime.Result = "timeout"
+	// The timeout path terminates the process with the stop signal, so
+	// upstream reports it as a signaled death: code=killed with the signal as
+	// the status, not the generic exit-code=1 markFailed left behind.
+	u.Runtime.MainCode = 2
+	u.Runtime.ExitCode = int(u.stopSignal())
+	u.mu.Unlock()
 }
 
 func (u *Unit) markFailed(err error, ignoreFailure bool) {
@@ -1504,6 +1942,7 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 	u.mu.Lock()
 	u.Runtime.State = StateFailed
 	u.Runtime.LastError = err.Error()
+	u.Runtime.Result = "exit-code"
 	u.Runtime.ExitCode = 1
 	u.Runtime.MainPID = 0
 	u.pgid = 0
@@ -1512,91 +1951,188 @@ func (u *Unit) markFailed(err error, ignoreFailure bool) {
 	u.mu.Unlock()
 }
 
-func (u *Unit) ensureRuntimeDirectory() error {
-	runBase, _, _, _, _ := u.directoryBases()
-	return u.ensureNamedDirectories(runBase, u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode)
+// execFailureStatus maps a spawn that never happened onto the exit status
+// systemd invents for it: 200 when the working directory could not be entered,
+// 203 when the program could not be exec'd at all, 216 when the failure is a
+// refused credential switch (User=/Group= as an unprivileged manager).
+// `systemctl status` renders these as "status=200/CHDIR", "status=203/EXEC" and
+// "status=216/GROUP"; scripts key on the number.
+func (u *Unit) execFailureStatus(err error) int {
+	svc := u.GetConfig().Service
+	creds := strings.TrimSpace(svc.User) != "" || strings.TrimSpace(svc.Group) != ""
+	msg := err.Error()
+	// Go performs WorkingDirectory= as a chdir in the child; a failure there
+	// surfaces as an *os.PathError with Op "chdir", distinct from the
+	// "fork/exec" of a missing binary.
+	if strings.Contains(msg, "chdir") {
+		return 200
+	}
+	if creds && (errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
+		strings.Contains(msg, "operation not permitted")) {
+		return 216
+	}
+	return 203
+}
+
+// recordExecFailure is markFailed for a main process that was never spawned,
+// carrying the manager-invented status instead of a generic 1.
+func (u *Unit) recordExecFailure(err error, ignoreFailure bool) {
+	status := u.execFailureStatus(err)
+	u.markFailed(err, ignoreFailure)
+	if ignoreFailure {
+		return
+	}
+	u.mu.Lock()
+	if u.Runtime.State == StateFailed {
+		u.Runtime.ExitCode = status
+		// systemd's helper process is the one that "exits" with the invented
+		// status, so the wait code is a plain exit.
+		u.Runtime.MainCode = 1
+	}
+	u.mu.Unlock()
 }
 
 // directoryBases resolves Runtime/State/Cache/Logs/Configuration roots for
 // the manager scope. System daemons (root) use the FHS paths; anything else
-// is a user manager that cannot create /run or /var/*, so XDG locations are
-// used instead. The daemon UID decides, not per-unit User= (which only
-// affects the child credentials, not where the supervisor may write).
+// is a user manager that cannot create /run or /var/*, so the XDG bases are
+// used instead - the same ones systemd uses, so a unit keeps the state
+// directory it already wrote. The daemon UID decides, not per-unit User=
+// (which only affects the child credentials, not where the supervisor may
+// write).
 func (u *Unit) directoryBases() (run, state, cache, logs, config string) {
 	if os.Geteuid() == 0 {
 		return "/run", "/var/lib", "/var/cache", "/var/log", "/etc"
 	}
-	return userpaths.UserRuntimeDir(), userpaths.UserStateDir(), userpaths.UserCacheDir(), filepath.Join(userpaths.UserStateDir(), "log"), userpaths.UserConfigHome()
+	state = userpaths.UserStateBase()
+	return userpaths.UserRuntimeDir(), state, userpaths.UserCacheBase(), filepath.Join(state, "log"), userpaths.UserConfigHome()
 }
 
 func (u *Unit) ensureManagedDirectories() error {
 	runBase, stateBase, cacheBase, logsBase, configBase := u.directoryBases()
-	if err := u.ensureNamedDirectories(runBase, u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode); err != nil {
+	runtime, err := u.ensureNamedDirectories(runBase, u.GetConfig().Service.RuntimeDirectory, u.GetConfig().Service.RuntimeDirectoryMode)
+	if err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories(stateBase, u.GetConfig().Service.StateDirectory, "0755"); err != nil {
+	state, err := u.ensureNamedDirectories(stateBase, u.GetConfig().Service.StateDirectory, "0755")
+	if err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories(cacheBase, u.GetConfig().Service.CacheDirectory, "0755"); err != nil {
+	cache, err := u.ensureNamedDirectories(cacheBase, u.GetConfig().Service.CacheDirectory, "0755")
+	if err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories(logsBase, u.GetConfig().Service.LogsDirectory, "0755"); err != nil {
+	logs, err := u.ensureNamedDirectories(logsBase, u.GetConfig().Service.LogsDirectory, "0755")
+	if err != nil {
 		return err
 	}
-	if err := u.ensureNamedDirectories(configBase, u.GetConfig().Service.ConfigurationDirectory, "0755"); err != nil {
+	config, err := u.ensureNamedDirectories(configBase, u.GetConfig().Service.ConfigurationDirectory, "0755")
+	if err != nil {
 		return err
 	}
+	// systemd exports these as computed variables after Environment=, so a
+	// unit cannot override where its own directories are. Multiple names are
+	// colon-joined in one value.
+	var env []string
+	for _, entry := range []struct {
+		key   string
+		paths []string
+	}{
+		{"RUNTIME_DIRECTORY", runtime},
+		{"STATE_DIRECTORY", state},
+		{"CACHE_DIRECTORY", cache},
+		{"LOGS_DIRECTORY", logs},
+		{"CONFIGURATION_DIRECTORY", config},
+	} {
+		if len(entry.paths) > 0 {
+			env = append(env, entry.key+"="+strings.Join(entry.paths, ":"))
+		}
+	}
+	u.mu.Lock()
+	u.managedDirs = managedDirectories{runtime: runtime, env: env}
+	u.mu.Unlock()
 	return nil
 }
 
-func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr string) error {
+// removeManagedRuntimeDirectories undoes the /run half of a start. State,
+// cache, logs and configuration directories survive a stop (they are the
+// point of those settings) but runtime ones do not, unless
+// RuntimeDirectoryPreserve=yes asked for them to. A crash is not a stop:
+// systemd leaves the directory of a service that died for its restart to
+// find, and initd does the same.
+func (u *Unit) removeManagedRuntimeDirectories() {
+	u.mu.Lock()
+	paths, keep := u.managedDirs.runtime, u.keepDirsOnStop
+	u.keepDirsOnStop = false
+	u.managedDirs = managedDirectories{}
+	u.mu.Unlock()
+
+	value := strings.TrimSpace(u.GetConfig().Service.RuntimeDirectoryPreserve)
+	if keep || value == "yes" || value == "true" || value == "1" {
+		return
+	}
+	for _, path := range paths {
+		_ = os.RemoveAll(path)
+	}
+}
+
+// KeepDirectoriesForRestart marks the unit as stopped in order to be started
+// again, which is all RuntimeDirectoryPreserve=restart asks for.
+func (u *Unit) KeepDirectoriesForRestart() {
+	u.mu.Lock()
+	u.keepDirsOnStop = true
+	u.mu.Unlock()
+}
+
+func (u *Unit) ensureNamedDirectories(base string, names []string, modeStr string) ([]string, error) {
 	if len(names) == 0 {
-		return nil
+		return nil, nil
 	}
 	mode, err := parseFileMode(modeStr, 0o755)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	creds, err := u.resolveCredentialsForStart(false)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	created := make([]string, 0, len(names))
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
 		if strings.Contains(name, "\\") {
-			return fmt.Errorf("invalid directory name %q", name)
+			return nil, fmt.Errorf("invalid directory name %q", name)
 		}
 		clean := filepath.Clean(name)
 		if filepath.IsAbs(clean) || clean == "." {
-			return fmt.Errorf("invalid directory name %q", name)
+			return nil, fmt.Errorf("invalid directory name %q", name)
 		}
 		if strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") || strings.HasSuffix(clean, "/..") || clean == ".." {
-			return fmt.Errorf("invalid directory name %q", name)
+			return nil, fmt.Errorf("invalid directory name %q", name)
 		}
 		for _, part := range strings.Split(clean, "/") {
 			if part == "." || part == ".." || part == "" {
-				return fmt.Errorf("invalid directory name %q", name)
+				return nil, fmt.Errorf("invalid directory name %q", name)
 			}
 		}
 		// Accept harmless normalizations (trailing slash, ./x, x//y):
 		// validate `clean` and use it for the join.
 		path := filepath.Join(base, clean)
 		if err := os.MkdirAll(path, mode); err != nil {
-			return fmt.Errorf("create directory %s: %w", path, err)
+			return nil, fmt.Errorf("create directory %s: %w", path, err)
 		}
 		if err := os.Chmod(path, mode); err != nil {
-			return err
+			return nil, err
 		}
 		if creds.set {
 			if err := os.Chown(path, int(creds.uid), int(creds.gid)); err != nil {
-				return fmt.Errorf("chown directory %s: %w", path, err)
+				return nil, fmt.Errorf("chown directory %s: %w", path, err)
 			}
 		}
+		created = append(created, path)
 	}
-	return nil
+	return created, nil
 }
 
 func (u *Unit) runExecStartPre(token int, envMap map[string]string, envList []string) error {
@@ -1820,6 +2356,19 @@ func (u *Unit) buildExecCommand(args []string, opts commandOptions) (*exec.Cmd, 
 	if len(args) == 0 {
 		return nil, errors.New("command parsed to empty")
 	}
+	// systemd does not create WorkingDirectory= for a service, and entering a
+	// missing one fails the spawn with 200/CHDIR - distinct from the 203 a
+	// missing binary gets. Go performs the chdir in the child and reports the
+	// resulting errno as a "fork/exec" failure of the program path, so the
+	// distinction is lost at cmd.Start; check it here instead. Skipped under
+	// RootDirectory=, where the path is relative to the chroot.
+	if wd := strings.TrimSpace(u.GetConfig().Service.WorkingDirectory); wd != "" &&
+		strings.TrimSpace(u.GetConfig().Service.RootDirectory) == "" {
+		dir := u.expandSpecifiers(wd)
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			return nil, fmt.Errorf("chdir %s: no such file or directory", dir)
+		}
+	}
 	umask := strings.TrimSpace(u.GetConfig().Service.UMask)
 	limitNOFILE := strings.TrimSpace(u.GetConfig().Service.LimitNOFILE)
 	var cmd *exec.Cmd
@@ -1904,7 +2453,11 @@ func (u *Unit) configureCommand(cmd *exec.Cmd, envList []string, stdoutLogger, s
 	cmd.Stderr = stderrLogger
 }
 
-func (u *Unit) checkConditions() error {
+// checkConditions reports whether any Condition= is unmet. An unmet condition
+// is not a failure upstream: the start is skipped and the unit is left
+// inactive, so this only answers yes/no and lets the caller take the skip
+// path (as ExecCondition's non-zero exit already does).
+func (u *Unit) checkConditions() bool {
 	for _, condition := range u.GetConfig().ConditionPathExists {
 		condition = strings.TrimSpace(condition)
 		if condition == "" {
@@ -1918,10 +2471,11 @@ func (u *Unit) checkConditions() error {
 			exists = !exists
 		}
 		if !exists {
-			return fmt.Errorf("ConditionPathExists=%s failed", condition)
+			u.Log(logging.LevelInfo, fmt.Sprintf("ConditionPathExists=%s was not met, skipping start", condition))
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (u *Unit) killModeProcess() bool {
@@ -2138,14 +2692,36 @@ func (u *Unit) warnIgnoredDirectives(ignored map[string]string) {
 	}
 }
 
+// StatePair maps the internal state machine onto the two axes systemd
+// reports: ActiveState (inactive/activating/active/deactivating/failed) and
+// SubState (dead/start/running/exited/stop/failed). Callers that echo
+// ActiveState into SubState make a running process report "active", so tools
+// filtering on "running"/"exited"/"dead" silently match nothing.
+func StatePair(eff State, remainActive bool) (string, string) {
+	switch eff {
+	case StateActive:
+		if remainActive {
+			// Oneshot kept alive by RemainAfterExit: active, but no process.
+			return "active", "exited"
+		}
+		return "active", "running"
+	case StateActivating:
+		return "activating", "start"
+	case StateStopping:
+		return "deactivating", "stop"
+	case StateFailed:
+		return "failed", "failed"
+	default:
+		return "inactive", "dead"
+	}
+}
+
 // SubState refines Active for display: oneshot units kept alive by
 // RemainAfterExit report "exited" (systemd's active (exited)), everything
 // else mirrors the raw state.
 func (u *Unit) SubState() State {
-	if u.RemainActive() {
-		return State("exited")
-	}
-	return u.Snapshot().State
+	_, sub := StatePair(u.Snapshot().State, u.RemainActive())
+	return State(sub)
 }
 
 // StartLimit reads the unit's StartLimitIntervalSec/StartLimitBurst,
@@ -2448,6 +3024,7 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			u.Runtime.State = StateActive
 			if pid != 0 {
 				u.Runtime.MainPID = pid
+				u.Runtime.ExecMainPID = pid
 			}
 		}
 		u.mu.Unlock()
@@ -2482,38 +3059,17 @@ func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string,
 			return
 		}
 		cmd = u.Cmd
-		pid := u.Runtime.MainPID
-		if pid == 0 {
-			pid = u.notifyMainPID(cmd)
-		}
 		u.mu.Unlock()
 
-		if pid != 0 && processAlive(pid) {
-			u.mu.Lock()
-			if u.startToken == token {
-				u.Runtime.State = StateActive
-				u.Runtime.MainPID = pid
-			}
-			u.mu.Unlock()
-			u.Log(logging.LevelInfo, "Type=notify readiness timed out; falling back to active because process is still running")
-			if u.reaper == nil && cmd != nil {
-				go func() {
-					u.handleExit(token, <-waitCh, ignoreFailure, true)
-				}()
-			}
-			return
-		}
-
+		// A service that never said READY=1 fails: upstream terminates the
+		// process and reports Result=timeout. The previous behaviour marked it
+		// active because the process was still running, which turned a service
+		// with a broken (or absent) notify protocol into a permanently healthy
+		// looking lie - and into a start job that reported success.
 		if cmd != nil && cmd.Process != nil {
 			u.killMainProcess(u.stopSignal())
 		}
-
-		u.markFailed(fmt.Errorf("notify timeout"), ignoreFailure)
-		if u.reaper == nil && cmd != nil {
-			go func() {
-				_ = <-waitCh
-			}()
-		}
+		u.markTimeout(fmt.Errorf("notify timeout"), ignoreFailure)
 		return
 	}
 }

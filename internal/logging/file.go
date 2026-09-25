@@ -17,18 +17,18 @@ import (
 // written in the same microsecond; Cursor is the opaque resume token handed
 // to clients (initd-<seq>-<boot>-<offset>).
 type StoredEntry struct {
-	Seq          uint64 `json:"seq"`
-	Cursor       string `json:"cursor"`
-	RealtimeUsec int64  `json:"__REALTIME_TIMESTAMP"`
-	MonotonicUsec int64 `json:"_MONOTONIC_USEC,omitempty"`
-	BootID       string `json:"_BOOT_ID,omitempty"`
-	Unit         string `json:"_SYSTEMD_UNIT,omitempty"`
-	PID          int    `json:"_PID,omitempty"`
-	Priority     int    `json:"PRIORITY,omitempty"`
-	Identifier   string `json:"SYSLOG_IDENTIFIER,omitempty"`
-	Hostname     string `json:"_HOSTNAME,omitempty"`
-	InvocationID string `json:"_SYSTEMD_INVOCATION_ID,omitempty"`
-	Message      string `json:"MESSAGE"`
+	Seq           uint64 `json:"seq"`
+	Cursor        string `json:"cursor"`
+	RealtimeUsec  int64  `json:"__REALTIME_TIMESTAMP"`
+	MonotonicUsec int64  `json:"_MONOTONIC_USEC,omitempty"`
+	BootID        string `json:"_BOOT_ID,omitempty"`
+	Unit          string `json:"_SYSTEMD_UNIT,omitempty"`
+	PID           int    `json:"_PID,omitempty"`
+	Priority      int    `json:"PRIORITY,omitempty"`
+	Identifier    string `json:"SYSLOG_IDENTIFIER,omitempty"`
+	Hostname      string `json:"_HOSTNAME,omitempty"`
+	InvocationID  string `json:"_SYSTEMD_INVOCATION_ID,omitempty"`
+	Message       string `json:"MESSAGE"`
 }
 
 // FileWriter appends entries as JSONL to one file per boot. It owns rotation
@@ -45,12 +45,12 @@ type FileWriter struct {
 	// vacuums. Zero disables (library default; the daemon opts in).
 	retainFiles int
 	retainBytes int64
-	seq      uint64
-	offset   uint64
-	file     *os.File
-	buf      *bufio.Writer
-	lines    uint64
-	syncedAt time.Time
+	seq         uint64
+	offset      uint64
+	file        *os.File
+	buf         *bufio.Writer
+	lines       uint64
+	syncedAt    time.Time
 }
 
 // DefaultMaxFileBytes caps a single journal file before rotation.
@@ -346,20 +346,43 @@ func (w *FileWriter) Close() error {
 }
 
 // ListFiles returns journal files oldest-first for reads and vacuum.
+//
+// Names are <bootID>.jsonl for the active file and <bootID>-<nanos>.jsonl for
+// a rotation, and a boot ID is a random UUID - so sorting by name has nothing
+// to do with time and can hand a tail query the oldest boot first. Order by
+// mtime, which tracks the last appended entry, and break ties on name so the
+// generations of one boot stay in order.
 func ListFiles(dir string) []string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	var out []string
+	type journalFile struct {
+		path  string
+		mtime time.Time
+	}
+	var out []journalFile
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
-		out = append(out, filepath.Join(dir, e.Name()))
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, journalFile{path: filepath.Join(dir, e.Name()), mtime: info.ModTime()})
 	}
-	sort.Strings(out)
-	return out
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].mtime.Equal(out[j].mtime) {
+			return out[i].mtime.Before(out[j].mtime)
+		}
+		return out[i].path < out[j].path
+	})
+	paths := make([]string, len(out))
+	for i, f := range out {
+		paths[i] = f.path
+	}
+	return paths
 }
 
 // ReadAll streams every well-formed entry from files in order. Torn tail

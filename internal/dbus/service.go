@@ -8,18 +8,20 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 
+	"initd/internal/build"
 	sservice "initd/internal/service"
 	"initd/internal/supervisor"
+	"strconv"
 )
 
 const (
-	managerPathString  = "/org/freedesktop/systemd1"
-	managerBusName     = "org.freedesktop.systemd1"
-	managerInterface   = "org.freedesktop.systemd1.Manager"
-	unitInterface      = "org.freedesktop.systemd1.Unit"
-	serviceInterface   = "org.freedesktop.systemd1.Service"
+	managerPathString   = "/org/freedesktop/systemd1"
+	managerBusName      = "org.freedesktop.systemd1"
+	managerInterface    = "org.freedesktop.systemd1.Manager"
+	unitInterface       = "org.freedesktop.systemd1.Unit"
+	serviceInterface    = "org.freedesktop.systemd1.Service"
 	propertiesInterface = "org.freedesktop.DBus.Properties"
-	unitBasePathString = "/org/freedesktop/systemd1/unit"
+	unitBasePathString  = "/org/freedesktop/systemd1/unit"
 )
 
 var managerPath = dbus.ObjectPath(managerPathString)
@@ -175,7 +177,9 @@ func (m *systemd1Manager) GetUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 // the loaded unit's object path; for a unit that is not loaded it raises
 // org.freedesktop.systemd1.NoSuchUnit with the body "Unit %s not found.". That
 // exact body is what busctl surfaces on stderr as
-//   "Call failed: Unit <name> not found."
+//
+//	"Call failed: Unit <name> not found."
+//
 // and callers such as openclaw match it verbatim to treat the unit as absent.
 // Do not change the message text or the error name without updating that
 // match.
@@ -319,18 +323,14 @@ type listUnitEntry struct {
 	JobPath     dbus.ObjectPath
 }
 
-
-// dbusSubState mirrors systemctl display: oneshot RemainAfterExit reports
-// exited, otherwise the effective state (so SysV-external shows active,
-// matching ipc list-units, instead of inactive from the raw snapshot).
+// dbusSubState mirrors systemctl display: the ListUnits SubState column is the
+// systemd sub-state (running/exited/dead/...), not the raw state name, so that
+// clients filtering on "running" or "exited" see what systemd reports.
 func dbusSubState(u interface {
-	SubState() sservice.State
 	RemainActive() bool
 }, eff sservice.State) sservice.State {
-	if u.RemainActive() {
-		return sservice.State("exited")
-	}
-	return eff
+	_, sub := sservice.StatePair(eff, u.RemainActive())
+	return sservice.State(sub)
 }
 
 func (m *systemd1Manager) ListUnits() ([]listUnitEntry, *dbus.Error) {
@@ -624,42 +624,42 @@ func buildManagerProps(mgr *supervisor.Manager) map[string]map[string]*prop.Prop
 	}
 	sysState := frontend.SystemState()
 	mgrIf := map[string]*prop.Prop{
-		"Version":                     {Value: "1.1.0 (initd)", Writable: false, Emit: prop.EmitConst},
+		"Version":                     {Value: build.String() + " (initd)", Writable: false, Emit: prop.EmitConst},
 		"Features":                    {Value: "", Writable: false, Emit: prop.EmitConst},
 		"Virtualization":              {Value: "", Writable: false, Emit: prop.EmitConst},
-		"ConfidentialVirtualization":    {Value: "", Writable: false, Emit: prop.EmitConst},
-		"Architecture":                  {Value: "aarch64", Writable: false, Emit: prop.EmitConst},
-		"Tainted":                       {Value: "", Writable: false, Emit: prop.EmitConst},
-		"SystemState":                   {Value: sysState, Writable: false, Emit: prop.EmitTrue},
-		"FirmwareTimestamp":             {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"FirmwareTimestampMonotonic":    {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"InitRDTimestamp":               {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"InitRDTimestampMonotonic":      {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"UserspaceTimestamp":            {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"UserspaceTimestampMonotonic":   {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"FinishTimestamp":               {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"FinishTimestampMonotonic":      {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"LogLevel":                      {Value: "info", Writable: false, Emit: prop.EmitTrue},
-		"LogTarget":                     {Value: "journal", Writable: false, Emit: prop.EmitTrue},
-		"NNames":                        {Value: uint32(len(frontend.ListAllUnitNames())), Writable: false, Emit: prop.EmitTrue},
-		"NFailedUnits":                  {Value: countFailed(frontend), Writable: false, Emit: prop.EmitTrue},
-		"NJobs":                         {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"NUnique":                       {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"NInstalledJobs":                {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"NFailedJobs":                   {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
-		"Progress":                      {Value: float64(0), Writable: false, Emit: prop.EmitTrue},
-		"Environment":                   {Value: []string{}, Writable: false, Emit: prop.EmitTrue},
-		"ConfirmSpawn":                  {Value: false, Writable: false, Emit: prop.EmitTrue},
-		"ShowStatus":                    {Value: false, Writable: false, Emit: prop.EmitTrue},
-		"UnitPath":                      {Value: frontend.SearchPaths, Writable: false, Emit: prop.EmitConst},
-		"DefaultStandardOutput":         {Value: "journal", Writable: false, Emit: prop.EmitConst},
-		"DefaultStandardError":          {Value: "inherit", Writable: false, Emit: prop.EmitConst},
-		"RuntimeWatchdogUSec":           {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"RebootWatchdogUSec":            {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"KExecWatchdogUSec":             {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
-		"ServiceWatchdogs":              {Value: false, Writable: false, Emit: prop.EmitConst},
-		"ControlGroup":                  {Value: "", Writable: false, Emit: prop.EmitConst},
-		"ExitCode":                      {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
+		"ConfidentialVirtualization":  {Value: "", Writable: false, Emit: prop.EmitConst},
+		"Architecture":                {Value: "aarch64", Writable: false, Emit: prop.EmitConst},
+		"Tainted":                     {Value: "", Writable: false, Emit: prop.EmitConst},
+		"SystemState":                 {Value: sysState, Writable: false, Emit: prop.EmitTrue},
+		"FirmwareTimestamp":           {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"FirmwareTimestampMonotonic":  {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"InitRDTimestamp":             {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"InitRDTimestampMonotonic":    {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"UserspaceTimestamp":          {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"UserspaceTimestampMonotonic": {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"FinishTimestamp":             {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"FinishTimestampMonotonic":    {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"LogLevel":                    {Value: "info", Writable: false, Emit: prop.EmitTrue},
+		"LogTarget":                   {Value: "journal", Writable: false, Emit: prop.EmitTrue},
+		"NNames":                      {Value: uint32(len(frontend.ListAllUnitNames())), Writable: false, Emit: prop.EmitTrue},
+		"NFailedUnits":                {Value: countFailed(frontend), Writable: false, Emit: prop.EmitTrue},
+		"NJobs":                       {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"NUnique":                     {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"NInstalledJobs":              {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"NFailedJobs":                 {Value: uint32(0), Writable: false, Emit: prop.EmitTrue},
+		"Progress":                    {Value: float64(0), Writable: false, Emit: prop.EmitTrue},
+		"Environment":                 {Value: []string{}, Writable: false, Emit: prop.EmitTrue},
+		"ConfirmSpawn":                {Value: false, Writable: false, Emit: prop.EmitTrue},
+		"ShowStatus":                  {Value: false, Writable: false, Emit: prop.EmitTrue},
+		"UnitPath":                    {Value: frontend.SearchPaths, Writable: false, Emit: prop.EmitConst},
+		"DefaultStandardOutput":       {Value: "journal", Writable: false, Emit: prop.EmitConst},
+		"DefaultStandardError":        {Value: "inherit", Writable: false, Emit: prop.EmitConst},
+		"RuntimeWatchdogUSec":         {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"RebootWatchdogUSec":          {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"KExecWatchdogUSec":           {Value: uint64(0), Writable: false, Emit: prop.EmitConst},
+		"ServiceWatchdogs":            {Value: false, Writable: false, Emit: prop.EmitConst},
+		"ControlGroup":                {Value: "", Writable: false, Emit: prop.EmitConst},
+		"ExitCode":                    {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
 	}
 	return map[string]map[string]*prop.Prop{managerInterface: mgrIf}
 }
@@ -677,6 +677,16 @@ func countFailed(mgr *supervisor.Manager) uint32 {
 // startLimitBurstOf / startLimitIntervalOf report the unit's configured
 // storm guard, defaulting to systemd's 5-in-10s when the unit is unknown
 // or the values don't parse.
+// dbusAtoi reads a numeric property back out of ShowUnit's string map;
+// unparsable (i.e. absent) values report 0 rather than failing the Get.
+func dbusAtoi(raw string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 func startLimitBurstOf(mgr *supervisor.Manager, name string) uint32 {
 	if u, err := mgr.FindUnit(name); err == nil {
 		return u.StartLimitBurstValue()
@@ -720,33 +730,42 @@ func buildUnitProps(mgr *supervisor.Manager, name string) map[string]*prop.Prop 
 			mainPID = uint32(snap.MainPID)
 		}
 	}
+	// Exit and restart counts come from ShowUnit's snapshot: clients that
+	// watch a unit's Result/ExecMainStatus to decide whether a start failed
+	// need real values, not a constant success.
+	mainStatus := int32(dbusAtoi(data["ExecMainStatus"]))
+	nRestarts := uint32(dbusAtoi(data["NRestarts"]))
+	result := data["Result"]
+	if result == "" {
+		result = "success"
+	}
 	return map[string]*prop.Prop{
-		"Id":                      {Value: id, Writable: false, Emit: prop.EmitConst},
-		"Names":                   {Value: []string{id}, Writable: false, Emit: prop.EmitConst},
-		"Description":             {Value: desc, Writable: false, Emit: prop.EmitConst},
-		"LoadState":               {Value: loadState, Writable: false, Emit: prop.EmitTrue},
-		"ActiveState":             {Value: activeState, Writable: false, Emit: prop.EmitTrue},
-		"SubState":                {Value: subState, Writable: false, Emit: prop.EmitTrue},
-		"UnitFileState":           {Value: mgr.UnitFileState(id), Writable: false, Emit: prop.EmitConst},
-		"UnitFilePreset":          {Value: "disabled", Writable: false, Emit: prop.EmitConst},
-		"Result":                  {Value: "", Writable: false, Emit: prop.EmitTrue},
-		"FragmentPath":            {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
-		"DropInPaths":          {Value: []string{}, Writable: false, Emit: prop.EmitConst},
-		"NeedDaemonReload":     {Value: mgr.NeedDaemonReload(), Writable: false, Emit: prop.EmitTrue},
-		"SourcePath":              {Value: "", Writable: false, Emit: prop.EmitConst},
-		"MainPID":                 {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
-		"ExecMainPID":             {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
-		"ExecMainStatus":          {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExecMainCode":            {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
-		"ExitCode":                {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
-		"ExitStatus":              {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
-		"NRestarts":               {Value: uint32(0), Writable: false, Emit: prop.EmitConst},
-		"StartLimitBurst":         {Value: startLimitBurstOf(mgr, name), Writable: false, Emit: prop.EmitTrue},
-		"StartLimitIntervalUSec":  {Value: startLimitIntervalOf(mgr, name), Writable: false, Emit: prop.EmitTrue},
-		"StartLimitAction":        {Value: "none", Writable: false, Emit: prop.EmitConst},
-		"MemoryCurrent":           {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
-		"CPUWeight":               {Value: uint64(100), Writable: false, Emit: prop.EmitTrue},
-		"TasksCurrent":            {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
+		"Id":                     {Value: id, Writable: false, Emit: prop.EmitConst},
+		"Names":                  {Value: []string{id}, Writable: false, Emit: prop.EmitConst},
+		"Description":            {Value: desc, Writable: false, Emit: prop.EmitConst},
+		"LoadState":              {Value: loadState, Writable: false, Emit: prop.EmitTrue},
+		"ActiveState":            {Value: activeState, Writable: false, Emit: prop.EmitTrue},
+		"SubState":               {Value: subState, Writable: false, Emit: prop.EmitTrue},
+		"UnitFileState":          {Value: mgr.UnitFileState(id), Writable: false, Emit: prop.EmitConst},
+		"UnitFilePreset":         {Value: "disabled", Writable: false, Emit: prop.EmitConst},
+		"Result":                 {Value: result, Writable: false, Emit: prop.EmitTrue},
+		"FragmentPath":           {Value: data["FragmentPath"], Writable: false, Emit: prop.EmitConst},
+		"DropInPaths":            {Value: []string{}, Writable: false, Emit: prop.EmitConst},
+		"NeedDaemonReload":       {Value: mgr.NeedDaemonReload(), Writable: false, Emit: prop.EmitTrue},
+		"SourcePath":             {Value: "", Writable: false, Emit: prop.EmitConst},
+		"MainPID":                {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
+		"ExecMainPID":            {Value: mainPID, Writable: false, Emit: prop.EmitTrue},
+		"ExecMainStatus":         {Value: mainStatus, Writable: false, Emit: prop.EmitTrue},
+		"ExecMainCode":           {Value: int32(0), Writable: false, Emit: prop.EmitTrue},
+		"ExitCode":               {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
+		"ExitStatus":             {Value: uint8(0), Writable: false, Emit: prop.EmitTrue},
+		"NRestarts":              {Value: nRestarts, Writable: false, Emit: prop.EmitTrue},
+		"StartLimitBurst":        {Value: startLimitBurstOf(mgr, name), Writable: false, Emit: prop.EmitTrue},
+		"StartLimitIntervalUSec": {Value: startLimitIntervalOf(mgr, name), Writable: false, Emit: prop.EmitTrue},
+		"StartLimitAction":       {Value: "none", Writable: false, Emit: prop.EmitConst},
+		"MemoryCurrent":          {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
+		"CPUWeight":              {Value: uint64(100), Writable: false, Emit: prop.EmitTrue},
+		"TasksCurrent":           {Value: uint64(18446744073709551615), Writable: false, Emit: prop.EmitTrue},
 	}
 }
 

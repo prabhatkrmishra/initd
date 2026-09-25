@@ -194,8 +194,10 @@ func TestDispatchListUnitFiles(t *testing.T) {
 	if data[0].Name != "app.service" {
 		t.Errorf("list-unit-files first = %q", data[0].Name)
 	}
-	if data[0].State != "disabled" {
-		t.Errorf("list-unit-files state = %q, want disabled", data[0].State)
+	// A unit with no [Install] section is "static", not "disabled": nothing
+	// could enable it, it only runs because something pulls it in.
+	if data[0].State != "static" {
+		t.Errorf("list-unit-files state = %q, want static", data[0].State)
 	}
 }
 

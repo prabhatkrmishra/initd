@@ -62,3 +62,33 @@ func TestSplitStatusLogOpts(t *testing.T) {
 		t.Fatalf("all=%d want -1", lines)
 	}
 }
+
+// TestIsNotFoundMessageKeepsRealFailuresReal: the daemon says "unit X not
+// found" for an unknown unit, but a known unit can fail with errno prose that
+// also contains "not found"/"no such". Classifying those as not-found made a
+// broken EnvironmentFile look like a missing unit.
+func TestIsNotFoundMessage(t *testing.T) {
+	yes := []string{
+		"unit zz-nope.service not found",
+		"Unit zz-nope.service not found",
+		"unit foo.service not loaded",
+		"unit bar.service could not be found",
+	}
+	no := []string{
+		"open /tmp/zzenvfile: no such file or directory",
+		"fork/exec /usr/bin/id: no such file or directory",
+		"required unit missing.service not found",
+		"unit zz-user.service is masked",
+		"exit status 1",
+	}
+	for _, msg := range yes {
+		if !isNotFoundMessage(msg) {
+			t.Errorf("isNotFoundMessage(%q) = false, want true", msg)
+		}
+	}
+	for _, msg := range no {
+		if isNotFoundMessage(msg) {
+			t.Errorf("isNotFoundMessage(%q) = true, want false", msg)
+		}
+	}
+}

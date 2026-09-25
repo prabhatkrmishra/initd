@@ -369,6 +369,23 @@ func TestListUnitFiles(t *testing.T) {
 	}
 }
 
+func TestIsEnabledStateNotFound(t *testing.T) {
+	m, dir := newTestManager(t)
+	writeUnit(t, dir, "foo.service", "[Service]\nExecStart=/bin/true\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	// A loaded unit with no [Install] section is "static", not an error.
+	if got := m.IsEnabledState("foo.service"); got != "static" {
+		t.Errorf("IsEnabledState(foo.service) = %q, want static", got)
+	}
+	// A name with no fragment anywhere is reported as systemd does: the state
+	// "not-found", not an error the caller would have to string-match.
+	if got := m.IsEnabledState("absent.service"); got != "not-found" {
+		t.Errorf("IsEnabledState(absent.service) = %q, want not-found", got)
+	}
+}
+
 func TestSocketStartStopAndState(t *testing.T) {
 	m, dir := newTestManager(t)
 	sockPath := filepath.Join(dir, "test.sock")
@@ -533,35 +550,39 @@ RestartSec=0
 	}
 }
 
-// TestNotifyCleanStop verifies the Phase 4 fix: stopping a Type=notify
-// service must not mark it failed, even after the readiness timer fires.
+// TestNotifyCleanStop verifies that stopping a Type=notify service does not
+// mark it failed, even after the readiness timer fires.
 func TestNotifyCleanStop(t *testing.T) {
 	m, dir := newTestManager(t)
 	writeUnit(t, dir, "notify.service", `
 [Service]
 Type=notify
 ExecStart=/bin/sleep 30
-TimeoutStartSec=1
+TimeoutStartSec=2
 `)
 	if err := m.LoadUnits(); err != nil {
 		t.Fatalf("LoadUnits: %v", err)
 	}
 
-	if err := m.StartUnit("notify.service"); err != nil {
-		t.Fatalf("StartUnit: %v", err)
-	}
-	u, _ := m.FindUnit("notify.service")
-
 	// The service never sends READY=1, so it stays activating until the
-	// readiness timeout. Stop it while activating.
+	// readiness timeout. A notify start job now blocks for that outcome, so
+	// the job has to run elsewhere for the test to catch the unit coming up.
+	startErr := make(chan error, 1)
+	go func() { startErr <- m.StartUnit("notify.service") }()
+	u, _ := m.FindUnit("notify.service")
 	waitForState(t, u, service.StateActivating)
 
 	if err := m.StopUnit("notify.service"); err != nil {
 		t.Fatalf("StopUnit: %v", err)
 	}
 
+	// A unit the operator stopped while it was coming up is not a failed job.
+	if err := <-startErr; err != nil {
+		t.Errorf("StartUnit released by a clean stop = %v, want nil", err)
+	}
+
 	// Wait past the readiness timeout so the notify timer path runs too.
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 
 	state := u.Snapshot().State
 	if state == service.StateFailed {
@@ -584,4 +605,154 @@ func waitForState(t *testing.T, u *service.Unit, want service.State) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// waitForActive parks until the manager finishes an asynchronous start, so
+// state assertions don't race the activating -> active transition.
+func waitForActive(t *testing.T, m *Manager, name string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if u, err := m.FindUnit(name); err == nil && u.Snapshot().State == service.StateActive {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never reached active", name)
+}
+
+// waitForFailed covers the failures that arrive asynchronously: a Type=simple
+// start is reported at fork, so the exec refusal shows up only when the child
+// is reaped.
+func waitForFailed(t *testing.T, m *Manager, name string) {
+	t.Helper()
+	for i := 0; i < 150; i++ {
+		if u, err := m.FindUnit(name); err == nil && u.Snapshot().State == service.StateFailed {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never reached failed", name)
+}
+
+// TestShowUnitStateAxesAndCapabilities pins what `systemctl show` reports for a
+// live unit: SubState is systemd's second axis (running, not "active"), and the
+// Can* / NRestarts properties clients probe before acting must be present.
+func TestShowUnitStateAxesAndCapabilities(t *testing.T) {
+	m, dir := newTestManager(t)
+	writeUnit(t, dir, "run.service", "[Service]\nType=simple\nExecStart=/bin/sleep 30\n")
+	writeUnit(t, dir, "rel.service", "[Service]\nType=simple\nExecStart=/bin/sleep 30\nExecReload=/bin/true\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	if err := m.StartUnit("run.service"); err != nil {
+		t.Fatalf("StartUnit(run): %v", err)
+	}
+	defer func() { _ = m.StopUnit("run.service") }()
+	waitForActive(t, m, "run.service")
+
+	data, err := m.ShowUnit("run.service")
+	if err != nil {
+		t.Fatalf("ShowUnit: %v", err)
+	}
+	if data["ActiveState"] != "active" || data["SubState"] != "running" {
+		t.Errorf("run.service = %s/%s, want active/running", data["ActiveState"], data["SubState"])
+	}
+	if data["MainPID"] == "0" {
+		t.Errorf("MainPID = 0 for a running unit")
+	}
+	for _, prop := range []string{"CanStart", "CanStop", "CanRestart", "CanFreeze", "NRestarts", "ExecMainStatus"} {
+		if data[prop] == "" {
+			t.Errorf("%s missing from ShowUnit output", prop)
+		}
+	}
+	if data["CanReload"] != "no" {
+		t.Errorf("CanReload = %q for a unit without ExecReload, want no", data["CanReload"])
+	}
+
+	if err := m.StartUnit("rel.service"); err != nil {
+		t.Fatalf("StartUnit(rel): %v", err)
+	}
+	defer func() { _ = m.StopUnit("rel.service") }()
+	waitForActive(t, m, "rel.service")
+	if data, err := m.ShowUnit("rel.service"); err != nil {
+		t.Fatalf("ShowUnit(rel): %v", err)
+	} else if data["CanReload"] != "yes" {
+		t.Errorf("CanReload = %q for a unit with ExecReload, want yes", data["CanReload"])
+	}
+}
+
+// Host systemd 259 answers a start of a unit whose main process cannot be
+// exec'd differently per Type: the simple job is already done at fork (rc 0)
+// while the oneshot job waits for the control process and reports the
+// failure. Both then read back as Result=exit-code with the status the
+// manager invented (203 EXEC, 216 USER).
+func TestStartUnitExecFailureMatchesSystemdJobResults(t *testing.T) {
+	m, dir := newTestManager(t)
+	writeUnit(t, dir, "simplefail.service", "[Service]\nType=simple\nExecStart=/nonexistent-initd-test-binary\n")
+	writeUnit(t, dir, "oneshotfail.service", "[Service]\nType=oneshot\nExecStart=/nonexistent-initd-test-binary\n")
+	writeUnit(t, dir, "userfail.service", "[Service]\nType=simple\nUser=nobody\nExecStart=/usr/bin/id\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+
+	if err := m.StartUnit("simplefail.service"); err != nil {
+		t.Errorf("StartUnit(simplefail) = %v, want nil: systemd's simple job completes at fork", err)
+	}
+	if err := m.StartUnit("oneshotfail.service"); err == nil {
+		t.Error("StartUnit(oneshotfail) = nil, want the control-process failure reported")
+	} else if !strings.Contains(err.Error(), "control process exited with error code") {
+		t.Errorf("StartUnit(oneshotfail) error = %q, want systemd's job wording", err)
+	}
+	_ = m.StartUnit("userfail.service")
+
+	cases := []struct{ unit, wantStatus string }{
+		{"simplefail.service", "203"},
+		{"oneshotfail.service", "203"},
+	}
+	if os.Geteuid() != 0 {
+		// Root may switch users, so the refusal only exists for an
+		// unprivileged manager.
+		cases = append(cases, struct{ unit, wantStatus string }{"userfail.service", "216"})
+	} else {
+		_ = m.StopUnit("userfail.service")
+	}
+	for _, c := range cases {
+		waitForFailed(t, m, c.unit)
+		data, err := m.ShowUnit(c.unit)
+		if err != nil {
+			t.Fatalf("ShowUnit(%s): %v", c.unit, err)
+		}
+		if data["ActiveState"] != "failed" || data["SubState"] != "failed" {
+			t.Errorf("%s = %s/%s, want failed/failed", c.unit, data["ActiveState"], data["SubState"])
+		}
+		if data["Result"] != "exit-code" {
+			t.Errorf("%s Result = %q, want exit-code", c.unit, data["Result"])
+		}
+		if data["ExecMainStatus"] != c.wantStatus {
+			t.Errorf("%s ExecMainStatus = %q, want %s", c.unit, data["ExecMainStatus"], c.wantStatus)
+		}
+	}
+}
+
+// The reported failure must not cost the unit its restart policy:
+// Restart=on-failure kept retrying an exec failure while it was only visible
+// asynchronously, and still must.
+func TestStartUnitKeepsRestartPolicyOnError(t *testing.T) {
+	m, dir := newTestManager(t)
+	writeUnit(t, dir, "flap.service", "[Service]\nType=oneshot\nRestart=on-failure\nExecStart=/nonexistent-initd-test-binary\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatalf("LoadUnits: %v", err)
+	}
+	if err := m.StartUnit("flap.service"); err == nil {
+		t.Fatal("StartUnit(flap) = nil, want exec failure")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		unit, err := m.FindUnit("flap.service")
+		if err == nil && unit.NRestarts() >= 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Error("Restart=on-failure stopped retrying once exec failures were reported synchronously")
 }

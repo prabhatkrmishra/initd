@@ -9,7 +9,6 @@ import (
 	"initd/internal/userpaths"
 )
 
-
 // defaultJournalDir resolves the durable log dir for this manager scope.
 func (m *Manager) defaultJournalDir() string {
 	if m.JournalDir != "" {

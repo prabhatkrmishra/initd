@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"initd/internal/build"
 	"initd/internal/ipc"
 	"initd/internal/userpaths"
 	"io"
@@ -21,7 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const systemctlVersion = "1.1.0"
+var systemctlVersion = build.String()
 
 func main() {
 	if wantsHelp(os.Args[1:]) {
@@ -256,7 +257,9 @@ func handleSimple(client *ipc.Client, action string) {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	if !resp.Success {
+	// Upstream `show` of a unit that does not exist prints nothing and
+	// exits 0; the "not found" sentence is not its business.
+	if !resp.Success && !isNotFoundMessage(resp.Message) {
 		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
 		os.Exit(1)
 	}
@@ -408,6 +411,11 @@ func handleEnableDisable(client *ipc.Client, action string, args []string) int {
 		}
 		if !resp.Success {
 			fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+			if now && action == "enable" {
+				if hint := jobFailureHint("start", resolved, resp.Message, client.Scope()); hint != "" {
+					fmt.Fprint(os.Stderr, hint)
+				}
+			}
 			code = 1
 		}
 	}
@@ -484,19 +492,27 @@ func handleShow(client *ipc.Client, args []string) {
 
 	if len(units) == 0 {
 		// No unit given: report manager-level info. When the daemon is
-		// reachable, ask it; when it is not (offline, daemon crashed), degrade
-		// gracefully like systemd by returning the standard manager properties
-		// so probes such as openclaw's UnitPath check do not fail with a
-		// fatal "Failed to connect to bus" error. The standard unit load paths
-		// are also returned verbatim so callers that scan them for a unit file
-		// (and find none) conclude the unit is absent.
-		if resp, err := client.Do(ipc.Request{Action: "status"}); err == nil && resp.Success {
+		// reachable, ask it. When it is not, the honest answer is a transport
+		// failure like upstream's, so only UnitPath - which is knowable from
+		// disk - is answered offline (openclaw's findInstalledSystemUnit
+		// scans the load paths itself when the manager is unreachable);
+		// anything else exits with the connection error rather than
+		// inventing an "active (running)" manager that does not exist.
+		resp, err := client.Do(ipc.Request{Action: "show"})
+		if err == nil && resp.Success {
 			printManagerProps(resp, properties, valueOnly)
 			warnIfReloadNeeded(client)
 			os.Exit(0)
 		}
-		printOfflineManagerProps(properties, valueOnly)
-		os.Exit(0)
+		if err != nil && printOfflineManagerProps(properties, valueOnly) {
+			os.Exit(0)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+		os.Exit(1)
 	}
 
 	exitCode := 0
@@ -507,7 +523,16 @@ func handleShow(client *ipc.Client, args []string) {
 			os.Exit(1)
 		}
 		resp, qerr := client.Do(ipc.Request{Action: "show", Unit: resolved})
-		loaded := qerr == nil && resp.Success
+		if qerr != nil {
+			// A daemon that cannot be reached cannot say whether a unit is
+			// loaded, so this is the transport failure upstream reports.
+			// Treating it as "not loaded" rendered a dead supervisor's running
+			// services as inactive/dead, which is how a broken socket looked
+			// like an idle system.
+			fmt.Fprintf(os.Stderr, "%v\n", qerr)
+			os.Exit(1)
+		}
+		loaded := resp.Success
 		if !loaded {
 			// Not loaded by the manager. systemd emits ALL requested properties
 			// (with empty/default values) for a not-found unit and exits 0, so
@@ -526,16 +551,16 @@ func handleShow(client *ipc.Client, args []string) {
 				}
 			}
 			notFoundDefaults := map[string]string{
-				"LoadState":          "not-found",
-				"ActiveState":        "inactive",
-				"SubState":           "dead",
-				"FragmentPath":       "",
-				"DropInPaths":        "",
-				"NeedDaemonReload":   needReload,
-				"UnitFileState":      "disabled",
-				"Description":        "",
-				"Restart":              "",
-				"RestartSec":           "",
+				"LoadState":             "not-found",
+				"ActiveState":           "inactive",
+				"SubState":              "dead",
+				"FragmentPath":          "",
+				"DropInPaths":           "",
+				"NeedDaemonReload":      needReload,
+				"UnitFileState":         "disabled",
+				"Description":           "",
+				"Restart":               "",
+				"RestartSec":            "",
 				"StartLimitIntervalSec": "",
 				"StartLimitBurst":       "",
 				"IgnoredDirectives":     "",
@@ -610,15 +635,6 @@ func printManagerProps(resp ipc.Response, properties []string, valueOnly bool) {
 	dataMap := map[string]string{}
 	raw, _ := json.Marshal(resp.Data)
 	_ = json.Unmarshal(raw, &dataMap)
-	if _, ok := dataMap["LoadState"]; !ok {
-		dataMap["LoadState"] = "loaded"
-	}
-	if _, ok := dataMap["ActiveState"]; !ok {
-		dataMap["ActiveState"] = "active"
-	}
-	if _, ok := dataMap["SubState"]; !ok {
-		dataMap["SubState"] = "running"
-	}
 	if len(properties) == 0 {
 		keys := make([]string, 0, len(dataMap))
 		for k := range dataMap {
@@ -637,39 +653,28 @@ func printManagerProps(resp ipc.Response, properties []string, valueOnly bool) {
 	}
 }
 
-// printOfflineManagerProps is the offline fallback for the manager-level
-// `systemctl show` (no unit). It mirrors the most relevant bits systemd
-// reports for the system manager so that absent-unit probes succeed without a
-// running daemon. The standard unit load paths are returned so callers that
-// scan them to locate a unit file (and find none) conclude the unit is
-// absent rather than erroring out.
-func printOfflineManagerProps(properties []string, valueOnly bool) {
-	offline := map[string]string{
-		"LoadState":    "loaded",
-		"ActiveState":  "active",
-		"SubState":     "running",
-		"UnitPath":     systemdUnitLoadPaths,
-		"Fragmentation": "",
-	}
+// printOfflineManagerProps answers the manager-level `systemctl show` (no
+// unit) properties that are knowable without a running daemon: the standard
+// unit load paths, so callers that scan them to locate a unit file (and find
+// none) conclude the unit is absent rather than erroring out. It reports
+// whether the request was fully answered - an unreachable manager has no
+// state to report, so anything else is a transport failure, and inventing
+// ActiveState=active for a daemon that is not running is exactly how a dead
+// supervisor gets mistaken for a healthy one.
+func printOfflineManagerProps(properties []string, valueOnly bool) bool {
 	if len(properties) == 0 {
-		keys := make([]string, 0, len(offline))
-		for k := range offline {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if k == "Fragmentation" {
-				continue
-			}
-			printProp(k, offline[k], valueOnly)
-		}
-	} else {
-		for _, p := range properties {
-			if v, ok := offline[p]; ok {
-				printProp(p, v, valueOnly)
-			}
-		}
+		printProp("UnitPath", systemdUnitLoadPaths, valueOnly)
+		return true
 	}
+	answered := true
+	for _, p := range properties {
+		if p == "UnitPath" {
+			printProp(p, systemdUnitLoadPaths, valueOnly)
+			continue
+		}
+		answered = false
+	}
+	return answered
 }
 
 // systemdUnitLoadPaths mirrors systemd's default unit load path, colon
@@ -683,6 +688,27 @@ func containsProp(props []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// jobFailureHint is the follow-up line systemd prints under a failed job,
+// naming the two commands that explain it. Only the job verbs get it, and
+// only for the daemon's job-failure message: `status` and `is-active` report
+// state, and a "unit not found" answer has nothing further to show.
+func jobFailureHint(action, unit, message, scope string) string {
+	switch action {
+	case "start", "stop", "restart", "reload":
+	default:
+		return ""
+	}
+	if !strings.HasPrefix(message, "Job for ") {
+		return ""
+	}
+	flag := ""
+	if scope == "user" {
+		flag = "--user "
+	}
+	return fmt.Sprintf("See \"systemctl %sstatus %s\" and \"journalctl %s-xeu %s\" for details.\n",
+		flag, unit, flag, unit)
 }
 
 // doUnitCommand runs one action for one unit and returns the process exit
@@ -713,17 +739,25 @@ func doUnitCommand(client *ipc.Client, action, unit string, statusLines int, qui
 		if isNotFoundMessage(resp.Message) {
 			switch action {
 			case "is-active":
-				fmt.Println("unknown")
+				// systemd reports an unknown unit as inactive, not
+				// "unknown", while still exiting 4.
+				fmt.Println("inactive")
 				return 4
-			case "is-enabled":
-				fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
-				return 4
+			case "start", "stop", "restart", "reload":
+				// Job verbs use EXIT_NOT_FOUND=5 (from the LSB table
+				// systemd follows); reporting 1 hid "this unit does not
+				// exist" behind the generic "something failed".
+				fmt.Fprintf(os.Stderr, "Failed to %s %s: %s\n", action, resolvedUnit, resp.Message)
+				return 5
 			case "status":
 				fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
 				return 4
 			}
 		}
 		fmt.Fprintf(os.Stderr, "%s\n", resp.Message)
+		if hint := jobFailureHint(action, resolvedUnit, resp.Message, client.Scope()); hint != "" {
+			fmt.Fprint(os.Stderr, hint)
+		}
 		return 1
 	}
 
@@ -749,7 +783,17 @@ func doUnitCommand(client *ipc.Client, action, unit string, statusLines int, qui
 		if !quiet {
 			fmt.Println(state)
 		}
-		if state == "enabled" {
+		warnIfReloadNeeded(client)
+		// A unit with no fragment is "not-found": systemd prints that on stdout
+		// and exits 4 (EXIT_NA), distinct from a unit that exists but is off.
+		if state == "not-found" {
+			return 4
+		}
+		// systemd treats a static unit as enabled-looking: it has no
+		// [Install] section to enable because something else pulls it in, and
+		// that is not an error. Only disabled/masked states exit 1.
+		switch state {
+		case "enabled", "static", "alias", "indirect":
 			return 0
 		}
 		return 1
@@ -1166,12 +1210,16 @@ func handleListUnits(client *ipc.Client, args []string) {
 	unitW := len("UNIT")
 	loadW := len("loaded")
 	activeW := len("ACTIVE")
+	subW := len("SUB")
 	for _, u := range units {
 		if len(u.Name) > unitW {
 			unitW = len(u.Name)
 		}
 		if len(string(u.State)) > activeW {
 			activeW = len(string(u.State))
+		}
+		if len(u.SubState) > subW {
+			subW = len(u.SubState)
 		}
 	}
 	if unitW < 20 {
@@ -1184,11 +1232,14 @@ func handleListUnits(client *ipc.Client, args []string) {
 		loadW = len("LOAD")
 	}
 
-	headerFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%s\n", unitW, loadW, activeW)
-	rowFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%s\n", unitW, loadW, activeW)
+	// systemd's table has a SUB column between ACTIVE and DESCRIPTION;
+	// scripts index these columns by position, so omitting it shifts every
+	// later field.
+	headerFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", unitW, loadW, activeW, subW)
+	rowFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", unitW, loadW, activeW, subW)
 
-	fmt.Printf(headerFmt, "UNIT", "LOAD", "ACTIVE", "DESCRIPTION")
-	fmt.Printf(headerFmt, strings.Repeat("-", unitW), strings.Repeat("-", loadW), strings.Repeat("-", activeW), strings.Repeat("-", 11))
+	fmt.Printf(headerFmt, "UNIT", "LOAD", "ACTIVE", "SUB", "DESCRIPTION")
+	fmt.Printf(headerFmt, strings.Repeat("-", unitW), strings.Repeat("-", loadW), strings.Repeat("-", activeW), strings.Repeat("-", subW), strings.Repeat("-", 11))
 	for _, unit := range units {
 		active := string(unit.State)
 		desc := unit.Description
@@ -1202,7 +1253,11 @@ func handleListUnits(client *ipc.Client, args []string) {
 		if len(desc) > 60 {
 			desc = desc[:57] + "..."
 		}
-		fmt.Printf(rowFmt, name, "loaded", active, desc)
+		sub := unit.SubState
+		if sub == "" {
+			sub = active
+		}
+		fmt.Printf(rowFmt, name, "loaded", active, sub, desc)
 	}
 	fmt.Printf("\n%d units listed.\n", len(units))
 	warnIfReloadNeeded(client)
@@ -1277,22 +1332,18 @@ func handleListUnitFiles(client *ipc.Client, args []string) {
 			stateW = len(u.State)
 		}
 	}
-	if fileW < 20 {
-		fileW = 20
-	}
-	if fileW > 50 {
-		fileW = 50
-	}
-
-	headerFmt := fmt.Sprintf("%%-%ds  %%-%ds\n", fileW, stateW)
-	fmt.Printf(headerFmt, "UNIT FILE", "STATE")
-	fmt.Printf(headerFmt, strings.Repeat("-", fileW), strings.Repeat("-", stateW))
+	// systemd lays this out as a left-aligned table: each column as wide as
+	// its widest cell (header included) and one space between them, with a
+	// PRESET column that initd does not implement and so prints as "-". The
+	// final column is not padded and there is no dashed underline.
+	headerFmt := fmt.Sprintf("%%-%ds %%-%ds %%s\n", fileW, stateW)
+	fmt.Printf(headerFmt, "UNIT FILE", "STATE", "PRESET")
 	for _, unit := range units {
 		name := unit.Name
 		if len(name) > fileW {
 			name = name[:fileW-3] + "..."
 		}
-		fmt.Printf(headerFmt, name, unit.State)
+		fmt.Printf(headerFmt, name, unit.State, "-")
 	}
 	fmt.Printf("\n%d unit files listed.\n", len(units))
 	warnIfReloadNeeded(client)
@@ -1305,42 +1356,197 @@ func decodeStatus(resp ipc.Response) ipc.StatusData {
 	return status
 }
 
+// statusKey prints one of the fact lines systemd's status aligns in an
+// eleven-column field: "     Loaded: ", "   Main PID: ", "        CPU: ".
+func statusKey(key, value string) {
+	fmt.Printf("%11s: %s\n", key, value)
+}
+
+// statusGlyph is the bullet before the unit name: filled while the unit is up
+// or coming up, a multiplication sign for a failed one, empty when it is down.
+func statusGlyph(state string) string {
+	switch state {
+	case "failed":
+		return "×"
+	case "active", "activating", "reloading", "deactivating", "stopping":
+		return "●"
+	default:
+		return "○"
+	}
+}
+
+func defaultSubState(state string) string {
+	switch state {
+	case "active":
+		return "running"
+	case "activating":
+		return "start"
+	case "stopping", "deactivating":
+		return "stop"
+	case "failed":
+		return "failed"
+	default:
+		return "dead"
+	}
+}
+
+// formatActiveLine is the Active: line: state, sub-state in parentheses (a
+// failed unit names its Result there instead), and when it got there. A unit
+// that is simply down says "inactive (dead)" with no timestamp.
+func formatActiveLine(status ipc.StatusData) string {
+	state := string(status.State)
+	if state == "failed" {
+		line := state
+		if status.Result != "" {
+			line = fmt.Sprintf("failed (Result: %s)", status.Result)
+		}
+		return withSince(line, status.FinishedAt, status.FinishedAtMonotonic)
+	}
+	if state == "inactive" {
+		if sub := status.SubState; sub != "" && sub != "dead" {
+			return fmt.Sprintf("inactive (%s)", sub)
+		}
+		return "inactive (dead)"
+	}
+	sub := status.SubState
+	if sub == "" {
+		sub = defaultSubState(state)
+	}
+	if state == "active" && status.LastError == "external-process" {
+		sub = "external"
+	}
+	return withSince(fmt.Sprintf("%s (%s)", state, sub), status.StartedAt, status.StartedAtMonotonic)
+}
+
+func withSince(line string, at time.Time, monotonic time.Duration) string {
+	if at.IsZero() {
+		return line
+	}
+	return fmt.Sprintf("%s since %s; %s ago", line, at.Local().Format("Mon 2006-01-02 15:04:05 MST"), formatSince(monotonic))
+}
+
+// signalShortName is the name systemd prints for a signaled death: the
+// uppercase signal without its SIG prefix (TERM, KILL, SEGV). Unknown numbers
+// fall back to the raw value so the line never loses the information.
+func signalShortName(n int) string {
+	switch syscall.Signal(n) {
+	case syscall.SIGHUP:
+		return "HUP"
+	case syscall.SIGINT:
+		return "INT"
+	case syscall.SIGQUIT:
+		return "QUIT"
+	case syscall.SIGILL:
+		return "ILL"
+	case syscall.SIGTRAP:
+		return "TRAP"
+	case syscall.SIGABRT:
+		return "ABRT"
+	case syscall.SIGBUS:
+		return "BUS"
+	case syscall.SIGFPE:
+		return "FPE"
+	case syscall.SIGKILL:
+		return "KILL"
+	case syscall.SIGUSR1:
+		return "USR1"
+	case syscall.SIGSEGV:
+		return "SEGV"
+	case syscall.SIGUSR2:
+		return "USR2"
+	case syscall.SIGPIPE:
+		return "PIPE"
+	case syscall.SIGALRM:
+		return "ALRM"
+	case syscall.SIGTERM:
+		return "TERM"
+	case syscall.SIGCHLD:
+		return "CHLD"
+	case syscall.SIGCONT:
+		return "CONT"
+	case syscall.SIGSTOP:
+		return "STOP"
+	case syscall.SIGTSTP:
+		return "TSTP"
+	case syscall.SIGWINCH:
+		return "WINCH"
+	}
+	return strconv.Itoa(n)
+}
+
+// execStatusName is the reason systemd appends to the handful of exit statuses
+// it synthesises for a spawn that never happened (a missing binary, an
+// unenterable WorkingDirectory=, a refused credential switch). Ordinary exit
+// codes get no name. Only the codes initd itself produces are mapped, and each
+// string was read off a live systemd rather than guessed.
+func execStatusName(n int) string {
+	switch n {
+	case 200:
+		return "CHDIR"
+	case 203:
+		return "EXEC"
+	case 216:
+		return "GROUP"
+	}
+	return ""
+}
+
+// formatExecOutcome is systemd's "(code=exited, status=3)": how the main
+// process was released and with what number. Empty when none ever ran.
+func formatExecOutcome(status ipc.StatusData) string {
+	switch status.MainCode {
+	case 1:
+		if name := execStatusName(status.ExitCode); name != "" {
+			return fmt.Sprintf("(code=exited, status=%d/%s)", status.ExitCode, name)
+		}
+		return fmt.Sprintf("(code=exited, status=%d)", status.ExitCode)
+	case 2:
+		return fmt.Sprintf("(code=killed, signal=%s)", signalShortName(status.ExitCode))
+	case 3:
+		return fmt.Sprintf("(code=dumped, signal=%s)", signalShortName(status.ExitCode))
+	}
+	return ""
+}
+
+func processCommand(pid int) string {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
 func printStatus(status ipc.StatusData, enabled string, maxLines int) {
 	unitBase := strings.TrimSuffix(status.Name, ".service")
 
-	fmt.Printf("● %s - %s\n", status.Name, status.Description)
-	fmt.Printf("   Loaded: loaded (%s; %s)\n", status.Name, enabled)
-
-	activeLine := string(status.State)
-	if status.State == "active" && status.LastError == "external-process" {
-		activeLine = "active (external)"
-	} else if status.State == "active" && status.SubState == "exited" {
-		activeLine = "active (exited)"
-	} else if status.State == "active" {
-		activeLine = "active (running)"
-	}
-
-	if !status.StartedAt.IsZero() {
-		startedAt := status.StartedAt.Local()
-		monotonicSince := formatSince(status.StartedAtMonotonic)
-		fmt.Printf(
-			"   Active: %s since %s; %s ago\n",
-			activeLine,
-			startedAt.Format("Mon, 02 Jan 2006 15:04:05 MST"),
-			monotonicSince,
-		)
+	fmt.Printf("%s %s - %s\n", statusGlyph(string(status.State)), status.Name, status.Description)
+	if enabled == "masked" {
+		statusKey("Loaded", fmt.Sprintf("masked (Reason: Unit %s is masked.)", status.Name))
 	} else {
-		fmt.Printf("   Active: %s\n", activeLine)
+		fragment := status.FragmentPath
+		if fragment == "" {
+			fragment = "transient"
+		}
+		statusKey("Loaded", fmt.Sprintf("loaded (%s; %s)", fragment, enabled))
 	}
+	statusKey("Active", formatActiveLine(status))
 
 	if status.MainPID > 0 {
-		fmt.Printf(" Main PID: %d\n", status.MainPID)
-		if status.LastError == "external-process" {
-			fmt.Printf("   Note: process running outside initd (SysV/manual/nohup); adopt with `systemctl restart %s` to supervise\n", status.Name)
+		mainPID := strconv.Itoa(status.MainPID)
+		if name := processCommand(status.MainPID); name != "" {
+			mainPID = fmt.Sprintf("%d (%s)", status.MainPID, name)
 		}
-	} else if status.State == "active" && status.SubState == "exited" {
-		// Oneshot with RemainAfterExit: no process to show, like systemd.
-		fmt.Printf("    Tasks: 0\n")
+		statusKey("Main PID", mainPID)
+		if status.LastError == "external-process" {
+			statusKey("Note", fmt.Sprintf("process running outside initd (SysV/manual/nohup); adopt with `systemctl restart %s` to supervise", status.Name))
+		}
+	} else if ended := formatExecOutcome(status); ended != "" {
+		// systemd shows how the main process ended only once it is gone: a
+		// Process: line naming the command, then the same code on Main PID.
+		if status.ExecStart != "" {
+			statusKey("Process", fmt.Sprintf("%d %s %s", status.ExecMainPID, status.ExecStart, ended))
+		}
+		statusKey("Main PID", fmt.Sprintf("%d %s", status.ExecMainPID, ended))
 	}
 
 	if status.LastError != "" && status.LastError != "external-process" {
@@ -1390,31 +1596,58 @@ func monotonicNow() time.Duration {
 	return time.Duration(ts.Sec)*time.Second + time.Duration(ts.Nsec)
 }
 
+// formatSince renders how long ago a monotonic stamp was, in systemd's
+// shape: at most the two most significant non-zero units, suffixed
+// year/month/week/day/h/min/s/ms, with a plural only on the spelled-out
+// ones. "9h", "1min 30s", "14ms", "2days 3h".
 func formatSince(start time.Duration) string {
 	if start <= 0 {
 		return "0s"
 	}
-	now := monotonicNow()
-	if now <= start {
+	return formatSpan(monotonicNow() - start)
+}
+
+func formatSpan(delta time.Duration) string {
+	if delta < time.Millisecond {
 		return "0s"
 	}
-	delta := now - start
-	if delta < 0 {
-		return "0s"
+	if delta < time.Second {
+		return fmt.Sprintf("%dms", delta/time.Millisecond)
 	}
 	delta = delta.Round(time.Second)
-	seconds := int(delta.Seconds())
-	hours := seconds / 3600
-	minutes := (seconds % 3600) / 60
-	secs := seconds % 60
-	switch {
-	case hours > 0:
-		return fmt.Sprintf("%dh %dm %ds", hours, minutes, secs)
-	case minutes > 0:
-		return fmt.Sprintf("%dm %ds", minutes, secs)
-	default:
-		return fmt.Sprintf("%ds", secs)
+	units := []struct {
+		size   time.Duration
+		suffix string
+		plural bool
+	}{
+		{365 * 24 * time.Hour, "year", true},
+		{30 * 24 * time.Hour, "month", true},
+		{7 * 24 * time.Hour, "week", true},
+		{24 * time.Hour, "day", true},
+		{time.Hour, "h", false},
+		{time.Minute, "min", false},
+		{time.Second, "s", false},
 	}
+	parts := make([]string, 0, 2)
+	for _, unit := range units {
+		if len(parts) == cap(parts) {
+			break
+		}
+		n := int(delta / unit.size)
+		if n == 0 {
+			continue
+		}
+		delta -= time.Duration(n) * unit.size
+		suffix := unit.suffix
+		if unit.plural && n != 1 {
+			suffix += "s"
+		}
+		parts = append(parts, strconv.Itoa(n)+suffix)
+	}
+	if len(parts) == 0 {
+		return "0s"
+	}
+	return strings.Join(parts, " ")
 }
 
 func fetchEnabledState(client *ipc.Client, unit string) string {

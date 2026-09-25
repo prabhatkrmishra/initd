@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFileWriterAppendRead(t *testing.T) {
@@ -157,4 +158,38 @@ func TestRetentionOnRotate(t *testing.T) {
 		t.Fatalf("retention must leave readable history")
 	}
 	_ = w.Close()
+}
+
+// TestListFilesOrdersByTimeNotName guards the tail query: files are named after
+// a random boot UUID, so name order is unrelated to chronology. A reader that
+// walks them "oldest first" by name starts at an arbitrary boot and hands
+// `journalctl -n 20` stale entries.
+func TestListFilesOrdersByTimeNotName(t *testing.T) {
+	dir := t.TempDir()
+	// Lexically "0000..." is the newest file on disk; "ffff..." the oldest.
+	write := func(name string, mod time.Time) {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatalf("chtimes %s: %v", name, err)
+		}
+	}
+	base := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	write("ffff1111.jsonl", base)
+	write("0000aaaa-100.jsonl", base.Add(time.Hour))
+	write("0000aaaa.jsonl", base.Add(2*time.Hour))
+	write("ignored.txt", base.Add(3*time.Hour))
+
+	got := ListFiles(dir)
+	want := []string{"ffff1111.jsonl", "0000aaaa-100.jsonl", "0000aaaa.jsonl"}
+	if len(got) != len(want) {
+		t.Fatalf("ListFiles returned %d files, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if filepath.Base(got[i]) != want[i] {
+			t.Errorf("position %d = %s, want %s", i, filepath.Base(got[i]), want[i])
+		}
+	}
 }

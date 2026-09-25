@@ -135,6 +135,44 @@ func TestWorkingDirectory(t *testing.T) {
 	}
 }
 
+// Host systemd 259, verified: a WorkingDirectory= that cannot be entered fails
+// the spawn with status 200 (200/CHDIR), not the generic 203 used for a
+// missing binary. The manager performs the chdir itself, so the Go exec error
+// is the thing classified here.
+func TestWorkingDirectoryMissingReportsChdir(t *testing.T) {
+	u := newTestUnit(t, "zzwd.service", "[Service]\nType=oneshot\nWorkingDirectory=/nonexistent-initd-wd\nExecStart=/bin/true\n")
+	if _, err := u.StartAndWait(true); err == nil {
+		t.Fatal("StartAndWait() = nil for an unenterable WorkingDirectory, want a failure")
+	}
+	snap := u.Snapshot()
+	if snap.State != StateFailed {
+		t.Errorf("state = %q, want failed", snap.State)
+	}
+	if snap.ExitCode != 200 {
+		t.Errorf("ExitCode = %d, want 200 (CHDIR)", snap.ExitCode)
+	}
+	if snap.Result != "exit-code" {
+		t.Errorf("Result = %q, want exit-code", snap.Result)
+	}
+}
+
+func TestExecFailureStatusClassification(t *testing.T) {
+	u := newTestUnit(t, "x.service", "[Service]\nExecStart=/bin/true\n")
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"chdir", &os.PathError{Op: "chdir", Path: "/nope", Err: syscall.ENOENT}, 200},
+		{"exec", &os.PathError{Op: "fork/exec", Path: "/nope", Err: syscall.ENOENT}, 203},
+	}
+	for _, c := range cases {
+		if got := u.execFailureStatus(c.err); got != c.want {
+			t.Errorf("execFailureStatus(%s) = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 func TestCommandExitStatus(t *testing.T) {
 	// Exited with status 3: exit status lives in bits 8-15.
 	ws := syscall.WaitStatus(3 << 8)

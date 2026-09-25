@@ -56,6 +56,7 @@ type ServiceSection struct {
 	RootDirectory            string
 	RuntimeDirectory         []string
 	RuntimeDirectoryMode     string
+	RuntimeDirectoryPreserve string
 	StateDirectory           []string
 	CacheDirectory           []string
 	LogsDirectory            []string
@@ -441,6 +442,8 @@ func parseUnitFile(path string, name string) (*Unit, error) {
 				}
 			case "RuntimeDirectoryMode":
 				unit.Service.RuntimeDirectoryMode = value
+			case "RuntimeDirectoryPreserve":
+				unit.Service.RuntimeDirectoryPreserve = value
 			case "StateDirectory":
 				if value == "" {
 					unit.Service.StateDirectory = nil
@@ -678,6 +681,9 @@ func mergeUnit(base, overlay *Unit) {
 	}
 	if overlay.Service.RuntimeDirectoryMode != "" {
 		base.Service.RuntimeDirectoryMode = overlay.Service.RuntimeDirectoryMode
+	}
+	if overlay.Service.RuntimeDirectoryPreserve != "" {
+		base.Service.RuntimeDirectoryPreserve = overlay.Service.RuntimeDirectoryPreserve
 	}
 	if len(overlay.Service.StateDirectory) > 0 {
 		base.Service.StateDirectory = append(base.Service.StateDirectory, overlay.Service.StateDirectory...)

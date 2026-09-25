@@ -205,6 +205,15 @@ func (u *Unit) EffectiveState() (State, int) {
 	if snap.State != StateInactive {
 		return snap.State, snap.MainPID
 	}
+	// A unit this daemon deliberately stopped stays stopped. The scan below
+	// cannot tell "someone else runs this command" from "the copy we just
+	// killed has not left /proc yet" or "a second unit shares the exact same
+	// ExecStart", and answering active made `systemctl stop X && systemctl
+	// is-active X` report active - so every restart script that gates on it
+	// skipped the start.
+	if u.StopRequested() {
+		return snap.State, snap.MainPID
+	}
 	if pid, _ := u.FindExternalPID(); pid > 0 {
 		return StateActive, pid
 	}

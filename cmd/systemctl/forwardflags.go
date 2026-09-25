@@ -215,11 +215,17 @@ func splitQuietFlag(args []string) ([]string, bool) {
 	return rest, quiet
 }
 
-// isNotFoundMessage reports daemon errors meaning "no such unit", which
-// systemd maps to LSB exit 4 instead of a generic failure.
+// isNotFoundMessage reports daemon errors meaning "the unit itself is unknown",
+// which systemd maps to the not-found exit codes (4 for queries, 5 for job
+// verbs). Substring matching on errno prose is not enough: "open
+// /etc/foo.conf: no such file or directory" is a start failure of a unit that
+// exists, and calling it not-found tells the caller the unit is missing.
 func isNotFoundMessage(msg string) bool {
-	m := strings.ToLower(msg)
+	m := strings.ToLower(strings.TrimSpace(msg))
+	if !strings.HasPrefix(m, "unit ") {
+		return false
+	}
 	return strings.Contains(m, "not found") ||
-		strings.Contains(m, "no such") ||
+		strings.Contains(m, "not loaded") ||
 		strings.Contains(m, "could not be found")
 }
