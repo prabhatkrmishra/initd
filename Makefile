@@ -1,5 +1,5 @@
 BUILD_DIR := build
-VERSION ?= 1.1.0
+VERSION ?= 1.2.0
 
 # Stamp every binary with the source it came from. Without this a rebuild of a
 # dirty tree and a months-old install both report the same version, and there
