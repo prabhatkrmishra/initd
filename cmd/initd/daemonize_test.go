@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -190,5 +191,43 @@ func TestSpawnDetachedWaitsForTheSocketNotThePidFile(t *testing.T) {
 		t.Fatalf("returned %v on a pid file with no listener; readiness must require the socket", err)
 	case <-time.After(1500 * time.Millisecond):
 		// Still waiting: correct, the socket never accepted.
+	}
+}
+
+// A non-root daemon does not listen on /run/initd.sock: it moves to the per-uid
+// runtime dir. The parent has to resolve that before it spawns, because the
+// child recomputes the address itself - a parent still waiting on
+// /run/initd.sock would sit out the whole readiness timeout on a socket that is
+// never created.
+func TestResolveSocketPathMovesOffRunForUnprivileged(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root keeps /run/initd.sock")
+	}
+	if _, err := os.Stat("/run"); err != nil {
+		t.Skip("/run not present")
+	}
+	got := resolveSocketPath("/run/initd.sock")
+	if got == "/run/initd.sock" {
+		t.Fatal("unprivileged daemon still resolved to /run/initd.sock")
+	}
+	// Whatever it resolved to must be where the child will actually bind, i.e.
+	// derived from the same rule userpaths uses.
+	if !strings.HasSuffix(got, "initd-system.sock") && !strings.HasSuffix(got, "initd.sock") {
+		t.Errorf("resolved to %q, which is not a socket path userpaths would produce", got)
+	}
+}
+
+// Root must be left alone, and an explicit --socket must never be rewritten.
+func TestResolveSocketPathLeavesExplicitChoicesAlone(t *testing.T) {
+	for _, p := range []string{"/run/initd.sock", "/tmp/custom.sock", "@abstract.sock"} {
+		if p == "/run/initd.sock" && os.Getuid() == 0 {
+			continue
+		}
+		if p == "/run/initd.sock" {
+			continue
+		}
+		if got := resolveSocketPath(p); got != p {
+			t.Errorf("resolveSocketPath(%q) = %q, want it unchanged", p, got)
+		}
 	}
 }

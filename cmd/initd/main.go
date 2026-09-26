@@ -31,6 +31,36 @@ import (
 
 var initdVersion = build.String()
 
+// resolveSocketPath applies the non-root fallback: /run/initd.sock is not
+// writable by an unprivileged daemon, so it moves to the per-uid runtime dir.
+//
+// This runs before the daemon is spawned, not just for the running process: the
+// detached child recomputes the same address from its own argv and environment,
+// so a parent that still believed in /run/initd.sock would wait for readiness on
+// a socket that is never created. It has to be the same answer on both sides.
+func resolveSocketPath(socketPath string) string {
+	if socketPath != "/run/initd.sock" || os.Getuid() == 0 {
+		return socketPath
+	}
+	if _, err := os.Stat("/run"); err != nil {
+		return socketPath
+	}
+	f, err := os.CreateTemp("/run", ".initd-probe-*")
+	if err != nil {
+		fallback := userpaths.SystemSocketPath()
+		if fallback == "/run/initd.sock" {
+			fallback = "/tmp/initd.sock"
+		}
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"no permission for %s, falling back to %s", socketPath, fallback)
+		return fallback
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return socketPath
+}
+
 func main() {
 	cfg, err := parseArgs(os.Args[1:])
 	if err != nil {
@@ -45,7 +75,8 @@ func main() {
 		printPaths(cfg.asJSON)
 		return
 	}
-	socketPath := cfg.socketPath
+	socketPath := resolveSocketPath(cfg.socketPath)
+	cfg.socketPath = socketPath
 	initMode := cfg.initMode
 
 	// A supervisor must not die with its launching terminal. Ignore hangup
@@ -113,26 +144,6 @@ func main() {
 	if tree := cgroup.Default(); !tree.Available() {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 			"unit cgroups unavailable (%s); stops fall back to process groups", tree.Reason())
-	}
-
-	// Fallback for non-root: /run/initd.sock not writable
-	if socketPath == "/run/initd.sock" && os.Getuid() != 0 {
-		if _, err := os.Stat("/run"); err == nil {
-			f, err := os.CreateTemp("/run", ".initd-probe-*")
-			if err != nil {
-				fallback := userpaths.SystemSocketPath()
-				if fallback == "/run/initd.sock" {
-					fallback = "/tmp/initd.sock"
-				}
-				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-					"no permission for %s, falling back to %s", socketPath, fallback)
-				socketPath = fallback
-			} else {
-				name := f.Name()
-				_ = f.Close()
-				_ = os.Remove(name)
-			}
-		}
 	}
 
 	// stopServe is closed by shutdownDaemon. Serve loops check it before
