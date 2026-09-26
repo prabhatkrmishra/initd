@@ -66,7 +66,22 @@ func TestServeReplacesStaleSocket(t *testing.T) {
 	// killed with SIGKILL leaves behind.
 	_ = syscall.Close(fd)
 
-	go func() { _ = Serve(path, m) }()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = Serve(path, m)
+	}()
+	// Serve only returns when its listener is closed or its path is lost, and a
+	// survivor keeps reading package state (the ownership-check interval) that
+	// the next test is already rewriting - a race between two tests.
+	defer func() {
+		StopServing(path)
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("serve goroutine did not exit")
+		}
+	}()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

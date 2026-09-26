@@ -402,9 +402,13 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 	lost := make(chan struct{})
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
+	// Read the interval once, here, rather than inside the watchdog: one read
+	// at bind time is one less shared cell for anything to race on, and the
+	// cadence cannot change underneath a listener that is already serving.
+	checkInterval := socketOwnershipCheckInterval
 	if haveOwn {
 		go func() {
-			ticker := time.NewTicker(socketOwnershipCheckInterval)
+			ticker := time.NewTicker(checkInterval)
 			defer ticker.Stop()
 			for {
 				select {

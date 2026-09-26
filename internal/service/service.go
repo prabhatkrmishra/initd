@@ -873,17 +873,17 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// -------------------------------------------------
 	switch serviceType {
 	case "oneshot":
-		go u.waitOneshot(token, envMap, envList, ignoreFailure)
+		go u.waitOneshot(token, cmd, envMap, envList, ignoreFailure)
 	case "forking":
-		go u.waitForking(token, envMap, envList, ignoreFailure)
+		go u.waitForking(token, cmd, envMap, envList, ignoreFailure)
 	case "notify":
-		go u.waitNotify(token, envMap, envList, ignoreFailure)
+		go u.waitNotify(token, cmd, envMap, envList, ignoreFailure)
 	default:
-		go u.waitSimple(token, envMap, envList, ignoreFailure)
+		go u.waitSimple(token, cmd, envMap, envList, ignoreFailure)
 	}
 }
 
-func (u *Unit) waitSimple(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
+func (u *Unit) waitSimple(token int, cmd *exec.Cmd, envMap map[string]string, envList []string, ignoreFailure bool) {
 	if err := u.runExecStartPost(token, envMap, envList); err != nil {
 		u.killMainProcess(u.stopSignal())
 		u.markFailed(err, ignoreFailure)
@@ -892,15 +892,15 @@ func (u *Unit) waitSimple(token int, envMap map[string]string, envList []string,
 	if u.reaper != nil {
 		return
 	}
-	err := u.Cmd.Wait()
+	err := cmd.Wait()
 	u.handleExit(token, err, ignoreFailure, true)
 }
 
-func (u *Unit) waitOneshot(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
+func (u *Unit) waitOneshot(token int, cmd *exec.Cmd, envMap map[string]string, envList []string, ignoreFailure bool) {
 	if u.reaper != nil {
 		return
 	}
-	err := u.Cmd.Wait()
+	err := cmd.Wait()
 	if err != nil {
 		u.handleExit(token, err, ignoreFailure, false)
 		return
@@ -912,7 +912,7 @@ func (u *Unit) waitOneshot(token int, envMap map[string]string, envList []string
 	u.handleExit(token, nil, ignoreFailure, false)
 }
 
-func (u *Unit) waitForking(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
+func (u *Unit) waitForking(token int, cmd *exec.Cmd, envMap map[string]string, envList []string, ignoreFailure bool) {
 	startedAt := time.Now()
 	startedAtMonotonic := logging.MonotonicNow()
 	timeout := u.StartTimeout()
@@ -949,7 +949,7 @@ func (u *Unit) waitForking(token int, envMap map[string]string, envList []string
 		return
 	}
 
-	err = u.Cmd.Wait()
+	err = cmd.Wait()
 	if err != nil {
 		u.mu.Lock()
 		shouldHandle := u.startToken == token && u.Runtime.MainPID == 0 && u.Runtime.State != StateActive
@@ -3278,10 +3278,9 @@ func (u *Unit) notifyMainPID(cmd *exec.Cmd) int {
 	return 0
 }
 
-func (u *Unit) waitNotify(token int, envMap map[string]string, envList []string, ignoreFailure bool) {
+func (u *Unit) waitNotify(token int, cmd *exec.Cmd, envMap map[string]string, envList []string, ignoreFailure bool) {
 	u.mu.Lock()
 	server := u.notifyServer
-	cmd := u.Cmd
 	u.mu.Unlock()
 
 	if server == nil {

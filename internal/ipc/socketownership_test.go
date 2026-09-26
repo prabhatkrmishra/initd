@@ -52,7 +52,22 @@ func TestServeReportsLostSocketPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "initd.sock")
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(path, testManager(t)) }()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		errCh <- Serve(path, testManager(t))
+	}()
+	// Serve returns on its own when the path is lost, but not if this test
+	// fails early - and a survivor would keep reading package state while the
+	// next test is already mutating it.
+	defer func() {
+		StopServing(path)
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("serve goroutine did not exit")
+		}
+	}()
 	waitForSocketPath(t, path)
 
 	// Exactly what a stray rm, a tmpfs cleanup or an over-eager installer does.
@@ -79,8 +94,10 @@ func TestServeRebindsAfterPathLoss(t *testing.T) {
 	shrinkOwnershipCheck(t)
 	path := filepath.Join(t.TempDir(), "initd.sock")
 	stop := make(chan struct{})
+	stopped := make(chan struct{})
 	serveErr := make(chan error, 1)
 	go func() {
+		defer close(stopped)
 		// The shape of cmd/initd's serveManager loop, reduced to the one rule
 		// that matters: a lost path is rebound at once, without backoff.
 		for {
@@ -99,7 +116,22 @@ func TestServeRebindsAfterPathLoss(t *testing.T) {
 			}
 		}
 	}()
-	defer close(stop)
+	// The listener must be gone before the test returns: a leaked Serve keeps
+	// reading package state (the ownership interval) while the next test is
+	// already mutating it, which is a data race between two tests.
+	defer func() {
+		// Serve blocks in Accept and nothing but a lost path or a closed
+		// listener returns it, so stopping the loop means closing the
+		// listener. Without this the goroutine outlives the test and races
+		// the next one's package state.
+		close(stop)
+		StopServing(path)
+		select {
+		case <-stopped:
+		case <-time.After(10 * time.Second):
+			t.Error("serve goroutine did not exit")
+		}
+	}()
 
 	waitForSocketPath(t, path)
 	if err := os.Remove(path); err != nil {
@@ -232,8 +264,9 @@ func TestServeRefusesSecondListenerOnLiveSocket(t *testing.T) {
 	shrinkOwnershipCheck(t)
 	path := filepath.Join(t.TempDir(), "initd.sock")
 	stop := make(chan struct{})
-	defer close(stop)
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		for {
 			if err := Serve(path, testManager(t)); err == nil || IsSocketPathLost(err) {
 				select {
@@ -244,6 +277,15 @@ func TestServeRefusesSecondListenerOnLiveSocket(t *testing.T) {
 				continue
 			}
 			return
+		}
+	}()
+	defer func() {
+		close(stop)
+		StopServing(path)
+		select {
+		case <-stopped:
+		case <-time.After(10 * time.Second):
+			t.Error("serve goroutine did not exit")
 		}
 	}()
 	waitForSocketPath(t, path)
