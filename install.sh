@@ -245,6 +245,9 @@ else
     rm -f "$PIDFILE"
     # Self-detaching start: pid file + log handled by the daemon itself.
     # Fall back to the old nohup path for binaries predating --daemonize.
+    # No --wait-ready here on purpose: this runs from a login shell, and the
+    # shell must not sit behind daemon startup. Readiness is the pid file, and
+    # anything that needs more can ask for it explicitly.
     if ! initd --init --daemonize --pid-file "$PIDFILE" >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1; then
       if ! pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
         nohup initd --init >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
@@ -402,7 +405,9 @@ fi
 unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND
 DAEMON_PIDFILE="$XDG_RUNTIME_DIR/initd.pid"
 rm -f "$DAEMON_PIDFILE"
-if ! "$INITD_DST" --init --daemonize --pid-file "$DAEMON_PIDFILE" >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1; then
+# --wait-ready: the installer verifies the manager immediately afterwards, so it
+# waits for the control socket to accept rather than trusting the pid file alone.
+if ! "$INITD_DST" --init --daemonize --wait-ready --pid-file "$DAEMON_PIDFILE" >>"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1; then
   echo "daemonize failed, falling back to nohup start." >&2
   nohup "$INITD_DST" --init >"$XDG_RUNTIME_DIR/initd-daemon.log" 2>&1 &
   disown 2>/dev/null || true

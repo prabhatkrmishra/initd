@@ -16,6 +16,7 @@ import (
 	"initd/internal/userpaths"
 
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -808,6 +809,10 @@ type daemonConfig struct {
 	showStatus bool
 	showPaths  bool
 	asJSON     bool
+	// waitReady makes --daemonize block until the daemon is actually serving.
+	// Off by default: a login hook runs on the critical path of every shell and
+	// must not wait on daemon startup. Installers and boot scripts opt in.
+	waitReady  bool
 	socketPath string
 	initMode   bool
 	daemonize  bool
@@ -841,6 +846,13 @@ const exitHandedOff = 3
 // record its pid file. The parent exits 0 once the child is up; startup
 // failures surface through a missing pid file instead of a lost terminal.
 func spawnDetached(cfg daemonConfig) error {
+	return spawnDetachedAs(cfg, "")
+}
+
+// spawnDetachedAs is spawnDetached with the child binary injectable. Empty bin
+// means "re-exec ourselves", which is the production path; a test passes a
+// helper instead so the launcher's own behaviour can be driven.
+func spawnDetachedAs(cfg daemonConfig, bin string) error {
 	logPath := cfg.logFile
 	if logPath == "" {
 		logPath = defaultLogFile()
@@ -872,13 +884,19 @@ func spawnDetached(cfg daemonConfig) error {
 	// the exec. /proc/self/exe is authoritative; resolving "initd" against the
 	// login cwd instead can name an unrelated file (the source tree at
 	// ~/initd) and fail --daemonize with EACCES.
-	bin, err := os.Executable()
-	if err != nil {
-		bin = os.Args[0]
-		if found, lookErr := exec.LookPath(bin); lookErr == nil {
-			bin = found
-		} else if abs, absErr := filepath.Abs(bin); absErr == nil {
-			bin = abs
+	if bin == "" {
+		// /proc/self/exe is authoritative; resolving "initd" against the login
+		// cwd instead can name an unrelated file (the source tree at ~/initd)
+		// and fail --daemonize with EACCES.
+		if resolved, execErr := os.Executable(); execErr == nil {
+			bin = resolved
+		} else {
+			bin = os.Args[0]
+			if found, lookErr := exec.LookPath(bin); lookErr == nil {
+				bin = found
+			} else if abs, absErr := filepath.Abs(bin); absErr == nil {
+				bin = abs
+			}
 		}
 	}
 	cmd := exec.Command(bin, childArgs...)
@@ -892,14 +910,31 @@ func spawnDetached(cfg daemonConfig) error {
 		return fmt.Errorf("start detached child: %w", err)
 	}
 	// Detached: do not wait (that would reattach fate to the child).
-	// Confirm it stays alive and records its pid file.
+	//
+	// Without --wait-ready the launcher hands the login straight back. A login
+	// hook must never sit behind daemon startup: this sits on the critical path
+	// of every shell the user opens, and the worst case used to be a flat ten
+	// seconds of frozen terminal before an error nobody could act on. The child
+	// writes the pid file itself when it is up, so callers that genuinely need
+	// readiness poll for that instead - see daemonReady.
 	pidPath := cfg.pidFile
 	if pidPath == "" {
 		pidPath = defaultPidFile()
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	if !cfg.waitReady {
+		// One liveness check so a child that dies instantly (bad binary,
+		// unwritable pid file) is still reported, then get out of the way.
+		if status, exited := pollChildExit(cmd.Process.Pid); exited {
+			if status == exitHandedOff {
+				return nil
+			}
+			return fmt.Errorf("child exited with status %d before writing %s", status, pidPath)
+		}
+		return nil
+	}
+	deadline := time.Now().Add(daemonReadyTimeout)
 	for {
-		if childWrotePidFile(pidPath, cmd.Process.Pid) {
+		if daemonReady(pidPath, cfg.socketPath, cmd.Process.Pid) {
 			return nil
 		}
 		if status, exited := pollChildExit(cmd.Process.Pid); exited {
@@ -911,10 +946,39 @@ func spawnDetached(cfg daemonConfig) error {
 			return fmt.Errorf("child exited with status %d before writing %s", status, pidPath)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for %s", pidPath)
+			return fmt.Errorf("daemon did not become ready within %s (pid file %s, socket %s)",
+				daemonReadyTimeout, pidPath, cfg.socketPath)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// daemonReadyTimeout bounds --wait-ready. Only the installer and boot scripts
+// take that path, never a login, so it can afford to be generous.
+const daemonReadyTimeout = 60 * time.Second
+
+// daemonReady reports whether the daemon is actually serving.
+//
+// The pid file alone was the wrong signal: it is written before the manager has
+// loaded its units, so a caller returning on it could immediately issue a
+// command the daemon was not yet answering. The control socket accepting a
+// connection is what a client actually needs, so that is what gets polled - with
+// the pid file still required, because it is what identifies our own child
+// rather than a predecessor's.
+func daemonReady(pidPath, socketPath string, childPID int) bool {
+	if !childWrotePidFile(pidPath, childPID) {
+		return false
+	}
+	if socketPath == "" || strings.HasPrefix(socketPath, "@") {
+		// An abstract socket has no path to dial; the pid file is all there is.
+		return true
+	}
+	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // pollChildExit reaps the detached child when it has already exited and
@@ -1018,6 +1082,8 @@ func parseArgs(args []string) (daemonConfig, error) {
 			cfg.initMode = true
 		case arg == "--daemonize":
 			cfg.daemonize = true
+		case arg == "--wait-ready":
+			cfg.waitReady = true
 		case arg == "--pid-file":
 			i++
 			if i >= len(args) {
@@ -1090,6 +1156,10 @@ Options:
   --init               Run as init/supervisor (autostart enabled units).
   --socket[=PATH]      Run as a pure daemon/service manager without init/PID1 behaviors.
                        If PATH omitted, defaults to /run/initd.sock.
+  --wait-ready         With --daemonize, block until the control socket is
+                       accepting connections (not merely until the pid file
+                       appears). For installers and boot scripts; a login hook
+                       must not wait, so this is off by default.
   --daemonize          Detach into a new session (setsid), wire stdio to the
                        log file and record a pid file, then exit 0. Combine
                        with --init for boot/login hooks.
