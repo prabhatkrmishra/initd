@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -150,10 +151,16 @@ func main() {
 	// rebinding: without this a shutdown that removes the socket file
 	// would be undone a second later by the retry loop resurrecting it.
 	stopServe := make(chan struct{})
-	serveManager := func(path string, mgr *supervisor.Manager) {
+	serveManager := func(path string, mgr *supervisor.Manager, readOnly bool, gid int) {
 		backoff := time.Second
 		for {
-			if err := ipc.Serve(path, mgr); err != nil {
+			var err error
+			if readOnly {
+				err = ipc.ServeReadOnly(path, mgr, gid)
+			} else {
+				err = ipc.Serve(path, mgr)
+			}
+			if err != nil {
 				select {
 				case <-stopServe:
 					return
@@ -208,7 +215,7 @@ func main() {
 			return false
 		}
 		userLock = lock
-		go serveManager(path, mgr)
+		go serveManager(path, mgr, false, -1)
 		return true
 	}
 
@@ -223,7 +230,7 @@ func main() {
 			return false
 		}
 		systemLock = lock
-		go serveManager(path, mgr)
+		go serveManager(path, mgr, false, -1)
 		return true
 	}
 
@@ -294,6 +301,22 @@ func main() {
 		defer func() {
 			_ = systemLock.Close()
 		}()
+	}
+
+	// Publish a read-only view of the system manager for the journal group.
+	// systemctl and journalctl select it for read verbs when they run
+	// unprivileged, so `proxy-ctl log` and `proxy-ctl status` work without
+	// sudo. Root keeps the 0600 control socket; this listener refuses every
+	// mutating action regardless of uid. A missing group is a deployment gap,
+	// not a transient bind error, so say so once and leave the socket dark
+	// instead of retrying a bind that can never help.
+	if !primaryIsUser && primaryServes && os.Getuid() == 0 {
+		if gid, err := readSocketGID(); err != nil {
+			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+				"read-only control socket disabled: %v", err)
+		} else {
+			go serveManager(userpaths.SystemReadSocketPath(), systemManager, true, gid)
+		}
 	}
 
 	// Advertise org.freedesktop.systemd1 over D-Bus so that tools which
@@ -399,6 +422,25 @@ func primaryIsUserSocket(socketPath string) bool {
 	return socketPath == userpaths.UserSocketPath()
 }
 
+// readSocketGroup is the group whose members may query the system manager
+// over the read-only socket.
+const readSocketGroup = "systemd-journal"
+
+// readSocketGID resolves readSocketGroup. It is resolved once before the
+// listener starts because the group is a deployment fact: a host without it
+// gets one clear log line, not a bind retry loop that can never succeed.
+func readSocketGID() (int, error) {
+	group, err := user.LookupGroup(readSocketGroup)
+	if err != nil {
+		return 0, err
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return 0, fmt.Errorf("group %s has non-numeric gid %q", group.Name, group.Gid)
+	}
+	return gid, nil
+}
+
 // sigName renders a signal for shutdown logging.
 func sigName(sig os.Signal) string {
 	if sig == syscall.SIGINT {
@@ -439,14 +481,15 @@ func shutdownDaemon(why string, stopServe chan struct{}, stopDBus context.Cancel
 	userManager.CloseJournal()
 	// Stop the listeners before the paths go, so nothing can accept a request
 	// this daemon will never answer, and so the identity check below is taken
-	// against a socket that is genuinely ours and not mid-rebind.
-	ipc.StopServing(userSocket)
-	if socketPath != userSocket {
-		ipc.StopServing(socketPath)
+	// against a socket that is genuinely ours and not mid-rebind. The read
+	// socket is only removed when this process bound it (RemoveIfOurs), so a
+	// user manager's shutdown cannot hide the system manager's copy.
+	socketPaths := []string{userSocket, socketPath, userpaths.SystemReadSocketPath()}
+	for _, path := range socketPaths {
+		ipc.StopServing(path)
 	}
-	ipc.RemoveIfOurs(userSocket)
-	if socketPath != userSocket {
-		ipc.RemoveIfOurs(socketPath)
+	for _, path := range socketPaths {
+		ipc.RemoveIfOurs(path)
 	}
 	removeOwnPidFile(pidFile)
 	if userLock != nil {
@@ -788,13 +831,14 @@ func readPidFileInt() int {
 // different.
 func printPaths(asJSON bool) {
 	paths := map[string]string{
-		"user_socket":    userpaths.UserSocketPath(),
-		"system_socket":  userpaths.SystemSocketPath(),
-		"user_runtime":   userpaths.UserRuntimeDir(),
-		"user_state":     userpaths.UserStateDir(),
-		"user_journal":   userpaths.UserJournalDir(),
-		"system_journal": userpaths.SystemJournalDir(),
-		"user_bus":       userBusAddress(),
+		"user_socket":        userpaths.UserSocketPath(),
+		"system_socket":      userpaths.SystemSocketPath(),
+		"system_read_socket": userpaths.SystemReadSocketPath(),
+		"user_runtime":       userpaths.UserRuntimeDir(),
+		"user_state":         userpaths.UserStateDir(),
+		"user_journal":       userpaths.UserJournalDir(),
+		"system_journal":     userpaths.SystemJournalDir(),
+		"user_bus":           userBusAddress(),
 	}
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -808,7 +852,7 @@ func printPaths(asJSON bool) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Printf("%-16s %s\n", k, paths[k])
+		fmt.Printf("%-18s %s\n", k, paths[k])
 	}
 }
 

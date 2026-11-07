@@ -58,7 +58,7 @@ func runOffline(opts journalOpts) int {
 	// path (flat memory); merged multi-source queries keep the old
 	// materializing path since one cursor cannot page several scopes.
 	if req.Lines == 0 && !req.Reverse && !req.LatestInvocation {
-		if _, dirs := journalScope(opts); len(dirs) == 1 {
+		if _, dirs := journalScope(opts, true); len(dirs) == 1 {
 			files := expandDirEntry(dirs[0], opts)
 			return streamUnbounded(req, opts, func(q ipc.Request) []logging.StoredEntry {
 				out, _ := logging.QueryJournalStream(files, requestFilter(q))
@@ -87,7 +87,7 @@ func offlineBoot(opts journalOpts) (string, bool) {
 	if opts.boot == "" {
 		return logging.BootID(), true
 	}
-	_, dirs := journalScope(opts)
+	_, dirs := journalScope(opts, true)
 	var all []logging.StoredEntry
 	for i := range dirs {
 		entries, _ := logging.ReadAll(expandDirEntry(dirs[i], opts))
@@ -133,7 +133,7 @@ func resolveBoot(client *ipc.Client, socketPath string, opts journalOpts) string
 		}
 	}
 	if len(ids) == 0 {
-		_, dirs := journalScope(opts)
+		_, dirs := journalScope(opts, true)
 		var all []logging.StoredEntry
 		for i := range dirs {
 			entries, _ := logging.ReadAll(expandDirEntry(dirs[i], opts))

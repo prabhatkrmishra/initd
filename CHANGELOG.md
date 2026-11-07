@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Unprivileged `systemctl` and `journalctl` reads now reach the root daemon through `/run/initd-read.sock`, a read-only system socket owned `root:systemd-journal` with mode `0660`. The daemon publishes it only when it serves the system manager as root; a host without the group logs one line and leaves the read socket dark instead of retrying a bind that can never help. Every peer, root included, is limited to an allowlist of inspection verbs, and the request is decoded before that check so the decision is about the action rather than the uid. Mutating verbs - including `journalctl --vacuum`, `--sync`, `--flush` and `--rotate` - stay on the `0600` control socket and remain root-only. `systemctl` and `journalctl` select the read socket for unprivileged reads when it exists and fall back to the legacy uid-scoped socket otherwise; `--print-paths` reports it as `system_read_socket`. This is what lets `proxy-ctl log` and `proxy-ctl status` work without sudo on an initd host.
+
 ## [1.2.0] - 2026-09-26
 
 Nine bugs fixed, the two most consequential being that a control socket could be unlinked from under a live daemon - leaving a supervisor nobody could reach while its units kept running - and that a supervised daemon could not recognise itself as the manager's own child, which turned `hermes gateway restart` into an endless respawn-and-refuse loop. Verified on aarch64 hardware; the whole tree is clean under `go test -race`.

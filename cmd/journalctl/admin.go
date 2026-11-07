@@ -54,17 +54,23 @@ func runAdminCommand(opts journalOpts) int {
 }
 
 // journalScope resolves which daemon(s) and dirs a query touches. --user /
-// --system pick one; --merge or the default reads system then user.
-func journalScope(opts journalOpts) (sockets []string, dirs []string) {
+// --system pick one; --merge or the default reads system then user. readOnly
+// selects the system manager's read-only socket for unprivileged callers;
+// mutating verbs pass false so they keep the control path.
+func journalScope(opts journalOpts, readOnly bool) (sockets []string, dirs []string) {
 	sysSock := opts.socket
+	sysDir := userpaths.SystemJournalDir()
 	if sysSock == "" {
-		sysSock = userpaths.SystemSocketPath()
+		if readOnly && os.Geteuid() != 0 {
+			sysSock, sysDir = userpaths.SystemScopeForRead()
+		} else {
+			sysSock = userpaths.SystemSocketPath()
+		}
 	}
 	userSock := opts.socket
 	if userSock == "" {
 		userSock = userpaths.UserSocketPath()
 	}
-	sysDir := userpaths.SystemJournalDir()
 	userDir := userpaths.UserJournalDir()
 	root := strings.TrimSuffix(opts.root, "/")
 	if root != "" {
@@ -97,7 +103,7 @@ func journalScope(opts journalOpts) (sockets []string, dirs []string) {
 // fetchScopedEntries queries each daemon in scope (or reads files directly
 // when a daemon is down) and merges in time order.
 func fetchScopedEntries(opts journalOpts, req ipc.Request) []logging.StoredEntry {
-	sockets, dirs := journalScope(opts)
+	sockets, dirs := journalScope(opts, true)
 	var scopes [][]logging.StoredEntry
 	for i, sock := range sockets {
 		var files []string
@@ -178,7 +184,7 @@ func filterLocal(entries []logging.StoredEntry, req ipc.Request) []logging.Store
 }
 
 func runListBoots(opts journalOpts) int {
-	sockets, dirs := journalScope(opts)
+	sockets, dirs := journalScope(opts, true)
 	seen := map[string]int{}
 	var order []string
 	for i, sock := range sockets {
@@ -219,7 +225,7 @@ func runListBoots(opts journalOpts) int {
 }
 
 func runListInvocations(opts journalOpts) int {
-	sockets, dirs := journalScope(opts)
+	sockets, dirs := journalScope(opts, true)
 	var all []logging.StoredEntry
 	for i, sock := range sockets {
 		if sock == "" {
@@ -264,15 +270,16 @@ func formatUnixShort(usec int64) string {
 }
 
 func runDiskUsage(opts journalOpts) int {
-	bytes, files := diskUsageTotals(opts)
+	bytes, files := diskUsageTotals(opts, true)
 	fmt.Printf("Journals take up %s in %d files.\n", humanBytes(bytes), files)
 	return 0
 }
 
 // diskUsageTotals shares the counting between --disk-usage output and the
-// --vacuum confirmation so both agree.
-func diskUsageTotals(opts journalOpts) (int64, int64) {
-	sockets, dirs := journalScope(opts)
+// --vacuum confirmation so both agree. readOnly follows the caller's scope:
+// a vacuum counts the journal it is about to change, not the system one.
+func diskUsageTotals(opts journalOpts, readOnly bool) (int64, int64) {
+	sockets, dirs := journalScope(opts, readOnly)
 	var bytes, files int64
 	var daemonDirs []string
 	seenDaemonDirs := map[string]bool{}
@@ -365,8 +372,8 @@ func runVacuum(opts journalOpts) int {
 	}
 	// Vacuum runs through the daemon so the open file is never removed.
 	// Offline dirs vacuum directly with the same never-newest rule.
-	sockList, dirList := journalScope(opts)
-	beforeBytes, _ := diskUsageTotals(opts)
+	sockList, dirList := journalScope(opts, false)
+	beforeBytes, _ := diskUsageTotals(opts, false)
 	code := 0
 	for i, sock := range sockList {
 		if sock != "" {
@@ -387,7 +394,7 @@ func runVacuum(opts journalOpts) int {
 		}
 	}
 	if code == 0 {
-		afterBytes, afterFiles := diskUsageTotals(opts)
+		afterBytes, afterFiles := diskUsageTotals(opts, false)
 		freed := beforeBytes - afterBytes
 		if freed < 0 {
 			freed = 0
@@ -605,7 +612,7 @@ func humanBytes(n int64) string {
 }
 
 func runSyncFlush(opts journalOpts) int {
-	sockets, _ := journalScope(opts)
+	sockets, _ := journalScope(opts, false)
 	code := 0
 	did := false
 	for _, sock := range sockets {
@@ -631,7 +638,7 @@ func runSyncFlush(opts journalOpts) int {
 }
 
 func runRotate(opts journalOpts) int {
-	sockets, _ := journalScope(opts)
+	sockets, _ := journalScope(opts, false)
 	code := 0
 	did := false
 	for _, sock := range sockets {
@@ -653,7 +660,7 @@ func runRotate(opts journalOpts) int {
 }
 
 func runHeader(opts journalOpts) int {
-	_, dirs := journalScope(opts)
+	_, dirs := journalScope(opts, true)
 	for _, d := range dirs {
 		if strings.HasPrefix(d, "file:") {
 			d = filepath.Dir(strings.TrimPrefix(d, "file:"))
@@ -670,7 +677,7 @@ func journalFieldNames() []string {
 
 func runField(opts journalOpts) int {
 	name := strings.ToUpper(opts.field)
-	sockets, dirs := journalScope(opts)
+	sockets, dirs := journalScope(opts, true)
 	seen := map[string]bool{}
 	var vals []string
 	collect := func(entries []logging.StoredEntry) {
@@ -735,7 +742,7 @@ func fieldValue(e logging.StoredEntry, name string) string {
 }
 
 func runVerify(opts journalOpts) int {
-	_, dirs := journalScope(opts)
+	_, dirs := journalScope(opts, true)
 	bad := 0
 	files := 0
 	for _, d := range dirs {

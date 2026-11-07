@@ -142,17 +142,85 @@ var ipcConnSem = make(chan struct{}, maxIPCConns)
 // process serving.
 var TransportsProvider func() []map[string]string
 
+// socketAccess is the authorization contract of one listener. The control
+// socket is owner-only and trusts a caller once SO_PEERCRED says it is root or
+// the daemon's own uid. The read-only system socket is connectable by the
+// journal group (0660, enforced by the kernel at connect time) and admits only
+// actions that cannot mutate state, for every peer, root included.
+type socketAccess struct {
+	readOnly bool
+	// gid is the group granted connect access on a read-only socket. -1 keeps
+	// the socket owner-only, which is what tests and degraded hosts get.
+	gid int
+}
+
+// apply gives the bound path the permissions its access contract needs. The
+// control socket stays owner-only because every action on it can mutate
+// state. A read-only socket is group-connectable and group-readable; the
+// kernel's group check is what makes the caller a journal-group member, and
+// checkAction below still limits that caller to reads.
+func (a socketAccess) apply(socketPath string) error {
+	// Start owner-only: a failure before the group is set must never leave the
+	// socket at the umask's default permissions.
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		return err
+	}
+	if !a.readOnly || a.gid < 0 {
+		return nil
+	}
+	if err := os.Chown(socketPath, -1, a.gid); err != nil {
+		return fmt.Errorf("chown %s to group %d: %w", socketPath, a.gid, err)
+	}
+	return os.Chmod(socketPath, 0660)
+}
+
+// checkAction decides whether a peer may issue action. Requests are decoded
+// before this runs so the read-only listener can judge the action, not just
+// the transport. haveUID is false for non-Unix transports (tests); the
+// filesystem's permission bits are the gate there.
+func (a socketAccess) checkAction(uid uint32, haveUID bool, action string) error {
+	if a.readOnly {
+		if readOnlyAction(action) {
+			return nil
+		}
+		return fmt.Errorf("access denied: action %q is not permitted on the read-only socket", action)
+	}
+	if !haveUID {
+		return nil
+	}
+	if uid == 0 || int(uid) == os.Getuid() {
+		return nil
+	}
+	return fmt.Errorf("access denied: caller UID not authorized for this manager")
+}
+
+// readOnlyAction is the allowlist for the read-only socket. It is an allowlist,
+// not a denylist: a named action stays control-socket-only until someone
+// decides it is safe for unprivileged readers. Every "list-" verb is
+// inspection by convention, so that family is admitted by prefix; the named
+// verbs are what systemctl and journalctl send for status, is-active, cat and
+// journal queries.
+func readOnlyAction(action string) bool {
+	switch action {
+	case "status", "show", "is-active", "is-enabled", "is-failed",
+		"cat", "is-system-running", "transports", "need-daemon-reload",
+		"journal", "journal-boots", "journal-usage", "logs":
+		return true
+	}
+	return strings.HasPrefix(action, "list-")
+}
+
 // serveConn admits one accepted connection with bounded concurrency. When
 // saturated the connection is closed immediately without a reply or a new
 // goroutine: answering inline would stall the accept loop behind a peer
 // that never reads, and a detached replier would reintroduce the pressure
 // being bounded. Excess peers see EOF and retry.
-func serveConn(conn net.Conn, manager *supervisor.Manager) {
+func serveConn(conn net.Conn, manager *supervisor.Manager, access socketAccess) {
 	select {
 	case ipcConnSem <- struct{}{}:
 		go func() {
 			defer func() { <-ipcConnSem }()
-			handleConn(conn, manager)
+			handleConn(conn, manager, access)
 		}()
 	default:
 		_ = conn.Close()
@@ -322,8 +390,26 @@ func prepareControlSocketPath(socketPath string, manager *supervisor.Manager) er
 	return nil
 }
 
+// Serve serves the owner-only control socket. Every action, including the
+// mutating ones, is available to root and the daemon's own uid.
 func Serve(socketPath string, manager *supervisor.Manager) error {
+	return serve(socketPath, manager, socketAccess{gid: -1})
+}
+
+// ServeReadOnly serves the read-only view of the system manager. Members of
+// gid may connect (mode 0660); every peer, root included, is limited to
+// actions that only read state.
+func ServeReadOnly(socketPath string, manager *supervisor.Manager, gid int) error {
+	return serve(socketPath, manager, socketAccess{readOnly: true, gid: gid})
+}
+
+func serve(socketPath string, manager *supervisor.Manager, access socketAccess) error {
 	if strings.HasPrefix(socketPath, "@") {
+		// Abstract sockets have no permission bits, so they cannot carry the
+		// group-only contract of a read-only listener.
+		if access.readOnly && access.gid >= 0 {
+			return fmt.Errorf("read-only socket %s must be a filesystem path", socketPath)
+		}
 		addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(socketPath, "@"), Net: "unix"}
 		listener, err := net.ListenUnix("unix", addr)
 		if err != nil {
@@ -336,7 +422,7 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 				time.Sleep(acceptErrorDelay)
 				continue
 			}
-			serveConn(conn, manager)
+			serveConn(conn, manager, access)
 		}
 	}
 
@@ -355,7 +441,10 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 	}
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		if len(socketPath) > 90 && !strings.HasPrefix(socketPath, "@") {
+		// An abstract socket has no permission bits, so it cannot carry the
+		// group-only contract of a read-only listener; leave that one to fail
+		// rather than expose the journal to every local user.
+		if len(socketPath) > 90 && !strings.HasPrefix(socketPath, "@") && !access.readOnly {
 			abstract := abstractFallback(manager)
 			addr := &net.UnixAddr{Name: "\x00" + strings.TrimPrefix(abstract, "@"), Net: "unix"}
 			abstractListener, aerr := net.ListenUnix("unix", addr)
@@ -367,16 +456,16 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 						time.Sleep(acceptErrorDelay)
 						continue
 					}
-					serveConn(conn, manager)
+					serveConn(conn, manager, access)
 				}
 			}
 		}
 		return err
 	}
 	defer listener.Close()
-	// The control socket is privileged regardless of user/system mode; keep
-	// it owner-only so other users can't connect and issue commands.
-	_ = os.Chmod(socketPath, 0600)
+	if err := access.apply(socketPath); err != nil {
+		return err
+	}
 
 	// Record what we bound before serving, so shutdownDaemon can prove the
 	// path is still ours before it removes the name. A rebind re-records.
@@ -439,7 +528,7 @@ func Serve(socketPath string, manager *supervisor.Manager) error {
 			time.Sleep(acceptErrorDelay)
 			continue
 		}
-		serveConn(conn, manager)
+		serveConn(conn, manager, access)
 	}
 }
 
@@ -482,42 +571,34 @@ func peerUID(conn net.Conn) (uint32, bool) {
 	return uid, true
 }
 
-// allowedPeer mirrors the filesystem socket's 0600 for transports without
-// permission bits (Linux abstract namespace, used when the path exceeds
-// ~90 bytes). The daemon's own UID may always connect; root may always
-// connect (admin + sudo flows); anyone else is rejected before dispatch
-// regardless of action, including read-only ones, matching the 0600
-// posture of the filesystem socket.
-func allowedPeer(manager *supervisor.Manager, uid uint32) bool {
-	if uid == 0 {
-		return true
-	}
-	return int(uid) == os.Getuid()
-}
-
-func handleConn(conn net.Conn, manager *supervisor.Manager) {
+func handleConn(conn net.Conn, manager *supervisor.Manager, access socketAccess) {
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 	decoder := json.NewDecoder(io.LimitReader(conn, maxRequestBytes))
 	encoder := json.NewEncoder(conn)
-	// Enforce only when we have kernel credentials. Filesystem sockets
-	// remain protected by 0600 even if this check is skipped (tests).
-	if uid, ok := peerUID(conn); ok && !allowedPeer(manager, uid) {
-		_ = encoder.Encode(Response{Success: false, Message: "access denied: caller UID not authorized for this manager"})
-		return
-	}
 
+	// Decode first: the read-only listener authorizes per action, so the
+	// request has to be known before the peer can be judged. The size and
+	// time bounds above still cap what an unauthorized peer can make us read.
 	var req Request
 	if err := decoder.Decode(&req); err != nil {
 		_ = encoder.Encode(Response{Success: false, Message: err.Error()})
 		return
 	}
-
 	// The request arrived whole; the response may legitimately take
 	// minutes (stop/restart waits out TimeoutStopSec), so clear the read
 	// deadline and allow a generous write deadline instead.
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+
+	// Enforce only when we have kernel credentials. Filesystem sockets
+	// remain protected by their permission bits even if this check is
+	// skipped (tests). The read-only action allowlist applies regardless.
+	uid, haveUID := peerUID(conn)
+	if err := access.checkAction(uid, haveUID, req.Action); err != nil {
+		_ = encoder.Encode(Response{Success: false, Message: err.Error()})
+		return
+	}
 	response := dispatch(req, manager)
 	_ = encoder.Encode(response)
 }

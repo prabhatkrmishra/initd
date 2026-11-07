@@ -16,7 +16,7 @@ func TestOversizedRequestRejected(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleConn(a, nil)
+		handleConn(a, nil, socketAccess{gid: -1})
 	}()
 	huge := `{"action":"status","unit":"` + strings.Repeat("x", 2<<20) + `"}`
 	// Write in the background: the server stops reading at the 1MB cap

@@ -92,16 +92,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	resolvedSocket := *socketPath
-	if resolvedSocket == "" {
-		if userFlag {
-			resolvedSocket = userpaths.UserSocketPath()
-			ensureUserDaemon(resolvedSocket)
-		} else {
-			resolvedSocket = userpaths.SystemSocketPath()
-		}
-	}
-
 	if flags.NArg() < 1 {
 		usage()
 		os.Exit(1)
@@ -109,6 +99,22 @@ func main() {
 
 	cmd := flags.Arg(0)
 	cmdArgs := append(forwardedGlobal, flags.Args()[1:]...)
+
+	resolvedSocket := *socketPath
+	if resolvedSocket == "" {
+		switch {
+		case userFlag:
+			resolvedSocket = userpaths.UserSocketPath()
+			ensureUserDaemon(resolvedSocket)
+		case os.Geteuid() != 0 && readOnlyCommand(cmd):
+			// Unprivileged read verbs go through the system manager's
+			// read-only socket. Mutations keep the 0600 control socket, where
+			// the daemon's uid check is the authorization.
+			resolvedSocket = userpaths.SystemSocketForRead()
+		default:
+			resolvedSocket = userpaths.SystemSocketPath()
+		}
+	}
 
 	client := &ipc.Client{SocketPath: resolvedSocket}
 	// Like systemd, timeouts are server-side (TimeoutStartSec/
@@ -249,6 +255,18 @@ func main() {
 		usage()
 		os.Exit(1)
 	}
+}
+
+// readOnlyCommand reports whether a verb only inspects state. Unprivileged
+// callers send these over the system manager's read-only socket; every other
+// verb stays on the control socket, where a mutation is authorized.
+func readOnlyCommand(cmd string) bool {
+	switch cmd {
+	case "status", "show", "cat", "is-active", "is-enabled", "is-failed",
+		"is-system-running", "list-units", "list-unit-files", "help":
+		return true
+	}
+	return false
 }
 
 func handleSimple(client *ipc.Client, action string) {

@@ -79,6 +79,38 @@ func SystemSocketPath() string {
 	return "/run/initd.sock"
 }
 
+// SystemReadSocketPath is the read-only system control socket. It is
+// deliberately independent of the caller's uid: the whole point is that an
+// unprivileged reader reaches the root daemon through it, while
+// SystemSocketPath falls back to a per-uid socket that reader owns. Only the
+// root system manager publishes it.
+func SystemReadSocketPath() string {
+	return "/run/initd-read.sock"
+}
+
+// SystemScopeForRead resolves the system socket and journal directory an
+// unprivileged reader should use. When the root daemon publishes the
+// read-only socket, its journal is the system one under /var/log even though
+// this process is not root. Without that socket the legacy uid-scoped pair is
+// returned, so a manager started by this user keeps answering.
+func SystemScopeForRead() (socketPath, journalDir string) {
+	if isSocket(SystemReadSocketPath()) {
+		return SystemReadSocketPath(), systemJournalDir
+	}
+	return SystemSocketPath(), SystemJournalDir()
+}
+
+// SystemSocketForRead is SystemScopeForRead for callers that only dial.
+func SystemSocketForRead() string {
+	socketPath, _ := SystemScopeForRead()
+	return socketPath
+}
+
+func isSocket(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode()&os.ModeSocket != 0
+}
+
 func UserSocketPath() string {
 	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
 		return filepath.Join(xdg, "initd.sock")
@@ -115,12 +147,17 @@ func UserLockPath() string {
 	return fmt.Sprintf("/tmp/initd-%d.lock", uid)
 }
 
+// systemJournalDir is where the root system manager writes its durable
+// journal. It is also what an unprivileged reader queries over the read-only
+// socket, so the path is shared instead of repeated.
+const systemJournalDir = "/var/log/initd/journal"
+
 // SystemJournalDir is the durable log dir for the system manager. Root gets
 // /var/log/initd/journal; non-root falls back to the per-user state dir so
 // the daemon never fails to start for want of a writable /var/log.
 func SystemJournalDir() string {
 	if os.Getuid() == 0 {
-		return "/var/log/initd/journal"
+		return systemJournalDir
 	}
 	return filepath.Join(UserStateDir(), "journal")
 }

@@ -45,9 +45,16 @@ func main() {
 
 	socketPath := opts.socket
 	if socketPath == "" {
-		if opts.user {
+		switch {
+		case opts.user:
 			socketPath = userpaths.UserSocketPath()
-		} else {
+		case os.Geteuid() != 0:
+			// The same daemon serves the journal; only the transport differs.
+			// Unprivileged reads use the system manager's read-only socket,
+			// falling back to the legacy uid-scoped system socket when the
+			// root daemon has not published one.
+			socketPath = userpaths.SystemSocketForRead()
+		default:
 			socketPath = userpaths.SystemSocketPath()
 		}
 	}

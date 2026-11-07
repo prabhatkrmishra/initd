@@ -76,6 +76,14 @@ func TestSystemSocketPathRoot(t *testing.T) {
 	}
 }
 
+func TestSystemReadSocketPath(t *testing.T) {
+	// The read socket is fixed and uid-independent: an unprivileged reader
+	// is exactly who it exists for.
+	if got := SystemReadSocketPath(); got != "/run/initd-read.sock" {
+		t.Errorf("SystemReadSocketPath = %q, want /run/initd-read.sock", got)
+	}
+}
+
 func TestUserSocketPathXDG(t *testing.T) {
 	oldXDG := os.Getenv("XDG_RUNTIME_DIR")
 	defer os.Setenv("XDG_RUNTIME_DIR", oldXDG)
