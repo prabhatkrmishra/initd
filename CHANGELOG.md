@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-07
+
+One new capability: unprivileged reads. `systemctl` and `journalctl` now reach the root daemon through `/run/initd-read.sock`, a `root:systemd-journal` socket with mode `0660` that admits only inspection verbs. The `0600` control socket is unchanged and every mutation - `journalctl --vacuum`, `--sync`, `--flush` and `--rotate` included - still requires root. On an initd host this is what makes `proxy-ctl log` and `proxy-ctl status` work without sudo: put the reader in the `systemd-journal` group and start a new session. Verified on aarch64 hardware; the whole tree is clean under `go test -race`.
+
 ### Added
 - Unprivileged `systemctl` and `journalctl` reads now reach the root daemon through `/run/initd-read.sock`, a read-only system socket owned `root:systemd-journal` with mode `0660`. The daemon publishes it only when it serves the system manager as root; a host without the group logs one line and leaves the read socket dark instead of retrying a bind that can never help. Every peer, root included, is limited to an allowlist of inspection verbs, and the request is decoded before that check so the decision is about the action rather than the uid. Mutating verbs - including `journalctl --vacuum`, `--sync`, `--flush` and `--rotate` - stay on the `0600` control socket and remain root-only. `systemctl` and `journalctl` select the read socket for unprivileged reads when it exists and fall back to the legacy uid-scoped socket otherwise; `--print-paths` reports it as `system_read_socket`. This is what lets `proxy-ctl log` and `proxy-ctl status` work without sudo on an initd host.
 
