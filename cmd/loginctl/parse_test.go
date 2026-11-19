@@ -33,6 +33,9 @@ func TestParseOptionsStrict(t *testing.T) {
 
 func TestLingerRoundTrip(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	oldDir := systemLingerDir
+	systemLingerDir = t.TempDir()
+	t.Cleanup(func() { systemLingerDir = oldDir })
 	u, err := user.Current()
 	if err != nil {
 		t.Skip("no current user")

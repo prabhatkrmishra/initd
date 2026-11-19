@@ -3,6 +3,10 @@ package dbus
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
 
 	dbus "github.com/godbus/dbus/v5"
 
@@ -20,6 +24,7 @@ import (
 type transientScopeSpec struct {
 	Description     string
 	PIDs            []int
+	PIDFDs          []int
 	Slice           string
 	Delegate        bool
 	RemainAfterExit bool
@@ -47,6 +52,14 @@ func parseTransientScopeProperties(props []struct {
 				return spec, invalidArgs("PIDs must be an array of integers")
 			}
 			spec.PIDs = pids
+		case "PIDFDs":
+			fds, ok := variantUnixFDs(p.Value)
+			if !ok {
+				return spec, invalidArgs("PIDFDs must be an array of file descriptors")
+			}
+			// Append rather than replace: every descriptor in the message
+			// must be closed, including one from a duplicated property.
+			spec.PIDFDs = append(spec.PIDFDs, fds...)
 		case "Slice":
 			s, ok := variantString(p.Value)
 			if !ok {
@@ -113,6 +126,54 @@ func variantInts(v dbus.Variant) ([]int, bool) {
 	return nil, false
 }
 
+// variantUnixFDs returns the descriptor numbers carried by an "ah" variant.
+// Only real UnixFD values qualify: UnixFDIndex values are wire indices with no
+// descriptor attached, and closing them would close unrelated descriptors.
+func variantUnixFDs(v dbus.Variant) ([]int, bool) {
+	x, ok := v.Value().([]dbus.UnixFD)
+	if !ok {
+		return nil, false
+	}
+	out := make([]int, len(x))
+	for i, fd := range x {
+		out[i] = int(fd)
+	}
+	return out, true
+}
+
+// pidFromPIDFD maps a pidfd to the process it refers to. fdinfo exposes the
+// target PID; there is no other read-only mapping available to unprivileged
+// callers.
+func pidFromPIDFD(fd int) (int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", fd))
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(line, "Pid:")
+		if !ok {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(rest))
+		if err != nil {
+			return 0, fmt.Errorf("pidfd %d: parse pid: %w", fd, err)
+		}
+		if pid <= 0 {
+			return 0, fmt.Errorf("pidfd %d: invalid pid %d", fd, pid)
+		}
+		return pid, nil
+	}
+	return 0, fmt.Errorf("fd %d is not a pidfd", fd)
+}
+
+// closeUnixFDs releases the descriptor copies that SCM_RIGHTS installed in
+// this process. They are only needed long enough to resolve the target PIDs.
+func closeUnixFDs(fds []int) {
+	for _, fd := range fds {
+		_ = syscall.Close(fd)
+	}
+}
+
 func invalidArgs(msg string) *dbus.Error {
 	return &dbus.Error{Name: "org.freedesktop.DBus.Error.InvalidArgs", Body: []interface{}{msg}}
 }
@@ -149,8 +210,22 @@ func (m *systemd1Manager) StartTransientUnit(name string, mode string, propertie
 		return "", derr
 	}
 	spec, derr := parseTransientScopeProperties(properties)
+	// The descriptors are this process's copies, installed by SCM_RIGHTS.
+	// Close them on every path, including refusals and errors.
+	defer closeUnixFDs(spec.PIDFDs)
 	if derr != nil {
 		return "", derr
+	}
+	// logind no longer sends "PIDs" for session scopes: it pins the session
+	// leader with a pidfd in "PIDFDs". Resolve each one so the scope can
+	// track and later signal the process.
+	for _, fd := range spec.PIDFDs {
+		pid, err := pidFromPIDFD(fd)
+		if err != nil {
+			m.logf("StartTransientUnit %s: ignoring pidfd: %v", name, err)
+			continue
+		}
+		spec.PIDs = append(spec.PIDs, pid)
 	}
 	mgr := m.primarySafe()
 	// A name that resolves to something already is refused synchronously,

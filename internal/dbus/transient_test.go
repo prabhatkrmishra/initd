@@ -1,6 +1,7 @@
 package dbus
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	dbus "github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 func scopeProperties(t *testing.T, pid int) []struct {
@@ -112,6 +114,60 @@ func TestParseTransientScopePropertiesRejectsNonPositivePIDs(t *testing.T) {
 	}
 	if _, derr := parseTransientScopeProperties(props); derr == nil {
 		t.Fatal("PIDs containing 0 must be rejected")
+	}
+}
+
+func TestParseTransientScopePropertiesPIDFDs(t *testing.T) {
+	props := []struct {
+		Name  string
+		Value dbus.Variant
+	}{
+		{Name: "PIDFDs", Value: dbus.MakeVariant([]dbus.UnixFD{3, 4})},
+	}
+	spec, derr := parseTransientScopeProperties(props)
+	if derr != nil {
+		t.Fatalf("parse: %v", derr)
+	}
+	if len(spec.PIDFDs) != 2 || spec.PIDFDs[0] != 3 || spec.PIDFDs[1] != 4 {
+		t.Fatalf("PIDFDs = %v, want [3 4]", spec.PIDFDs)
+	}
+	if len(spec.PIDs) != 0 {
+		t.Fatalf("PIDs = %v, want none", spec.PIDs)
+	}
+}
+
+func TestParseTransientScopePropertiesRejectsWireOnlyPIDFDs(t *testing.T) {
+	// UnixFDIndex values are message indices, not descriptors. Treating them
+	// as descriptors would close unrelated file descriptors.
+	props := []struct {
+		Name  string
+		Value dbus.Variant
+	}{
+		{Name: "PIDFDs", Value: dbus.MakeVariant([]dbus.UnixFDIndex{0})},
+	}
+	if _, derr := parseTransientScopeProperties(props); derr == nil || derr.Name != "org.freedesktop.DBus.Error.InvalidArgs" {
+		t.Fatalf("wire-only PIDFDs: %v, want InvalidArgs", derr)
+	}
+}
+
+func TestPIDFromPIDFD(t *testing.T) {
+	fd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
+			t.Skipf("pidfd_open unsupported: %v", err)
+		}
+		t.Fatalf("pidfd_open: %v", err)
+	}
+	pid, err := pidFromPIDFD(fd)
+	if err != nil {
+		t.Fatalf("pidFromPIDFD: %v", err)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", pid, os.Getpid())
+	}
+	closeUnixFDs([]int{fd})
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("descriptor %d still open after closeUnixFDs: %v", fd, err)
 	}
 }
 

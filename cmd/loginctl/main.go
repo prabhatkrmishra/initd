@@ -209,11 +209,16 @@ func (o loginctlOptions) jsonPretty() (bool, bool) {
 
 // --- linger store ---------------------------------------------------------
 
+// systemLingerDir is logind's own linger store. It is a variable so tests can
+// redirect it; the deployed value is what makes a login work, because real
+// logind is the process that reads it, not this shim.
+var systemLingerDir = "/var/lib/systemd/linger"
+
 // lingerDir mirrors /var/lib/systemd/linger: one empty file per lingering
 // user. Root uses the system path, everyone else their own state dir.
 func lingerDir() string {
 	if os.Getuid() == 0 {
-		return "/var/lib/initd/linger"
+		return systemLingerDir
 	}
 	return filepath.Join(userpaths.UserStateDir(), "linger")
 }

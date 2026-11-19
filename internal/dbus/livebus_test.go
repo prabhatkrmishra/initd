@@ -10,6 +10,7 @@ import (
 	"time"
 
 	dbus "github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 // liveDbusServer is a private dbus-daemon plus a connected manager side. It
@@ -221,8 +222,24 @@ type scopeAuxArg struct {
 
 // The transient-scope path over a real bus: property marshalling of the a(sv)
 // and a(sa(sv)) argument shapes, creation of the scope unit, its properties
-// and its unload once the last process exits.
+// and its unload once the last process exits. The two subtests cover both ways
+// a caller names the processes: plain PIDs and the pidfds systemd-logind 255
+// sends for session scopes.
 func TestLiveBusStartTransientUnitLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pidfd bool
+	}{
+		{"PIDs", false},
+		{"PIDFDs", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testLiveBusStartTransientUnitLifecycle(t, tc.pidfd)
+		})
+	}
+}
+
+func testLiveBusStartTransientUnitLifecycle(t *testing.T, usePIDFDs bool) {
 	srv := spawnLiveDbus(t)
 	defer srv.Cleanup()
 
@@ -266,7 +283,16 @@ func TestLiveBusStartTransientUnitLifecycle(t *testing.T) {
 
 	props := []scopePropArg{
 		{Name: "Description", Value: dbus.MakeVariant("live bus scope")},
-		{Name: "PIDs", Value: dbus.MakeVariant([]uint32{uint32(cmd.Process.Pid)})},
+	}
+	if usePIDFDs {
+		pidfd, err := unix.PidfdOpen(cmd.Process.Pid, 0)
+		if err != nil {
+			t.Skipf("pidfd_open: %v", err)
+		}
+		defer unix.Close(pidfd)
+		props = append(props, scopePropArg{Name: "PIDFDs", Value: dbus.MakeVariant([]dbus.UnixFD{dbus.UnixFD(pidfd)})})
+	} else {
+		props = append(props, scopePropArg{Name: "PIDs", Value: dbus.MakeVariant([]uint32{uint32(cmd.Process.Pid)})})
 	}
 	aux := []scopeAuxArg{}
 	var jobPath dbus.ObjectPath

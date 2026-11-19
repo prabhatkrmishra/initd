@@ -51,7 +51,7 @@ remote hosts, FSS/catalog) with a clear stderr message.
 | Unknown flags | error | `unknown option` exit 1 | match (Phase 3) |
 | `-p` compact | `-pNAME` attached form (getopt) | same | match |
 | `show-*` format | `KEY=VALUE` at column zero, `-p/-P/--value`, `-a` for empties, manager props with no args | same; user props use real names (`UID/GID/Home`, plus `Linger/State`) | match (Phase 3) |
-| Linger | real per-user state | file store (`/var/lib/initd/linger`, else user state dir); `enable/disable` with no args act on caller | match (Phase 3) |
+| Linger | real per-user state | file store in logind's `/var/lib/systemd/linger` as root, else user state dir; `enable/disable` with no args act on caller | match (Phase 3) |
 | Session/seat actions | act on sessions | ID-targeted verbs report no-such-session/seat exit 1; empty plural verbs succeed trivially; `attach/flush-devices` loud-fail | match (Phase 3) |
 | `-H/-M` remote | remote ops | loud-fail | loud-fail (keep) |
 | `list-users` | `UID USER LINGER STATE` + count | same, plus `--json` | match (Phase 3) |
