@@ -1,6 +1,9 @@
 package dbus
 
 import (
+	"bytes"
+	"encoding/xml"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -128,6 +131,25 @@ func TestPolicyAllowsActivatorActivationRequest(t *testing.T) {
 	} {
 		if !strings.Contains(policy, want) {
 			t.Errorf("policy does not allow ActivationRequest: missing %s", want)
+		}
+	}
+}
+
+func TestPolicyFileIsWellFormedXML(t *testing.T) {
+	raw, err := os.ReadFile("org.freedesktop.systemd1.system-policy.conf")
+	if err != nil {
+		t.Fatalf("read policy: %v", err)
+	}
+	// XML forbids "--" inside comments; a malformed policy is discarded
+	// wholesale by dbus-daemon, which is how activation broke silently.
+	dec := xml.NewDecoder(bytes.NewReader(raw))
+	for {
+		_, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("policy is not well-formed XML: %v", err)
 		}
 	}
 }
