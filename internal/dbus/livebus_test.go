@@ -12,12 +12,15 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 )
 
-// This test exercises the real transport path (actual godbus marshalling over a
-// private dbus-daemon) that the rest of the suite only models: Manager method
-// export and argument encoding, JobNew/JobRemoved marshal, NJobs property
-// updates, and unexporting the finished job object. It skips where
-// dbus-daemon is unavailable.
-func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
+// liveDbusServer is a private dbus-daemon plus a connected manager side. It
+// exercises the real transport path that the rest of the suite only models.
+type liveDbusServer struct {
+	Addr    string
+	Cleanup func()
+}
+
+func spawnLiveDbus(t *testing.T) *liveDbusServer {
+	t.Helper()
 	if _, err := exec.LookPath("dbus-daemon"); err != nil {
 		t.Skip("dbus-daemon not available")
 	}
@@ -30,10 +33,6 @@ func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
 	if err := daemon.Start(); err != nil {
 		t.Skipf("cannot start dbus-daemon: %v", err)
 	}
-	defer func() {
-		_ = daemon.Process.Kill()
-		_, _ = daemon.Process.Wait()
-	}()
 
 	address := make(chan string, 1)
 	scanDone := make(chan struct{})
@@ -51,13 +50,31 @@ func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
 			}
 		}
 	}()
-	var busAddress string
+
+	srv := &liveDbusServer{}
 	select {
-	case busAddress = <-address:
+	case srv.Addr = <-address:
 	case <-time.After(5 * time.Second):
 		<-scanDone
+		_ = daemon.Process.Kill()
+		_, _ = daemon.Process.Wait()
 		t.Fatal("dbus-daemon did not print its address")
 	}
+	srv.Cleanup = func() {
+		_ = daemon.Process.Kill()
+		_, _ = daemon.Process.Wait()
+	}
+	return srv
+}
+
+// This test exercises the real transport path (actual godbus marshalling over a
+// private dbus-daemon) that the rest of the suite only models: Manager method
+// export and argument encoding, JobNew/JobRemoved marshal, NJobs property
+// updates, and unexporting the finished job object. It skips where
+// dbus-daemon is unavailable.
+func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
+	srv := spawnLiveDbus(t)
+	defer srv.Cleanup()
 
 	mgr := newTestManager(t)
 	dir := mgr.SearchPaths[0]
@@ -66,16 +83,14 @@ func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgrConn, err := dbus.Connect(busAddress)
+	mgrConn, err := dbus.Connect(srv.Addr)
 	if err != nil {
 		t.Fatalf("manager connect: %v", err)
 	}
 	defer mgrConn.Close()
-
-	ctx := context.Background()
 	managerDone := make(chan error, 1)
 	go func() {
-		managerDone <- serveManager(ctx, mgrConn, mgr)
+		managerDone <- serveManager(context.Background(), mgrConn, mgr)
 	}()
 	var serveErr error
 	select {
@@ -88,7 +103,7 @@ func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
 	}
 	_ = mgr.StopUnit("zzlivebus.service") // ensure no leftovers on failure paths
 
-	client, err := dbus.Connect(busAddress)
+	client, err := dbus.Connect(srv.Addr)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
@@ -192,4 +207,138 @@ func TestLiveBusStartUnitJobLifecycle(t *testing.T) {
 		t.Fatalf("GetJob error name = %q, want NoSuchJob", name)
 	}
 	_ = mgr.StopUnit("zzlivebus.service")
+}
+
+type scopePropArg struct {
+	Name  string
+	Value dbus.Variant
+}
+
+type scopeAuxArg struct {
+	Name  string
+	Value []scopePropArg
+}
+
+// The transient-scope path over a real bus: property marshalling of the a(sv)
+// and a(sa(sv)) argument shapes, creation of the scope unit, its properties
+// and its unload once the last process exits.
+func TestLiveBusStartTransientUnitLifecycle(t *testing.T) {
+	srv := spawnLiveDbus(t)
+	defer srv.Cleanup()
+
+	mgr := newTestManager(t)
+	if err := mgr.LoadUnits(); err != nil {
+		t.Fatal(err)
+	}
+	mgrConn, err := dbus.Connect(srv.Addr)
+	if err != nil {
+		t.Fatalf("manager connect: %v", err)
+	}
+	defer mgrConn.Close()
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- serveManager(context.Background(), mgrConn, mgr)
+	}()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serveManager: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveManager did not return")
+	}
+
+	cmd := exec.Command("/bin/sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start /bin/sleep: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	client, err := dbus.Connect(srv.Addr)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer client.Close()
+	obj := client.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+
+	props := []scopePropArg{
+		{Name: "Description", Value: dbus.MakeVariant("live bus scope")},
+		{Name: "PIDs", Value: dbus.MakeVariant([]uint32{uint32(cmd.Process.Pid)})},
+	}
+	aux := []scopeAuxArg{}
+	var jobPath dbus.ObjectPath
+	if err := obj.Call("org.freedesktop.systemd1.Manager.StartTransientUnit", 0, "zzlivebus-live.scope", "replace", props, aux).Store(&jobPath); err != nil {
+		t.Fatalf("StartTransientUnit: %v", err)
+	}
+	if !strings.HasPrefix(string(jobPath), "/org/freedesktop/systemd1/job/") {
+		t.Fatalf("job path = %q", jobPath)
+	}
+
+	// Creation runs inside the job; wait for it to finish.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var jobs []listJobEntry
+		if err := obj.Call("org.freedesktop.systemd1.Manager.ListJobs", 0).Store(&jobs); err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The scope exists and is active.
+	var unitPath dbus.ObjectPath
+	if err := obj.Call("org.freedesktop.systemd1.Manager.GetUnit", 0, "zzlivebus-live.scope").Store(&unitPath); err != nil {
+		t.Fatalf("GetUnit after creation: %v", err)
+	}
+	unitObj := client.Object("org.freedesktop.systemd1", unitPath)
+	var activeState dbus.Variant
+	if err := unitObj.Call("org.freedesktop.DBus.Properties.Get", 0, "org.freedesktop.systemd1.Unit", "ActiveState").Store(&activeState); err != nil {
+		t.Fatalf("ActiveState Get: %v", err)
+	}
+	if v, ok := activeState.Value().(string); !ok || v != "active" {
+		t.Fatalf("ActiveState = %v, want active", activeState.Value())
+	}
+
+	// Stopping the scope kills the member process and unloads the unit.
+	var stopJob dbus.ObjectPath
+	if err := obj.Call("org.freedesktop.systemd1.Manager.StopUnit", 0, "zzlivebus-live.scope", "replace").Store(&stopJob); err != nil {
+		t.Fatalf("StopUnit: %v", err)
+	}
+	for time.Now().Before(deadline) {
+		var jobs []listJobEntry
+		if err := obj.Call("org.freedesktop.systemd1.Manager.ListJobs", 0).Store(&jobs); err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitErr := make(chan error, 1)
+	go func() {
+		_, err := cmd.Process.Wait()
+		waitErr <- err
+	}()
+	killed := false
+	select {
+	case werr := <-waitErr:
+		// A signal kill surfaces as *ExitError; a clean exit never happens
+		// because termination came from outside.
+		_ = werr
+		killed = true
+	case <-time.After(5 * time.Second):
+	}
+	if !killed {
+		t.Fatal("scope stop did not terminate the member process")
+	}
+
+	c := obj.Call("org.freedesktop.systemd1.Manager.GetUnit", 0, "zzlivebus-live.scope")
+	if c.Err == nil {
+		t.Fatalf("GetUnit after stop returned %+v, want NoSuchUnit (scope unloaded)", c)
+	}
 }

@@ -120,12 +120,20 @@ func (t *Tree) Attach(unit string, pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid pid %d", pid)
 	}
-	f, err := os.OpenFile(filepath.Join(path, "cgroup.procs"), os.O_WRONLY, 0)
+	// The kernel parses each written buffer as one PID, and Members() reads
+	// the file back as a list: a bare PID per line. A leading newline only
+	// when the group already holds entries, so a single attach writes
+	// exactly the pid and the file never glues two pids into one number.
+	f, err := os.OpenFile(filepath.Join(path, "cgroup.procs"), os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = f.Write([]byte(strconv.Itoa(pid)))
+	pidPrefix := ""
+	if fi, statErr := os.Stat(filepath.Join(path, "cgroup.procs")); statErr == nil && fi.Size() > 0 {
+		pidPrefix = "\n"
+	}
+	_, err = f.Write([]byte(pidPrefix + strconv.Itoa(pid)))
 	return err
 }
 

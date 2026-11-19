@@ -51,6 +51,10 @@ type Manager struct {
 	// (system scope only). Empty disables the SysV generator; tests
 	// override it with a temp dir.
 	SysVInitDir string
+	// transientUnits holds the names of transient scope units created at
+	// runtime. They survive LoadUnits the way template instances do, so a
+	// daemon-reload does not orphan an active session scope.
+	transientUnits map[string]struct{}
 	// journal is the durable per-boot log store. Nil until OpenJournal
 	// runs at daemon startup; tests leave it nil and keep RAM-only rings.
 	journal *logging.FileWriter
@@ -88,9 +92,10 @@ func NewSystemManager() *Manager {
 			"/lib/systemd/system",
 			"/usr/lib/systemd/system",
 		},
-		EnabledRoot: "/etc/systemd/system",
-		UserMode:    false,
-		SysVInitDir: "/etc/init.d",
+		EnabledRoot:    "/etc/systemd/system",
+		UserMode:       false,
+		SysVInitDir:    "/etc/init.d",
+		transientUnits: map[string]struct{}{},
 	}
 }
 
@@ -102,6 +107,7 @@ func NewUserManager() *Manager {
 		SearchPaths:    userpaths.UserUnitsPaths(),
 		EnabledRoot:    userpaths.UserEnabledRoot(),
 		UserMode:       true,
+		transientUnits: map[string]struct{}{},
 	}
 }
 
@@ -119,6 +125,85 @@ func NewManagerWithMode(userMode bool) *Manager {
 		return NewUserManager()
 	}
 	return NewSystemManager()
+}
+
+// TransientScope describes a scope unit created at runtime (currently only
+// from the D-Bus StartTransientUnit method). PIDs are the processes the new
+// scope owns. Slice and Delegate are accepted for compatibility and are not
+// honoured for cgroup placement: scopes live under the manager's own cgroup
+// prefix like every other unit.
+type TransientScope struct {
+	Description     string
+	PIDs            []int
+	Slice           string
+	Delegate        bool
+	RemainAfterExit bool
+}
+
+// StartTransientScope registers a new scope unit and activates it around the
+// given PIDs. Only the .scope kind exists: service and socket transient
+// units are refused, as they have no general ExecStart to run.
+func (m *Manager) StartTransientScope(name string, spec TransientScope) error {
+	if err := ValidateTransientScopeName(name); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if _, exists := m.Units[name]; exists {
+		m.mu.Unlock()
+		return fmt.Errorf("Unit %s already exists.", name)
+	}
+	if _, exists := m.SocketUnits[name]; exists {
+		m.mu.Unlock()
+		return fmt.Errorf("Unit %s already exists.", name)
+	}
+	if m.unitExistsOnDiskLocked(name) {
+		m.mu.Unlock()
+		return fmt.Errorf("Unit %s already exists.", name)
+	}
+	cfg := &parser.Unit{Name: name}
+	cfg.Description = strings.TrimSpace(spec.Description)
+	if cfg.Description == "" {
+		cfg.Description = name
+	}
+	cfg.Service.Type = "scope"
+	if spec.RemainAfterExit {
+		cfg.Service.RemainAfterExit = "yes"
+	}
+	unit := m.newUnit(cfg, "")
+	if m.reaper != nil {
+		unit.SetReaper(m.reaper)
+	}
+	unit.SetOnFailureHandler(m.onFailureCallback(name))
+	unit.SetScopeEmptyHandler(m.unloadUnit)
+	m.attachJournalLocked(unit)
+	m.Units[name] = unit
+	m.UnitOrder = append(m.UnitOrder, name)
+	if m.transientUnits == nil {
+		m.transientUnits = map[string]struct{}{}
+	}
+	m.transientUnits[name] = struct{}{}
+	m.mu.Unlock()
+	return unit.ActivateScope(spec.PIDs, spec.RemainAfterExit)
+}
+
+// unloadUnit drops a transient scope whose last process has exited. Only
+// transient scopes are ever unloaded this way; nothing on disk is touched.
+func (m *Manager) unloadUnit(name string) {
+	m.mu.Lock()
+	if _, ok := m.transientUnits[name]; !ok {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.transientUnits, name)
+	delete(m.Units, name)
+	filtered := make([]string, 0, len(m.UnitOrder))
+	for _, n := range m.UnitOrder {
+		if n != name {
+			filtered = append(filtered, n)
+		}
+	}
+	m.UnitOrder = filtered
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetReaper(reaper service.ExitReaper) {
@@ -230,6 +315,31 @@ func (m *Manager) LoadUnits() error {
 		newConfig := cloneAndExpandTemplate(tmpl.GetConfig(), name, instance)
 		oldUnit.SetConfig(newConfig)
 		oldUnit.Path = tmpl.Path
+		if oldUnit.Reaper() == nil && m.reaper != nil {
+			oldUnit.SetReaper(m.reaper)
+		}
+		m.attachJournalLocked(oldUnit)
+		units[name] = oldUnit
+		order = append(order, name)
+	}
+
+	// Preserve transient scopes that are still active. Unlike template
+	// instances they have no unit file to re-parse, so the object carries
+	// over as-is.
+	for name := range m.transientUnits {
+		if _, exists := units[name]; exists {
+			continue
+		}
+		oldUnit, ok := oldUnits[name]
+		if !ok {
+			delete(m.transientUnits, name)
+			continue
+		}
+		if snap := oldUnit.Snapshot(); snap.State != service.StateActive && snap.State != service.StateActivating {
+			// The scope emptied itself; drop the registration.
+			delete(m.transientUnits, name)
+			continue
+		}
 		if oldUnit.Reaper() == nil && m.reaper != nil {
 			oldUnit.SetReaper(m.reaper)
 		}

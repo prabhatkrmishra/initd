@@ -107,6 +107,15 @@ type Unit struct {
 	// membership question can be answered "no evidence" instead of "nobody is
 	// running" on a box where groups cannot be created.
 	cgroupLeaf bool
+	// scopePIDs tracks the processes a transient .scope unit was created
+	// with. The cgroup leaf is the authoritative membership when there is
+	// one; this is the fallback when there is not.
+	scopePIDs            []int
+	scopeRemainAfterExit bool
+	// onScopeEmpty is called by scopes when their last tracked process has
+	// exited, so the manager can unload the transient unit. Nil for normal
+	// units.
+	onScopeEmpty func(name string)
 	// invocationID identifies the current run and is exported to the child as
 	// INVOCATION_ID, which systemd guarantees to every service it starts. It is
 	// read by buildEnvironment under configMu, not mu, because a start mints it
@@ -966,6 +975,11 @@ func (u *Unit) waitForking(token int, cmd *exec.Cmd, envMap map[string]string, e
 }
 
 func (u *Unit) Stop(timeout time.Duration) error {
+	if u.isScope() {
+		// A scope owns processes it did not exec: stop means SIGTERM the
+		// group and wait, never an ExecStop command it never had.
+		return u.stopScope(timeout)
+	}
 	u.mu.Lock()
 	u.stopRequested = true
 	u.mu.Unlock()
@@ -2095,7 +2109,7 @@ func (u *Unit) canonicalServiceType() string {
 	case "", "simple":
 		return "simple"
 
-	case "forking", "oneshot", "idle", "exec":
+	case "forking", "oneshot", "idle", "exec", "scope":
 		return serviceType
 
 	case "notify", "notify-reload":

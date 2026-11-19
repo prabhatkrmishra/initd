@@ -283,13 +283,10 @@ func jobUnitKnown(mgr *supervisor.Manager, name string) bool {
 	return err == nil
 }
 
-// enqueueUnitJob validates unit, enqueues the job, and runs run in the
-// background. The job path is returned immediately; the outcome is reported
-// through JobRemoved exactly once.
-func enqueueUnitJob(mgr *supervisor.Manager, jobs *jobRegistry, logf func(string, ...interface{}), unit, jobType string, run func(string) error) (dbus.ObjectPath, *dbus.Error) {
-	if !jobUnitKnown(mgr, unit) {
-		return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", unit)}}
-	}
+// queueUnitJob enqueues the job and runs run in the background. The job path
+// is returned immediately; the outcome is reported through JobRemoved exactly
+// once. Callers that require the unit to exist must check first.
+func queueUnitJob(mgr *supervisor.Manager, jobs *jobRegistry, logf func(string, ...interface{}), unit, jobType string, run func(string) error) (dbus.ObjectPath, *dbus.Error) {
 	job := jobs.newJob(unit, jobType)
 	go func() {
 		if !jobs.begin(job) {
@@ -307,4 +304,14 @@ func enqueueUnitJob(mgr *supervisor.Manager, jobs *jobRegistry, logf func(string
 		jobs.finish(job, jobResultDone)
 	}()
 	return job.path, nil
+}
+
+// enqueueUnitJob validates unit, enqueues the job, and runs run in the
+// background. The job path is returned immediately; the outcome is reported
+// through JobRemoved exactly once.
+func enqueueUnitJob(mgr *supervisor.Manager, jobs *jobRegistry, logf func(string, ...interface{}), unit, jobType string, run func(string) error) (dbus.ObjectPath, *dbus.Error) {
+	if !jobUnitKnown(mgr, unit) {
+		return "", &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{fmt.Sprintf("Unit %s not found.", unit)}}
+	}
+	return queueUnitJob(mgr, jobs, logf, unit, jobType, run)
 }
