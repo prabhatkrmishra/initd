@@ -3,12 +3,14 @@ package dbus
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	dbus "github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 
 	"initd/internal/build"
+	"initd/internal/logging"
 	sservice "initd/internal/service"
 	"initd/internal/supervisor"
 	"strconv"
@@ -1028,7 +1030,26 @@ func serveManager(ctx context.Context, conn *dbus.Conn, primary *supervisor.Mana
 		return fmt.Errorf("request name %s: reply=%v", managerBusName, reply)
 	}
 
+	// D-Bus service activation: when the bus daemon cannot start a service on
+	// its own it asks us over the Activator signal. A missing subscription
+	// means the request times out after 25s and the service never starts, so
+	// log loudly and keep serving if the match cannot be added. Without a
+	// backing supervisor there is nobody to activate for.
+	if primary != nil {
+		if err := watchActivatorSignals(ctx, conn, primary.StartUnit, activatorLog); err != nil {
+			activatorLog("activation subscription failed: %v (D-Bus-activated units will not start)", err)
+		}
+	} else {
+		activatorLog("no supervisor for this connection; D-Bus-activated units will not start")
+	}
+
 	return nil
+}
+
+// activatorLog reports activation failures on the daemon's own log, the same
+// place every other initd diagnostic goes.
+func activatorLog(format string, args ...interface{}) {
+	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "activator: "+format, args...)
 }
 
 func primarySafe(primary *supervisor.Manager) *supervisor.Manager {

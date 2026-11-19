@@ -1,6 +1,8 @@
 package dbus
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -94,4 +96,21 @@ func TestListUnitsFilteredHonorsFilter(t *testing.T) {
 		t.Fatalf("active run.service missing from filtered list")
 	}
 	_ = mgr.StopUnit("run.service")
+}
+
+func TestPolicyAllowsActivatorActivationRequest(t *testing.T) {
+	raw, err := os.ReadFile("org.freedesktop.systemd1.system-policy.conf")
+	if err != nil {
+		t.Fatalf("read policy: %v", err)
+	}
+	policy := string(raw)
+	for _, want := range []string{
+		`receive_sender="org.freedesktop.DBus"`,
+		`receive_interface="org.freedesktop.systemd1.Activator"`,
+		`receive_member="ActivationRequest"`,
+	} {
+		if !strings.Contains(policy, want) {
+			t.Errorf("policy does not allow ActivationRequest: missing %s", want)
+		}
+	}
 }
