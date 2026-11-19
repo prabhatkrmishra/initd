@@ -234,7 +234,15 @@ else
     dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
 fi
 PIDFILE="$XDG_RUNTIME_DIR/initd.pid"
-if { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; } \
+# When the user@.service drop-in is installed, the session manager is started
+# on login through logind activation of user@<uid>.service instead of here.
+# Launching another daemon would race it for the same socket, and the user@
+# service would loop forever without ever becoming ready. Fall back to the
+# direct launch only when the drop-in path is not usable on this host.
+DROP_IN=/etc/systemd/system/user@.service.d/initd.conf
+if [ -f "$DROP_IN" ] && { [ -f /lib/systemd/system/user@.service ] || [ -f /usr/lib/systemd/system/user@.service ]; }; then
+    : # logind starts the session manager via user@<uid>.service
+elif { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; } \
    || pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
     # A manager is already up for this uid. The pidfile check covers the
     # profile.d autostart; the pgrep covers one started by user@.service.
