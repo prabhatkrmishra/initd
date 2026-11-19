@@ -12,6 +12,7 @@ import (
 	"initd/internal/dbus"
 	"initd/internal/ipc"
 	"initd/internal/logging"
+	"initd/internal/notify"
 	"initd/internal/supervisor"
 	"initd/internal/userpaths"
 
@@ -146,6 +147,11 @@ func main() {
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 			"unit cgroups unavailable (%s); stops fall back to process groups", tree.Reason())
 	}
+
+	// Notification sockets are files now, so a crashed daemon can leave them
+	// behind. Only files whose owning pid is gone are touched, which keeps a
+	// second manager's live sockets safe.
+	notify.SweepStale()
 
 	// stopServe is closed by shutdownDaemon. Serve loops check it before
 	// rebinding: without this a shutdown that removes the socket file

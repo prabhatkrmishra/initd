@@ -745,9 +745,16 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	// start (a stop or a newer start bumped the token while this one was
 	// exec'ing) used to kill the child and return with the socket still open:
 	// the unit's own handle is cleared by whoever superseded us, so nothing ever
-	// stopped it and the abstract name stayed in the kernel for the life of the
-	// daemon. The defer owns that, so a new early return cannot leak one.
-	var pendingNotify *notify.Server
+	// stopped it and the socket file stayed on disk for the life of the daemon.
+	// The defer owns that, so a new early return cannot leak one.
+	var notifyServer *notify.Server
+	notifyHandedOff := false
+	defer func() {
+		if notifyServer != nil && !notifyHandedOff {
+			u.releaseNotifyServer(notifyServer)
+		}
+	}()
+
 	if serviceType == "notify" {
 		server, err := notify.Start()
 		if err != nil {
@@ -758,19 +765,17 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 			return
 		}
 
-		pendingNotify = server
-		envList = append(envList, "NOTIFY_SOCKET="+server.Path)
-
-		u.mu.Lock()
-		u.notifyServer = server
-		u.mu.Unlock()
-	}
-	notifyHandedOff := false
-	defer func() {
-		if pendingNotify != nil && !notifyHandedOff {
-			u.releaseNotifyServer(pendingNotify)
+		notifyServer = server
+		// Claiming the unit's handle is a compare-and-swap against the
+		// start token: a stop that lands while the socket is being created
+		// may already have started the next run, and this one must not
+		// overwrite that run's server on its way out.
+		if !u.installNotifyServer(token, server) {
+			closeSocketFiles()
+			return
 		}
-	}()
+		envList = append(envList, "NOTIFY_SOCKET="+server.Path)
+	}
 
 	stdoutLogger := &logging.LineLogger{
 		Unit:   u.GetConfig().Name,
@@ -877,7 +882,7 @@ func (u *Unit) runStartSequence(token int, args []string, envMap map[string]stri
 	case "forking":
 		go u.waitForking(token, cmd, envMap, envList, ignoreFailure)
 	case "notify":
-		go u.waitNotify(token, cmd, envMap, envList, ignoreFailure)
+		go u.waitNotify(token, cmd, notifyServer, envMap, envList, ignoreFailure)
 	default:
 		go u.waitSimple(token, cmd, envMap, envList, ignoreFailure)
 	}
@@ -1664,7 +1669,12 @@ func (u *Unit) handleExitCode(token int, watchedPID int, exitCode int, mainCode 
 	// for that SIGTERM must not overwrite LastError with "terminated by
 	// signal SIGTERM" / 143.
 	if u.Runtime.State == StateFailed {
+		srv := u.notifyServer
+		u.notifyServer = nil
 		u.mu.Unlock()
+		if srv != nil {
+			srv.Stop()
+		}
 		return
 	}
 
@@ -3263,6 +3273,25 @@ func (u *Unit) releaseNotifyServer(srv *notify.Server) {
 	srv.Stop()
 }
 
+// installNotifyServer publishes srv as the unit's notification socket for the
+// run identified by token. A start that was superseded while it was creating
+// the socket must not replace the newer run's handle: the caller sees false and
+// releases its own server instead.
+func (u *Unit) installNotifyServer(token int, srv *notify.Server) bool {
+	u.mu.Lock()
+	if u.startToken != token || u.stopRequested {
+		u.mu.Unlock()
+		return false
+	}
+	old := u.notifyServer
+	u.notifyServer = srv
+	u.mu.Unlock()
+	if old != nil && old != srv {
+		old.Stop()
+	}
+	return true
+}
+
 func (u *Unit) notifyMainPID(cmd *exec.Cmd) int {
 	if pid := u.waitForLivePIDFile(500*time.Millisecond, 25*time.Millisecond); pid != 0 {
 		return pid
@@ -3278,11 +3307,7 @@ func (u *Unit) notifyMainPID(cmd *exec.Cmd) int {
 	return 0
 }
 
-func (u *Unit) waitNotify(token int, cmd *exec.Cmd, envMap map[string]string, envList []string, ignoreFailure bool) {
-	u.mu.Lock()
-	server := u.notifyServer
-	u.mu.Unlock()
-
+func (u *Unit) waitNotify(token int, cmd *exec.Cmd, server *notify.Server, envMap map[string]string, envList []string, ignoreFailure bool) {
 	if server == nil {
 		u.markFailed(fmt.Errorf("notify server missing"), ignoreFailure)
 		return
@@ -3353,6 +3378,7 @@ func (u *Unit) waitNotify(token int, cmd *exec.Cmd, envMap map[string]string, en
 		u.mu.Unlock()
 		if err := u.runExecStartPost(token, envMap, envList); err != nil && !u.StopRequested() {
 			u.killMainProcess(u.stopSignal())
+			u.releaseNotifyServer(server)
 			u.markFailed(err, ignoreFailure)
 			return
 		}
@@ -3392,6 +3418,9 @@ func (u *Unit) waitNotify(token int, cmd *exec.Cmd, envMap map[string]string, en
 		if cmd != nil && cmd.Process != nil {
 			u.killMainProcess(u.stopSignal())
 		}
+		// This exact server, not whatever the unit holds now: a stop may
+		// already have started the next run.
+		u.releaseNotifyServer(server)
 		u.markTimeout(fmt.Errorf("notify timeout"), ignoreFailure)
 		return
 	}

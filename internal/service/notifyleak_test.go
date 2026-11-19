@@ -9,19 +9,19 @@ import (
 	"initd/internal/notify"
 )
 
-// notifySocketCount counts the notify sockets the kernel still holds for this
-// user. /proc/net/unix is the only place an abstract name shows up, so it is
-// what makes the leak observable at all: a closed socket has no name left to
-// grep for anywhere else.
+// notifySocketCount counts the notification sockets this manager still has on
+// disk. The sockets live under the runtime dir; a stopped server removes its
+// file, so a leftover file is the leak.
 func notifySocketCount(t *testing.T) int {
 	t.Helper()
-	raw, err := os.ReadFile("/proc/net/unix")
+	entries, err := os.ReadDir(notify.Dir())
 	if err != nil {
-		t.Skipf("cannot read /proc/net/unix: %v", err)
+		t.Skipf("cannot read notify dir %s: %v", notify.Dir(), err)
 	}
 	n := 0
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.Contains(line, "initd-notify-") {
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && strings.HasPrefix(name, "notify-") && strings.HasSuffix(name, ".sock") {
 			n++
 		}
 	}
@@ -110,14 +110,53 @@ func TestSupersededNotifyStartDoesNotAccumulateSockets(t *testing.T) {
 		u.mu.Unlock()
 
 		_ = u.Stop(2 * time.Second)
-		u.releaseNotifyServer(func() *notify.Server {
-			u.mu.Lock()
-			defer u.mu.Unlock()
-			return u.notifyServer
-		}())
+		// No manual release here: the start's own hand-off cleanup and Stop
+		// have to leave nothing behind.
 	}
 
 	if got := waitNotifyCount(t, before); got != before {
 		t.Errorf("notify sockets after 12 superseded starts = %d, want %d", got, before)
+	}
+}
+
+// A notify start that times out is the production leak: sshd never answered
+// the old abstract socket, every attempt was marked failed, and the server was
+// left open because handleExit took the StateFailed early return.
+func TestNotifyTimeoutLeavesNoSocket(t *testing.T) {
+	before := waitNotifyCount(t, 0)
+
+	u := newTestUnit(t, "zznotifytimeout.service",
+		"[Service]\nType=notify\nTimeoutStartSec=200ms\nExecStart=/bin/sleep 30\n")
+	defer func() { _ = u.Stop(2 * time.Second) }()
+
+	if _, err := u.StartAndWait(true); err == nil {
+		t.Fatal("StartAndWait() = nil for a notify unit that never signals ready")
+	}
+	waitForState(t, u, StateFailed)
+
+	u.mu.Lock()
+	held := u.notifyServer
+	u.mu.Unlock()
+	if held != nil {
+		t.Error("unit still holds its notify server after a timeout")
+	}
+	if got := waitNotifyCount(t, before); got != before {
+		t.Errorf("notify sockets after a timeout = %d, want %d", got, before)
+	}
+}
+
+// Repeating the failure must not accumulate one socket per attempt.
+func TestRepeatedNotifyTimeoutsDoNotAccumulateSockets(t *testing.T) {
+	before := waitNotifyCount(t, 0)
+
+	for i := 0; i < 3; i++ {
+		u := newTestUnit(t, "zznotifyrepeat.service",
+			"[Service]\nType=notify\nTimeoutStartSec=150ms\nExecStart=/bin/sleep 30\n")
+		_, _ = u.StartAndWait(true)
+		_ = u.Stop(time.Second)
+	}
+
+	if got := waitNotifyCount(t, before); got != before {
+		t.Errorf("notify sockets after repeated timeouts = %d, want %d", got, before)
 	}
 }
