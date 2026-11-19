@@ -367,6 +367,7 @@ func main() {
 			}
 
 			boot.SpawnVirtualTerminals()
+			sendInitdReady()
 
 			for {
 				select {
@@ -400,6 +401,7 @@ func main() {
 						"failed to start enabled user units: %v", err)
 				}
 			}
+			sendInitdReady()
 
 			for {
 				select {
@@ -469,6 +471,16 @@ func stopManagerBounded(mgr *supervisor.Manager, bound time.Duration) {
 	case <-time.After(bound):
 		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 			"unit shutdown timed out, continuing anyway")
+	}
+}
+
+// sendInitdReady reports READY=1 to the manager that started this daemon, if
+// any (Type=notify units such as systemd's user@.service). Socket-only mode
+// never reaches here, and a daemon started outside a manager never had
+// NOTIFY_SOCKET set, so both skip the send silently.
+func sendInitdReady() {
+	if err := notify.Ready(); err != nil {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "notify: READY: %v", err)
 	}
 }
 

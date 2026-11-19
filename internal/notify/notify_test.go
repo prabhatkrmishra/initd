@@ -71,3 +71,85 @@ func TestSweepStaleKeepsLiveAndRemovesDead(t *testing.T) {
 		t.Errorf("stale socket still exists: %v", err)
 	}
 }
+
+// receiveOneDatagram drains a single datagram from conn, tolerating nothing
+// else on the wire.
+func receiveOneDatagram(t *testing.T, conn *net.UnixConn) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read notify datagram: %v", err)
+	}
+	return string(buf[:n])
+}
+
+func TestReadySendsREADY1ToFilesystemSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notify.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer conn.Close()
+
+	t.Setenv("NOTIFY_SOCKET", path)
+	if err := Ready(); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	got := receiveOneDatagram(t, conn)
+	if got != "READY=1\n" {
+		t.Fatalf("received %q, want READY=1\\n", got)
+	}
+}
+
+func TestReadySendsSTATUSToo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notify.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer conn.Close()
+
+	t.Setenv("NOTIFY_SOCKET", path)
+	if err := Ready("all systems go"); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	got := receiveOneDatagram(t, conn)
+	if got != "READY=1\nSTATUS=all systems go\n" {
+		t.Fatalf("received %q", got)
+	}
+}
+
+func TestReadyOnAbstractSocket(t *testing.T) {
+	name := fmt.Sprintf("initd-notify-test-%d", os.Getpid())
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: "\x00" + name, Net: "unixgram"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer conn.Close()
+
+	t.Setenv("NOTIFY_SOCKET", "@"+name)
+	if err := Ready(); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	got := receiveOneDatagram(t, conn)
+	if got != "READY=1\n" {
+		t.Fatalf("received %q, want READY=1\\n", got)
+	}
+}
+
+func TestReadyWithoutNotifySocketIsSilentNoOp(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "")
+	if err := Ready(); err != nil {
+		t.Fatalf("Ready with NOTIFY_SOCKET unset must be a no-op, got %v", err)
+	}
+}
+
+func TestReadyReportsUnreachableSocket(t *testing.T) {
+	// Nothing is listening on this path; the error must surface, not hang.
+	t.Setenv("NOTIFY_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+	if err := Ready(); err == nil {
+		t.Fatal("Ready against a dead socket must error, got nil")
+	}
+}

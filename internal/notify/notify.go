@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"initd/internal/userpaths"
 )
@@ -137,4 +138,52 @@ func (s *Server) Stop() {
 	if s.Path != "" && !strings.HasPrefix(s.Path, "@") {
 		_ = os.Remove(s.Path)
 	}
+}
+
+// notifySocketWriteTimeout bounds how long Send waits on a datagram socket
+// whose buffer is full; readiness must never hang the supervisor's startup.
+const notifySocketWriteTimeout = 2 * time.Second
+
+// Send writes state to the notification socket the manager passed in
+// NOTIFY_SOCKET, if any. The socket may be a filesystem path or an abstract
+// name (a leading @). When NOTIFY_SOCKET is unset the call is a no-op, which
+// is what makes a plain service work without a manager behind it.
+// state is written with a trailing newline; multi-line payloads (e.g.
+// "READY=1\nSTATUS=...") are sent as a single datagram.
+func Send(state string) error {
+	addr := os.Getenv("NOTIFY_SOCKET")
+	if addr == "" {
+		return nil
+	}
+	path := addr
+	if strings.HasPrefix(addr, "@") {
+		// systemd's abstract form: a leading @ stands for a NUL byte.
+		path = "\x00" + strings.TrimPrefix(addr, "@")
+	}
+	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: path, Net: "unixgram"})
+	if err != nil {
+		return fmt.Errorf("notify: connect %s: %w", addr, err)
+	}
+	defer conn.Close()
+	if err := conn.SetWriteDeadline(time.Now().Add(notifySocketWriteTimeout)); err != nil {
+		return fmt.Errorf("notify: set write deadline: %w", err)
+	}
+	payload := state
+	if !strings.HasSuffix(payload, "\n") {
+		payload += "\n"
+	}
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		return fmt.Errorf("notify: send to %s: %w", addr, err)
+	}
+	return nil
+}
+
+// Ready reports that the daemon finished startup: READY=1, with an optional
+// human-readable status (STATUS=...) included in the same datagram.
+func Ready(status ...string) error {
+	msg := "READY=1"
+	if len(status) > 0 && status[0] != "" {
+		msg += "\nSTATUS=" + status[0]
+	}
+	return Send(msg)
 }

@@ -234,8 +234,12 @@ else
     dbus-daemon --session --fork --address="$DBUS_SESSION_BUS_ADDRESS" --print-pid=1 >/dev/null 2>&1 || true
 fi
 PIDFILE="$XDG_RUNTIME_DIR/initd.pid"
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    : # daemon already running
+if { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; } \
+   || pgrep -u "$(id -u)" -x initd >/dev/null 2>&1; then
+    # A manager is already up for this uid. The pidfile check covers the
+    # profile.d autostart; the pgrep covers one started by user@.service.
+    # Never run two supervisors for the same uid.
+    :
 else
     # A login spawned by sudo (or a chroot entrypoint) inherits SUDO_USER*,
     # which would make initd's RealUID() resolve to the sudo user and route
@@ -433,6 +437,34 @@ else
   fi
 fi
 
+# --- user manager drop-in (systemd's user@.service runs initd --init) ---------
+# On hosts whose user@.service exists, run initd as the per-user manager:
+# pam_systemd needs a session manager that owns org.freedesktop.systemd1 and
+# sends READY=1, both of which systemd --user cannot do on an initd host.
+# Only the ExecStart= line changes; the host unit's Type=notify-reload,
+# User=%i and Requires=user-runtime-dir@%i.service stay in place.
+# Takes effect the next time the user manager starts (login or reboot).
+USER_DROP_IN_DIR="/etc/systemd/system/user@.service.d"
+USER_DROP_IN="$USER_DROP_IN_DIR/initd.conf"
+if [ -f /lib/systemd/system/user@.service ] || [ -f /usr/lib/systemd/system/user@.service ]; then
+  echo "Installing user manager drop-in -> $USER_DROP_IN"
+  as_root mkdir -p "$USER_DROP_IN_DIR"
+  tmp_dropin=$(mktemp)
+  cat > "$tmp_dropin" <<'EOSH'
+# Installed by initd install.sh — run initd as the per-user manager instead
+# of systemd --user. The host unit's Type=notify-reload, User=%i and
+# Requires=user-runtime-dir@%i.service stay in place; only ExecStart changes.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/initd --init --pid-file %t/initd.pid
+EOSH
+  as_root install -m 0644 "$tmp_dropin" "$USER_DROP_IN"
+  rm -f "$tmp_dropin"
+  echo "note: initd will serve the user manager from the next login onwards." >&2
+else
+  echo "no user@.service on this host; skipping the user manager drop-in."
+fi
+
 # --- verify --------------------------------------------------------------------
 echo "Verifying org.freedesktop.systemd1 ownership ..."
 if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
@@ -472,6 +504,7 @@ install.sh complete.
   real backup   : $REAL_BACKUP
   session bus   : $XDG_RUNTIME_DIR/bus
   autostart     : $AUTOSTART_FILE  (runs \`initd --init\` on each session login)
+  user manager  : /etc/systemd/system/user@.service.d/initd.conf  (initd --init, if user@.service exists)
 
 After this, on each session login, if the daemon is not running, initd --init starts and
 brings up ALL enabled units automatically.
