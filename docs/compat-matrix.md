@@ -54,7 +54,8 @@ remote hosts, FSS/catalog) with a clear stderr message.
 | Linger | real per-user state | file store in logind's `/var/lib/systemd/linger` as root, else user state dir; `enable/disable` with no args act on caller | match (Phase 3) |
 | Session/seat actions | act on sessions | ID-targeted verbs report no-such-session/seat exit 1; empty plural verbs succeed trivially; `attach/flush-devices` loud-fail | match (Phase 3) |
 | `-H/-M` remote | remote ops | loud-fail | loud-fail (keep) |
-| `list-users` | `UID USER LINGER STATE` + count | same, plus `--json` | match (Phase 3) |
+| `list-sessions` | `SESSION UID USER SEAT TTY STATE IDLE SINCE` + count from logind | same; rows from login1 `ListSessions` plus per-session `TTY/State/IdleHint`, empty table when logind is absent | match (live logind) |
+| `list-users` | `UID USER LINGER STATE` + count from logind | same; rows from login1 `ListUsers` plus `Linger/State`, merged with local linger files; linger-only fallback without logind; plus `--json` | match (live logind) |
 
 ## initd vs systemd PID1 (real `systemd --help`: 34 lines)
 

@@ -278,25 +278,57 @@ func callerName() (string, error) {
 	return u.Username, nil
 }
 
-// --- sessions (untracked) ---------------------------------------------------
+// --- sessions ---------------------------------------------------------------
 
 func handleListSessions(opts loginctlOptions, args []string) int {
 	if len(args) > 0 {
 		fmt.Fprintf(os.Stderr, "list-sessions takes no arguments\n")
 		return 1
 	}
+	sessions, err := fetchLoginSessions()
+	if err != nil {
+		// No logind (or no bus) is the normal state in a bare chroot. Keep
+		// the old answer instead of turning a probe into an error.
+		sessions = nil
+	}
 	if asJSON, pretty := opts.jsonPretty(); asJSON {
-		if pretty {
-			fmt.Println("[]")
-		} else {
-			fmt.Println("[]")
+		type jsession struct {
+			Session string `json:"session"`
+			UID     uint32 `json:"uid"`
+			User    string `json:"user"`
+			Seat    string `json:"seat"`
+			TTY     string `json:"tty"`
+			State   string `json:"state"`
+			Idle    bool   `json:"idle"`
+			Since   string `json:"since"`
 		}
+		jrows := make([]jsession, 0, len(sessions))
+		for _, s := range sessions {
+			jrows = append(jrows, jsession{
+				Session: s.ID, UID: s.UID, User: s.User, Seat: s.Seat,
+				TTY: s.TTY, State: s.State, Idle: s.Idle, Since: dash(s.Since),
+			})
+		}
+		var raw []byte
+		if pretty {
+			raw, err = json.MarshalIndent(jrows, "", "  ")
+		} else {
+			raw, err = json.Marshal(jrows)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 1
+		}
+		fmt.Println(string(raw))
 		return 0
 	}
-	if !opts.noLegend {
-		fmt.Println("SESSION UID USER SEAT LEADER CLASS TTY IDLE SINCE")
-	}
-	fmt.Println("0 sessions listed.")
+	printColumns(
+		[]string{"SESSION", "UID", "USER", "SEAT", "TTY", "STATE", "IDLE", "SINCE"},
+		sessionRows(sessions),
+		[]bool{true, true, false, false, false, false, false, false},
+		opts.noLegend,
+	)
+	fmt.Printf("%d sessions listed.\n", len(sessions))
 	return 0
 }
 
@@ -397,14 +429,13 @@ func handleListUsers(opts loginctlOptions, args []string) int {
 		fmt.Fprintf(os.Stderr, "list-users takes no arguments\n")
 		return 1
 	}
-	var rows []userRow
-	for _, name := range lingerUsers() {
-		u, err := resolveUser(name)
-		if err != nil {
-			continue
-		}
-		rows = append(rows, userRow{UID: u.Uid, Name: u.Username, Linger: "yes", State: userState(name)})
+	users, err := fetchLoginUsers()
+	if err != nil {
+		// Same fallback as list-sessions: without logind, report what the
+		// local linger store knows rather than failing.
+		users = nil
 	}
+	rows := userRows(users)
 	if asJSON, pretty := opts.jsonPretty(); asJSON {
 		type juser struct {
 			UID    string `json:"uid"`
@@ -430,12 +461,16 @@ func handleListUsers(opts loginctlOptions, args []string) int {
 		fmt.Println(string(raw))
 		return 0
 	}
-	if !opts.noLegend {
-		fmt.Println("UID USER LINGER STATE")
-	}
+	table := make([][]string, 0, len(rows))
 	for _, r := range rows {
-		fmt.Printf("%s %s %s %s\n", r.UID, r.Name, r.Linger, r.State)
+		table = append(table, []string{r.UID, r.Name, r.Linger, r.State})
 	}
+	printColumns(
+		[]string{"UID", "USER", "LINGER", "STATE"},
+		table,
+		[]bool{true, false, false, false},
+		opts.noLegend,
+	)
 	fmt.Printf("%d users listed.\n", len(rows))
 	return 0
 }
