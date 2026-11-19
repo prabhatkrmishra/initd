@@ -1356,6 +1356,28 @@ func (u *Unit) buildEnvironment() (map[string]string, []string, error) {
 		}
 	}
 
+	// A unit that starts with different credentials than the manager runs
+	// as must not inherit the manager's home/profile: a root manager
+	// spawning uid 1000 with HOME=/root cannot read /root at all, so the
+	// child fell over before printing anything and /etc/skel-style user
+	// directories never appeared. Set the child's environment from the
+	// target user's passwd entry, the same picture systemd-console-welcome
+	// would see had the unit come up from a login. Unit-provided
+	// EnvironmentFile=/Environment= is applied after, so a unit can still
+	// override any of these, as it can upstream.
+	if creds, err := u.resolveCredentialsForStart(false); err == nil && creds.set && int(creds.uid) != os.Geteuid() {
+		if acct, err := user.LookupId(strconv.Itoa(int(creds.uid))); err == nil {
+			if acct.Username != "" {
+				envMap["USER"] = acct.Username
+				envMap["LOGNAME"] = acct.Username
+			}
+			if acct.HomeDir != "" {
+				envMap["HOME"] = acct.HomeDir
+			}
+			envMap["XDG_RUNTIME_DIR"] = fmt.Sprintf("/run/user/%d", creds.uid)
+		}
+	}
+
 	// INVOCATION_ID identifies this run of this unit, and systemd guarantees a
 	// fresh one to every service it starts. It is not cosmetic: a supervised
 	// daemon commonly uses it to recognise that IT is the manager's child, and
