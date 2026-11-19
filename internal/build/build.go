@@ -5,7 +5,7 @@ package build
 
 // Version is the release line, overridden at build time with
 // -X initd/internal/build.Version=$(VERSION).
-var Version = "1.1.0"
+var Version = "1.4.0"
 
 // Meta records the exact source a binary came from, stamped by the Makefile
 // (git commit, with -dirty for an uncommitted tree). Empty for hand-run

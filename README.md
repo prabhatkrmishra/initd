@@ -161,7 +161,7 @@ Supported types:
 - forking
    The service is expected to fork and write a PID file. initd waits for the PID file to appear and treats that PID as the main process.
 - notify / notify-reload
-   initd implements systemd-style NOTIFY_SOCKET support. The service becomes active after READY=1 is received. If READY is not received but the process remains alive, initd safely falls back to simple behavior.
+   initd implements systemd-style NOTIFY_SOCKET support. The service becomes active after READY=1 is received. Notification sockets live on the filesystem (`/run/initd/notify` or the user runtime dir) with mode `0666`, and a service that never sends `READY=1` is killed and marked failed after `TimeoutStartSec`, matching systemd.
 
 Other types:
 
