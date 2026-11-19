@@ -271,3 +271,37 @@ func TestBuildServicePropsControlGroupInterface(t *testing.T) {
 		t.Fatalf("ControlGroup = %q for a unit that was never started, want empty", got)
 	}
 }
+
+func TestBuildUnitPropsForSocketUnit(t *testing.T) {
+	mgr := newTestManager(t)
+	searchDir := mgr.SearchPaths[0]
+	sockPath := filepath.Join(t.TempDir(), "propsock.sock")
+	writeUnitForDBus(t, searchDir, "propsock.socket", "[Socket]\nListenStream="+sockPath+"\n")
+	if err := mgr.LoadUnits(); err != nil {
+		t.Fatal(err)
+	}
+	props := buildUnitProps(mgr, "propsock.socket")
+	if props == nil {
+		t.Fatal("no properties for a socket unit")
+	}
+	if v := props["Id"].Value; v != "propsock.socket" {
+		t.Fatalf("Id = %v, want propsock.socket", v)
+	}
+	if v := props["ActiveState"].Value; v != "inactive" {
+		t.Fatalf("ActiveState before start = %v, want inactive", v)
+	}
+	if v := props["SubState"].Value; v != "inactive" {
+		t.Fatalf("SubState before start = %v, want inactive", v)
+	}
+	if err := mgr.StartUnit("propsock.socket"); err != nil {
+		t.Fatalf("start socket unit: %v", err)
+	}
+	props = buildUnitProps(mgr, "propsock.socket")
+	if v := props["ActiveState"].Value; v != "active" {
+		t.Fatalf("ActiveState after start = %v, want active", v)
+	}
+	if v := props["SubState"].Value; v != "listening" {
+		t.Fatalf("SubState after start = %v, want listening", v)
+	}
+	_ = mgr.StopUnit("propsock.socket")
+}

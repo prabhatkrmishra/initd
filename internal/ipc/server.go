@@ -626,6 +626,14 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		}
 		return Response{Success: true}
 	case "status":
+		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
+			state, _ := manager.SocketActiveState(req.Unit)
+			return Response{Success: true, Data: StatusData{
+				Name:        req.Unit,
+				Description: req.Unit,
+				State:       service.State(state),
+			}}
+		}
 		if unit, err := manager.FindUnit(req.Unit); err == nil {
 			snapshot := unit.Snapshot()
 			effState, effPID := unit.EffectiveState()
@@ -661,22 +669,14 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 				CGroupPIDs:          unit.CGroupPIDs(),
 			}}
 		}
-		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
-			state, _ := manager.SocketActiveState(req.Unit)
-			return Response{Success: true, Data: StatusData{
-				Name:        req.Unit,
-				Description: req.Unit,
-				State:       service.State(state),
-			}}
-		}
 		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "is-active":
-		if unit, err := manager.FindUnit(req.Unit); err == nil {
-			state, _ := unit.EffectiveState()
-			return Response{Success: true, Data: state}
-		}
 		if _, err := manager.FindSocketUnit(req.Unit); err == nil {
 			state, _ := manager.SocketActiveState(req.Unit)
+			return Response{Success: true, Data: state}
+		}
+		if unit, err := manager.FindUnit(req.Unit); err == nil {
+			state, _ := unit.EffectiveState()
 			return Response{Success: true, Data: state}
 		}
 		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
@@ -767,18 +767,18 @@ func dispatch(req Request, manager *supervisor.Manager) Response {
 		if strings.TrimSpace(req.Unit) == "" {
 			return Response{Success: true, Data: manager.ManagerProperties()}
 		}
-		if data, err := manager.ShowUnit(req.Unit); err == nil {
+		if data, err := manager.ShowSocketUnit(req.Unit); err == nil {
 			return Response{Success: true, Data: data}
 		}
-		if data, err := manager.ShowSocketUnit(req.Unit); err == nil {
+		if data, err := manager.ShowUnit(req.Unit); err == nil {
 			return Response{Success: true, Data: data}
 		}
 		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}
 	case "cat":
-		if content, err := manager.CatUnit(req.Unit); err == nil {
+		if content, err := manager.CatSocketUnit(req.Unit); err == nil {
 			return Response{Success: true, Data: content}
 		}
-		if content, err := manager.CatSocketUnit(req.Unit); err == nil {
+		if content, err := manager.CatUnit(req.Unit); err == nil {
 			return Response{Success: true, Data: content}
 		}
 		return Response{Success: false, Message: fmt.Sprintf("unit %s not found", req.Unit)}

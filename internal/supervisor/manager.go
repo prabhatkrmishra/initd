@@ -502,6 +502,13 @@ func (m *Manager) loadUnitFromDiskLocked(n string) *service.Unit {
 	if unit, ok := m.Units[n]; ok {
 		return unit
 	}
+	if strings.HasSuffix(n, ".socket") {
+		// Socket units live in m.SocketUnits and have no service to run:
+		// loading a .socket file as a service produced a bogus
+		// "Type=simple, empty ExecStart" unit that status/show answered
+		// from instead of the socket.
+		return nil
+	}
 	for _, dir := range m.SearchPaths {
 		p := filepath.Join(dir, n)
 		fi, err := os.Stat(p)
@@ -569,6 +576,27 @@ func (m *Manager) expandSocketPath(p string) string {
 	return strings.ReplaceAll(p, "\x00", "%")
 }
 
+// socketUnitDefaultMode is what AF_UNIX sockets get unless the unit says
+// otherwise: 0666, so an unprivileged client (the whole point of a session
+// bus socket) can connect.
+const socketUnitDefaultMode = 0o666
+
+// socketUnitMode resolves the permission bits for a socket's filesystem node:
+// the SocketMode= directive when set (octal), otherwise systemd's default.
+// An unparsable SocketMode falls back to the default with a warning.
+func socketUnitMode(raw string) os.FileMode {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return socketUnitDefaultMode
+	}
+	mode, err := strconv.ParseUint(trimmed, 8, 32)
+	if err != nil || mode > 0o7777 {
+		logKernelWarning(fmt.Sprintf("SocketMode %q is not an octal mode; using %04o", raw, socketUnitDefaultMode))
+		return socketUnitDefaultMode
+	}
+	return os.FileMode(mode)
+}
+
 func (m *Manager) startSocketUnit(name string) error {
 	m.socketMu.Lock()
 	defer m.socketMu.Unlock()
@@ -614,10 +642,8 @@ func (m *Manager) startSocketUnit(name string) error {
 			}
 			return fmt.Errorf("failed to listen on %s: %w", sockPath, err)
 		}
-		if cfg.Socket.SocketMode != "" {
-			if mode, perr := strconv.ParseUint(cfg.Socket.SocketMode, 8, 32); perr == nil {
-				_ = os.Chmod(sockPath, os.FileMode(mode))
-			}
+		if err := os.Chmod(sockPath, socketUnitMode(cfg.Socket.SocketMode)); err != nil {
+			logKernelWarning(fmt.Sprintf("socket %s: chmod %v: %v", sockPath, socketUnitMode(cfg.Socket.SocketMode), err))
 		}
 		listeners = append(listeners, l)
 		paths = append(paths, sockPath)
@@ -644,10 +670,8 @@ func (m *Manager) startSocketUnit(name string) error {
 			}
 			return fmt.Errorf("failed to listen on %s: %w", sockPath, err)
 		}
-		if cfg.Socket.SocketMode != "" {
-			if mode, perr := strconv.ParseUint(cfg.Socket.SocketMode, 8, 32); perr == nil {
-				_ = os.Chmod(sockPath, os.FileMode(mode))
-			}
+		if err := os.Chmod(sockPath, socketUnitMode(cfg.Socket.SocketMode)); err != nil {
+			logKernelWarning(fmt.Sprintf("socket %s: chmod %v: %v", sockPath, socketUnitMode(cfg.Socket.SocketMode), err))
 		}
 		packets = append(packets, pc)
 		paths = append(paths, sockPath)
@@ -1220,6 +1244,14 @@ func (m *Manager) stopUnitRecursive(name string, visited map[string]struct{}) er
 }
 
 func (m *Manager) RestartUnit(name string) error {
+	if strings.HasSuffix(name, ".socket") {
+		// Recreating the listener is the only honest restart for a socket:
+		// there is no process to bounce.
+		if err := m.stopSocketUnit(name); err != nil {
+			return err
+		}
+		return m.startSocketUnit(name)
+	}
 	unit, err := m.FindUnit(name)
 	if err != nil {
 		return err
@@ -1796,6 +1828,11 @@ func canReload(cfg *parser.Unit) string {
 }
 
 func (m *Manager) ShowUnit(name string) (map[string]string, error) {
+	if strings.HasSuffix(name, ".socket") {
+		// Socket units are not service units; callers that fall through
+		// to ShowSocketUnit get the real answer.
+		return nil, fmt.Errorf("unit %s not found", name)
+	}
 	unit, err := m.FindUnit(name)
 	if err != nil {
 		return nil, err

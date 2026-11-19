@@ -376,3 +376,63 @@ func TestDispatchStatusNotFound(t *testing.T) {
 		t.Error("status for unknown unit should fail")
 	}
 }
+
+func TestDispatchListUnitsContainsOneEntryPerSocket(t *testing.T) {
+	m, dir := newTestManager(t)
+	writeUnit(t, dir, "app.service", "[Service]\nExecStart=/bin/true\n")
+	sockPath := filepath.Join(dir, "app.sock")
+	writeUnit(t, dir, "appd.socket", "[Socket]\nListenStream="+sockPath+"\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatal(err)
+	}
+	resp := dispatch(Request{Action: "list-units"}, m)
+	if !resp.Success {
+		t.Fatalf("list-units failed: %v", resp.Message)
+	}
+	entries, ok := resp.Data.([]UnitData)
+	if !ok {
+		t.Fatalf("list-units data type = %T, want []UnitData", resp.Data)
+	}
+	counts := map[string]int{}
+	socketEntries := map[string]UnitData{}
+	for _, e := range entries {
+		counts[e.Name]++
+		if e.Name == "appd.socket" {
+			socketEntries[e.Name] = e
+		}
+	}
+	if counts["appd.socket"] != 1 {
+		t.Fatalf("appd.socket appears %d times in list-units, want exactly one", counts["appd.socket"])
+	}
+	e := socketEntries["appd.socket"]
+	if e.Type != "socket" {
+		t.Fatalf("socket entry Type = %q, want socket", e.Type)
+	}
+}
+
+func TestDispatchStatusAndIsActivePreferSocketUnits(t *testing.T) {
+	m, dir := newTestManager(t)
+	sockPath := filepath.Join(dir, "app.sock")
+	writeUnit(t, dir, "appd.socket", "[Socket]\nListenStream="+sockPath+"\n")
+	if err := m.LoadUnits(); err != nil {
+		t.Fatal(err)
+	}
+	resp := dispatch(Request{Action: "status", Unit: "appd.socket"}, m)
+	if !resp.Success {
+		t.Fatalf("status for socket unit failed: %v", resp.Message)
+	}
+	data, ok := resp.Data.(StatusData)
+	if !ok {
+		t.Fatalf("status data type = %T, want StatusData", resp.Data)
+	}
+	if data.Name != "appd.socket" || data.State != "inactive" {
+		t.Fatalf("status = %+v", data)
+	}
+	resp = dispatch(Request{Action: "is-active", Unit: "appd.socket"}, m)
+	if !resp.Success {
+		t.Fatalf("is-active for socket unit failed: %v", resp.Message)
+	}
+	if got, ok := resp.Data.(string); !ok || got != "inactive" {
+		t.Fatalf("is-active = %v (%T), want inactive", resp.Data, resp.Data)
+	}
+}
