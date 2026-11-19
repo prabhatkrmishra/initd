@@ -536,8 +536,9 @@ func removeOwnPidFile(path string) {
 
 // busLivenessPoll is how often a held bus connection is checked for having gone
 // away. Short enough that a restarted bus is re-advertised promptly, long
-// enough not to be a busy loop.
-const busLivenessPoll = 5 * time.Second
+// enough not to be a busy loop. A variable so the advertise tests can run
+// without waiting five seconds per poll.
+var busLivenessPoll = 5 * time.Second
 
 // transportState is what a client needs in order to trust (or distrust) a
 // route to this daemon without inferring it from a timeout.
@@ -630,7 +631,6 @@ func advertise(ctx context.Context, key, label, scope, address string, register 
 		maxBackoff = 30 * time.Second
 	)
 	backoff := minBackoff
-	held := false
 	report := func(state, detail string) {
 		setTransportState(key, transportState{
 			Transport: "dbus", Scope: scope, Address: address,
@@ -638,51 +638,56 @@ func advertise(ctx context.Context, key, label, scope, address string, register 
 		})
 	}
 	report("retrying", "not registered yet")
+	var heldConn *gdbus.Conn
 	for {
 		if ctx.Err() != nil {
+			if heldConn != nil {
+				_ = heldConn.Close()
+			}
 			return
 		}
-		conn, err := register(ctx)
-		if err == nil {
-			if !held {
+		// Register once, then hold. Re-registering on every liveness poll
+		// would call ServeSystemBus/ServeUserBus again on the same manager:
+		// every call re-exports the manager properties, requests the name
+		// again and appends another unload handler, so one scope unload
+		// would emit one signal per poll for the life of the daemon.
+		if heldConn == nil {
+			conn, err := register(ctx)
+			if err == nil {
+				heldConn = conn
 				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
 					"registered %s", label)
-			}
-			held = true
-			report("owned", "")
-			// Hold the connection. A bus that goes away takes the name with
-			// it, so re-acquire rather than pretending it is still ours.
-			select {
-			case <-ctx.Done():
-				_ = conn.Close()
-				return
-			case <-time.After(busLivenessPoll):
-				if !dbus.ConnAlive(conn) {
-					_ = conn.Close()
-					logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-						"lost %s; re-acquiring", label)
-					held = false
-					backoff = minBackoff
-					report("retrying", "bus connection lost")
+				report("owned", "")
+			} else {
+				report("retrying", err.Error())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(jitter(backoff)):
 				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
 			}
-			continue
 		}
-		if held {
-			logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
-				"lost %s: %v", label, err)
-			held = false
-		}
-		report("retrying", err.Error())
+		// Hold the connection. A bus that goes away takes the name with it,
+		// so re-acquire rather than pretending it is still ours.
 		select {
 		case <-ctx.Done():
+			_ = heldConn.Close()
 			return
-		case <-time.After(jitter(backoff)):
-		}
-		if backoff < maxBackoff {
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+		case <-time.After(busLivenessPoll):
+			if !dbus.ConnAlive(heldConn) {
+				_ = heldConn.Close()
+				heldConn = nil
+				logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+					"lost %s; re-acquiring", label)
+				backoff = minBackoff
+				report("retrying", "bus connection lost")
 			}
 		}
 	}

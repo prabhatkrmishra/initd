@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,6 +55,50 @@ func TestAdvertiseKeepsTryingUntilTheBusAppears(t *testing.T) {
 // then polls liveness, and a nil conn must read as not-alive so it re-acquires
 // instead of spinning on a connection it does not have.
 var errHeldForTest = errors.New("held")
+
+// advertise used to call the registrar once per liveness poll even while the
+// bus was healthy. Each call re-exported the manager, requested the name again
+// and appended another unload handler, so one session scope emitted one
+// UnitRemoved signal per poll for the life of the daemon (39 for a single
+// scope on the host). Holding the connection means register runs once.
+func TestAdvertiseHoldsOneRegistration(t *testing.T) {
+	oldPoll := busLivenessPoll
+	busLivenessPoll = 10 * time.Millisecond
+	t.Cleanup(func() { busLivenessPoll = oldPoll })
+
+	server, client := net.Pipe()
+	defer server.Close()
+	conn, err := gdbus.NewConn(client)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var attempts int32
+	done := make(chan struct{})
+	go func() {
+		advertise(ctx, "dbus:test", "test bus", "user", "test", func(context.Context) (*gdbus.Conn, error) {
+			atomic.AddInt32(&attempts, 1)
+			return conn, nil
+		})
+		close(done)
+	}()
+
+	// More than enough time for several polls on a connection that stays alive.
+	time.Sleep(100 * time.Millisecond)
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Fatalf("register called %d times while the bus stayed up, want 1", n)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("advertise did not return after its context was cancelled")
+	}
+}
 
 // A registrar that fails forever must not spin: backoff has to grow, or a box
 // with no bus at all burns a core retrying every 100ms for the daemon's life.
