@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `User=`, `Group=` and `SupplementaryGroups=` specifiers are expanded before resolution, so templated units like `user@1000.service` (User=%i) start instead of failing with `lookup user "%i"`, and the user@.service drop-in points initd's pid file at the right per-uid runtime dir.
 - The D-Bus system-bus policy is well-formed XML again: it contained `--` inside a comment, which XML forbids, so dbus-daemon discarded the file wholesale and every connection including root was denied `org.freedesktop.systemd1`, which is why logind never activated on demand and logins stalled 25s even with the Activator in place. The malformed comment is gone, a test guards the policy parses and contains the activation receive rule.
 - A non-root daemon no longer advertises `org.freedesktop.systemd1` on the system bus. Two daemons on one host race for the name there each boot; when the user daemon won, the root (system) manager could never answer the system bus again and activation was delivered to the wrong manager. A non-root daemon now advertises only on its own session bus.
 
