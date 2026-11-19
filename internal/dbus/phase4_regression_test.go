@@ -61,6 +61,23 @@ func TestListUnitsFilteredHonorsFilter(t *testing.T) {
 	if _, derr := m.StartUnit("idle.service", "fail"); derr != nil {
 		t.Fatalf("start idle: %v", derr)
 	}
+	// StartUnit is asynchronous (systemd semantics): wait for run.service to
+	// reach active before listing.
+	waitFor := func(name string) bool {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if u, err := mgr.FindUnit(name); err == nil {
+				if u.Snapshot().State == "active" {
+					return true
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return false
+	}
+	if !waitFor("run.service") {
+		t.Fatal("run.service did not become active")
+	}
 	// Let oneshot finish.
 	deadline := time.Now().Add(5 * time.Second)
 	for {

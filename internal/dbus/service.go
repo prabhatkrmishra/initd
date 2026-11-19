@@ -44,10 +44,16 @@ var emptyManager = &supervisor.Manager{}
 // from the system bus.
 type systemd1Manager struct {
 	primary *supervisor.Manager
+	jobs    *jobRegistry
+	logf    func(string, ...interface{})
 }
 
 func newManager(primary *supervisor.Manager) *systemd1Manager {
-	return &systemd1Manager{primary: primary}
+	return &systemd1Manager{
+		primary: primary,
+		jobs:    newJobRegistry(nil, nil, nil),
+		logf:    dbusLog,
+	}
 }
 
 func (m *systemd1Manager) primarySafe() *supervisor.Manager {
@@ -282,51 +288,39 @@ func (m *systemd1Manager) DisableUnitFiles(files []string, runtime bool) (bool, 
 }
 
 func (m *systemd1Manager) RestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.primarySafe()
-	if derr := unitDBusError(name, mgr.RestartUnit(name)); derr != nil {
-		return "", derr
-	}
-	return m.unitPathFor(name), nil
+	return m.enqueue(name, "restart", mode, m.primarySafe().RestartUnit)
 }
 
 func (m *systemd1Manager) StopUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.primarySafe()
-	if derr := unitDBusError(name, mgr.StopUnit(name)); derr != nil {
-		return "", derr
-	}
-	return m.unitPathFor(name), nil
+	return m.enqueue(name, "stop", mode, m.primarySafe().StopUnit)
 }
 
 func (m *systemd1Manager) StartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.primarySafe()
-	if derr := unitDBusError(name, mgr.StartUnit(name)); derr != nil {
-		return "", derr
-	}
-	return m.unitPathFor(name), nil
+	return m.enqueue(name, "start", mode, m.primarySafe().StartUnit)
 }
 
 func (m *systemd1Manager) ReloadUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.primarySafe()
-	if derr := unitDBusError(name, mgr.ReloadUnit(name)); derr != nil {
-		return "", derr
-	}
-	return m.unitPathFor(name), nil
+	return m.enqueue(name, "reload", mode, m.primarySafe().ReloadUnit)
 }
 
 func (m *systemd1Manager) ReloadOrRestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	return m.RestartUnit(name, mode)
+	return m.enqueue(name, "reload-or-restart", mode, m.primarySafe().RestartUnit)
 }
 
 func (m *systemd1Manager) ReloadOrTryRestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	return m.RestartUnit(name, mode)
+	return m.enqueue(name, "reload-or-try-restart", mode, m.primarySafe().RestartUnit)
 }
 
 func (m *systemd1Manager) TryRestartUnit(name string, mode string) (dbus.ObjectPath, *dbus.Error) {
-	mgr := m.primarySafe()
-	if derr := unitDBusError(name, mgr.RestartUnit(name)); derr != nil {
-		return "", derr
-	}
-	return m.unitPathFor(name), nil
+	return m.enqueue(name, "try-restart", mode, m.primarySafe().RestartUnit)
+}
+
+// enqueue queues the unit for asynchronous execution and returns the job's
+// object path immediately. The outcome is reported through JobNew /
+// JobRemoved; the job vanishes from the bus once it finishes.
+func (m *systemd1Manager) enqueue(name string, jobType string, mode string, run func(string) error) (dbus.ObjectPath, *dbus.Error) {
+	_ = mode
+	return enqueueUnitJob(m.primarySafe(), m.jobs, m.logf, name, jobType, run)
 }
 
 func (m *systemd1Manager) KillUnit(name string, whom string, signal int32) *dbus.Error {
@@ -337,6 +331,29 @@ func (m *systemd1Manager) KillUnit(name string, whom string, signal int32) *dbus
 func (m *systemd1Manager) ResetFailedUnit(name string) *dbus.Error {
 	mgr := m.primarySafe()
 	return unitDBusError(name, mgr.ResetFailed(name))
+}
+
+// GetJob returns the object path of a queued or running job.
+func (m *systemd1Manager) GetJob(id uint32) (dbus.ObjectPath, *dbus.Error) {
+	return m.jobs.get(id)
+}
+
+// CancelJob aborts a queued job. Jobs whose execution has already begun are
+// left alone, as with systemd.
+func (m *systemd1Manager) CancelJob(id uint32) *dbus.Error {
+	return m.jobs.cancel(id)
+}
+
+// ClearJobs aborts every job that has not begun executing. It has no effect
+// on jobs that are already running, as with systemd.
+func (m *systemd1Manager) ClearJobs() *dbus.Error {
+	m.jobs.clearQueue()
+	return nil
+}
+
+// ListJobs lists all queued and running jobs in id order.
+func (m *systemd1Manager) ListJobs() ([]listJobEntry, *dbus.Error) {
+	return m.jobs.list(), nil
 }
 
 // listUnitEntry matches systemd's a(st) unit-listing return shape.
@@ -451,46 +468,41 @@ func (m *systemd1Manager) Reload() *dbus.Error {
 type systemd1Unit struct {
 	mgr  *supervisor.Manager
 	name string
+	jobs *jobRegistry
+	logf func(string, ...interface{})
+}
+
+func (u *systemd1Unit) enqueue(jobType string, mode string, run func(string) error) (dbus.ObjectPath, *dbus.Error) {
+	_ = mode
+	return enqueueUnitJob(u.mgr, u.jobs, u.logf, u.name, jobType, run)
 }
 
 func (u *systemd1Unit) Start(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if derr := unitDBusError(u.name, u.mgr.StartUnit(u.name)); derr != nil {
-		return "", derr
-	}
-	return unitObjectPath(u.name), nil
+	return u.enqueue("start", mode, u.mgr.StartUnit)
 }
 
 func (u *systemd1Unit) Stop(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if derr := unitDBusError(u.name, u.mgr.StopUnit(u.name)); derr != nil {
-		return "", derr
-	}
-	return unitObjectPath(u.name), nil
+	return u.enqueue("stop", mode, u.mgr.StopUnit)
 }
 
 func (u *systemd1Unit) Restart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if derr := unitDBusError(u.name, u.mgr.RestartUnit(u.name)); derr != nil {
-		return "", derr
-	}
-	return unitObjectPath(u.name), nil
+	return u.enqueue("restart", mode, u.mgr.RestartUnit)
 }
 
 func (u *systemd1Unit) Reload(mode string) (dbus.ObjectPath, *dbus.Error) {
-	if derr := unitDBusError(u.name, u.mgr.ReloadUnit(u.name)); derr != nil {
-		return "", derr
-	}
-	return unitObjectPath(u.name), nil
+	return u.enqueue("reload", mode, u.mgr.ReloadUnit)
 }
 
 func (u *systemd1Unit) TryRestart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	return u.Restart(mode)
+	return u.enqueue("try-restart", mode, u.mgr.RestartUnit)
 }
 
 func (u *systemd1Unit) ReloadOrRestart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	return u.Reload(mode)
+	return u.enqueue("reload-or-restart", mode, u.mgr.RestartUnit)
 }
 
 func (u *systemd1Unit) ReloadOrTryRestart(mode string) (dbus.ObjectPath, *dbus.Error) {
-	return u.Reload(mode)
+	return u.enqueue("reload-or-try-restart", mode, u.mgr.RestartUnit)
 }
 
 func (u *systemd1Unit) Kill(whom string, signal int32) *dbus.Error {
@@ -502,7 +514,9 @@ func (u *systemd1Unit) ResetFailed() *dbus.Error {
 }
 
 type unitSubtreeHandler struct {
-	mgr *supervisor.Manager
+	mgr  *supervisor.Manager
+	jobs *jobRegistry
+	logf func(string, ...interface{})
 }
 
 func (h *unitSubtreeHandler) unitObj(msg dbus.Message) (*systemd1Unit, *dbus.Error) {
@@ -514,7 +528,7 @@ func (h *unitSubtreeHandler) unitObj(msg dbus.Message) (*systemd1Unit, *dbus.Err
 	if !found {
 		return nil, &dbus.Error{Name: "org.freedesktop.systemd1.NoSuchUnit", Body: []interface{}{"No such unit"}}
 	}
-	return &systemd1Unit{mgr: h.mgr, name: name}, nil
+	return &systemd1Unit{mgr: h.mgr, name: name, jobs: h.jobs, logf: h.logf}, nil
 }
 
 func (h *unitSubtreeHandler) Start(msg dbus.Message, mode string) (dbus.ObjectPath, *dbus.Error) {
@@ -994,15 +1008,23 @@ func ServeSystemBus(ctx context.Context, systemMgr, userMgr *supervisor.Manager)
 }
 
 func serveManager(ctx context.Context, conn *dbus.Conn, primary *supervisor.Manager) error {
-	_ = ctx
-
-	mgrObj := newManager(primary)
-	handler := &unitSubtreeHandler{mgr: primarySafe(primary)}
-
-	// Properties layer (org.freedesktop.DBus.Properties) on the manager path.
-	if _, err := prop.Export(conn, managerPath, buildManagerProps(primary)); err != nil {
+	primaryMgr := primarySafe(primary)
+	props, err := prop.Export(conn, managerPath, buildManagerProps(primary))
+	if err != nil {
 		return fmt.Errorf("export manager properties: %w", err)
 	}
+	// Asynchronous jobs: queued per connection, reported through JobNew /
+	// JobRemoved, NJobs/NInstalledJobs/NFailedJobs kept in sync with them.
+	registry := newJobRegistry(connJobBus{conn}, func(nJobs, nInstalled, nFailed uint32) {
+		_ = props.Set(managerInterface, "NJobs", dbus.MakeVariant(nJobs))
+		_ = props.Set(managerInterface, "NInstalledJobs", dbus.MakeVariant(nInstalled))
+		_ = props.Set(managerInterface, "NFailedJobs", dbus.MakeVariant(nFailed))
+	}, dbusLog)
+
+	mgrObj := newManager(primary)
+	mgrObj.jobs = registry
+
+	handler := &unitSubtreeHandler{mgr: primaryMgr, jobs: registry, logf: dbusLog}
 
 	// Manager methods on the manager interface at /org/freedesktop/systemd1.
 	if err := conn.Export(mgrObj, managerPath, managerInterface); err != nil {
@@ -1036,20 +1058,20 @@ func serveManager(ctx context.Context, conn *dbus.Conn, primary *supervisor.Mana
 	// log loudly and keep serving if the match cannot be added. Without a
 	// backing supervisor there is nobody to activate for.
 	if primary != nil {
-		if err := watchActivatorSignals(ctx, conn, primary.StartUnit, activatorLog); err != nil {
-			activatorLog("activation subscription failed: %v (D-Bus-activated units will not start)", err)
+		if err := watchActivatorSignals(ctx, conn, primary.StartUnit, dbusLog); err != nil {
+			dbusLog("activator: activation subscription failed: %v (D-Bus-activated units will not start)", err)
 		}
 	} else {
-		activatorLog("no supervisor for this connection; D-Bus-activated units will not start")
+		dbusLog("activator: no supervisor for this connection; D-Bus-activated units will not start")
 	}
 
 	return nil
 }
 
-// activatorLog reports activation failures on the daemon's own log, the same
-// place every other initd diagnostic goes.
-func activatorLog(format string, args ...interface{}) {
-	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), "activator: "+format, args...)
+// dbusLog reports D-Bus failures on the daemon's own log, the same place
+// every other initd diagnostic goes.
+func dbusLog(format string, args ...interface{}) {
+	logging.KernelPrintf(os.Stderr, "initd", os.Getpid(), format, args...)
 }
 
 func primarySafe(primary *supervisor.Manager) *supervisor.Manager {
