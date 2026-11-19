@@ -331,6 +331,17 @@ func testLiveBusStartTransientUnitLifecycle(t *testing.T, usePIDFDs bool) {
 	}
 
 	// Stopping the scope kills the member process and unloads the unit.
+	// Watch for the unload announcement before triggering it: logind reaps
+	// a session record only when UnitRemoved names its scope.
+	removed := make(chan *dbus.Signal, 4)
+	client.Signal(removed)
+	if err := client.AddMatchSignal(
+		dbus.WithMatchObjectPath(managerPath),
+		dbus.WithMatchInterface(managerInterface),
+		dbus.WithMatchMember("UnitRemoved"),
+	); err != nil {
+		t.Fatalf("match UnitRemoved: %v", err)
+	}
 	var stopJob dbus.ObjectPath
 	if err := obj.Call("org.freedesktop.systemd1.Manager.StopUnit", 0, "zzlivebus-live.scope", "replace").Store(&stopJob); err != nil {
 		t.Fatalf("StopUnit: %v", err)
@@ -367,4 +378,22 @@ func testLiveBusStartTransientUnitLifecycle(t *testing.T, usePIDFDs bool) {
 	if c.Err == nil {
 		t.Fatalf("GetUnit after stop returned %+v, want NoSuchUnit (scope unloaded)", c)
 	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case sig := <-removed:
+			if sig == nil || sig.Name != managerInterface+".UnitRemoved" || len(sig.Body) != 2 {
+				continue
+			}
+			name, _ := sig.Body[0].(string)
+			path, _ := sig.Body[1].(dbus.ObjectPath)
+			if name != "zzlivebus-live.scope" || path != unitPath {
+				t.Fatalf("UnitRemoved = %q %q, want zzlivebus-live.scope %q", name, path, unitPath)
+			}
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	t.Fatal("scope unloaded without a UnitRemoved signal")
 }

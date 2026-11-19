@@ -106,6 +106,31 @@ func TestStartTransientScopeNonScopeNameRefused(t *testing.T) {
 	}
 }
 
+func TestTransientScopeUnloadFiresHandler(t *testing.T) {
+	stubScopeCgroups(t)
+	m, _ := newTestManager(t)
+	removed := make(chan string, 1)
+	m.AddUnitRemovedHandler(func(name string) { removed <- name })
+
+	cmd := exec.Command("/bin/sleep", "0.15")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start /bin/sleep: %v", err)
+	}
+	if err := m.StartTransientScope("zzunload.scope", TransientScope{PIDs: []int{cmd.Process.Pid}}); err != nil {
+		t.Fatalf("StartTransientScope: %v", err)
+	}
+	_ = cmd.Wait()
+
+	select {
+	case name := <-removed:
+		if name != "zzunload.scope" {
+			t.Fatalf("handler saw %q, want zzunload.scope", name)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the unloaded scope fired no handler")
+	}
+}
+
 func TestStartTransientScopeGoesEmptyAndUnloads(t *testing.T) {
 	stubScopeCgroups(t)
 	m, _ := newTestManager(t)

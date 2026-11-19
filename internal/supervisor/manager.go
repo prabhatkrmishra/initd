@@ -55,6 +55,10 @@ type Manager struct {
 	// runtime. They survive LoadUnits the way template instances do, so a
 	// daemon-reload does not orphan an active session scope.
 	transientUnits map[string]struct{}
+	// unitRemovedHandlers are fired after a transient scope is unloaded, so
+	// a bus front end can emit UnitRemoved. systemd-logind uses that signal
+	// to reap the session record whose scope just vanished.
+	unitRemovedHandlers []func(string)
 	// journal is the durable per-boot log store. Nil until OpenJournal
 	// runs at daemon startup; tests leave it nil and keep RAM-only rings.
 	journal *logging.FileWriter
@@ -203,6 +207,19 @@ func (m *Manager) unloadUnit(name string) {
 		}
 	}
 	m.UnitOrder = filtered
+	handlers := append([]func(string){}, m.unitRemovedHandlers...)
+	m.mu.Unlock()
+	for _, h := range handlers {
+		h(name)
+	}
+}
+
+// AddUnitRemovedHandler registers a callback fired after a transient scope is
+// unloaded. The D-Bus front end emits UnitRemoved from it; logind treats that
+// signal as the end of a session's scope and reaps the session.
+func (m *Manager) AddUnitRemovedHandler(h func(string)) {
+	m.mu.Lock()
+	m.unitRemovedHandlers = append(m.unitRemovedHandlers, h)
 	m.mu.Unlock()
 }
 

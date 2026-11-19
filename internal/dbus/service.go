@@ -1036,6 +1036,15 @@ func serveManager(ctx context.Context, conn *dbus.Conn, primary *supervisor.Mana
 		return fmt.Errorf("export unit subtree: %w", err)
 	}
 
+	// A session scope that empties is unloaded by the supervisor. logind
+	// watches UnitRemoved on this connection to reap the session record, so
+	// without the signal every login leaves a session in "closing" forever.
+	primaryMgr.AddUnitRemovedHandler(func(name string) {
+		if err := conn.Emit(managerPath, managerInterface+".UnitRemoved", name, unitObjectPath(name)); err != nil {
+			dbusLog("UnitRemoved %s: %v", name, err)
+		}
+	})
+
 	// org.freedesktop.DBus.Properties on the unit subtree (dynamic per-unit).
 	propsHandler := &unitPropsSubtree{mgr: primarySafe(primary)}
 	if err := conn.ExportSubtree(propsHandler, dbus.ObjectPath(unitBasePathString), "org.freedesktop.DBus.Properties"); err != nil {
