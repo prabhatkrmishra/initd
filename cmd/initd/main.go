@@ -699,11 +699,18 @@ func jitter(d time.Duration) time.Duration {
 }
 
 // startDBusServers advertises org.freedesktop.systemd1 on the D-Bus session bus
-// (and the system bus when reachable) so that systemctl/system-scope probes and
-// third-party service managers talk to initd instead of failing. Neither bus is
-// required: a box with no dbus-daemon, or a non-root daemon with no system bus,
-// still supervises over its own socket. The user/session bus is the important
-// one, since that is where a user's tools look for a user manager.
+// (and, for the root daemon only, on the system bus) so that tools which talk
+// to the systemd1 D-Bus interface (e.g. /usr/bin/systemctl in system scope,
+// openclaw's ownership probe) get verifiable answers instead of "Failed to
+// connect to bus: Permission denied". Neither bus is required: a box with no
+// dbus-daemon, or a daemon with no system bus, still supervises over its own
+// socket. The user/session bus is the important one, since that is where a
+// user's tools look for a user manager.
+//
+// The system bus is only for root. Without this, two coexisting daemons race
+// for org.freedesktop.systemd1 on the system bus each boot; when the
+// non-root daemon wins, the system manager can never answer the bus again,
+// and system-scope activation goes to the wrong manager.
 func startDBusServers(ctx context.Context, systemManager, userManager *supervisor.Manager) {
 	// The user (session) bus: initd already owns org.freedesktop.DBus there, so
 	// owning org.freedesktop.systemd1 too is what makes `systemctl --user` and
@@ -714,7 +721,14 @@ func startDBusServers(ctx context.Context, systemManager, userManager *superviso
 			return dbus.ServeUserBus(ctx, userManager)
 		})
 	// The system bus: lets a system-scope systemctl connect and get a
-	// verifiable answer. Non-fatal where there is no system bus.
+	// verifiable answer. Non-fatal where there is no system bus; skipped
+	// entirely for non-root daemons so they cannot squat the system-wide
+	// name away from the system manager.
+	if os.Getuid() != 0 {
+		logging.KernelPrintf(os.Stderr, "initd", os.Getpid(),
+			"system bus skipped: only the root daemon advertises org.freedesktop.systemd1 there")
+		return
+	}
 	go advertise(ctx, "dbus:system", "org.freedesktop.systemd1 on the system bus",
 		"system", "/var/run/dbus/system_bus_socket",
 		func(ctx context.Context) (*gdbus.Conn, error) {
