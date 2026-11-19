@@ -3464,8 +3464,10 @@ func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error)
 	if rootOnly {
 		return credentialSpec{}, nil
 	}
-	userName := strings.TrimSpace(u.GetConfig().Service.User)
-	groupName := strings.TrimSpace(u.GetConfig().Service.Group)
+	// Specifiers are expanded on the whole config before use: User=%i in a
+	// templated unit must not be looked up literally.
+	userName := strings.TrimSpace(u.expandSpecifiers(u.GetConfig().Service.User))
+	groupName := strings.TrimSpace(u.expandSpecifiers(u.GetConfig().Service.Group))
 	if userName == "" && groupName == "" {
 		return credentialSpec{}, nil
 	}
@@ -3496,7 +3498,11 @@ func (u *Unit) resolveCredentialsForStart(rootOnly bool) (credentialSpec, error)
 		uid = uint32(os.Getuid())
 	}
 
-	groups, err := lookupSupplementaryGroups(u.GetConfig().Service.SupplementaryGroups)
+	expandedGroups := make([]string, 0, len(u.GetConfig().Service.SupplementaryGroups))
+	for _, entry := range u.GetConfig().Service.SupplementaryGroups {
+		expandedGroups = append(expandedGroups, u.expandSpecifiers(entry))
+	}
+	groups, err := lookupSupplementaryGroups(expandedGroups)
 	if err != nil {
 		return credentialSpec{}, err
 	}

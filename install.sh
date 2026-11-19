@@ -454,9 +454,10 @@ if [ -f /lib/systemd/system/user@.service ] || [ -f /usr/lib/systemd/system/user
 # Installed by initd install.sh — run initd as the per-user manager instead
 # of systemd --user. The host unit's Type=notify-reload, User=%i and
 # Requires=user-runtime-dir@%i.service stay in place; only ExecStart changes.
+# %i is expanded by initd's own specifier handling.
 [Service]
 ExecStart=
-ExecStart=/usr/bin/initd --init --pid-file %t/initd.pid
+ExecStart=/usr/bin/initd --init --pid-file /run/user/%i/initd.pid
 EOSH
   as_root install -m 0644 "$tmp_dropin" "$USER_DROP_IN"
   rm -f "$tmp_dropin"
